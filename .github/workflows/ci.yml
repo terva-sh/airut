@@ -1,0 +1,70 @@
+# CI for airut on GitHub. It runs vet, gofmt, the dependency cgo check,
+# the tests and cross-builds, each with CGO_ENABLED=0 and the goolm tag
+# that every build of this repository uses. The commands are inline
+# because the runner does not install just; the justfile has the same
+# checks under `just ci`.
+#
+# Go follows go.mod's line, 1.27.x.
+
+name: ci
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [release]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  test:
+    name: Vet, test and cross-build
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: go vet
+        run: |
+          go vet -tags goolm ./...
+          go vet -tags goolm,e2e ./matrix/
+
+      - name: gofmt
+        run: |
+          diff=$(gofmt -l .)
+          if [ -n "$diff" ]; then
+            echo "gofmt issues in:"
+            echo "$diff"
+            exit 1
+          fi
+
+      - name: No mattn/go-sqlite3 in the cgo-free build
+        run: |
+          if go list -deps -tags goolm ./... | grep -qx github.com/mattn/go-sqlite3; then
+            echo "mattn/go-sqlite3 is in the cgo-free build; open the store on the pure-Go driver instead"
+            go mod why -m github.com/mattn/go-sqlite3
+            exit 1
+          fi
+
+      - name: go test
+        run: go test -tags goolm ./...
+
+      - name: Cross-build
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            echo "== $t"
+            GOOS=${t%/*} GOARCH=${t#*/} go build -tags goolm ./...
+          done
