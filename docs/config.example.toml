@@ -1,0 +1,78 @@
+# An airut bot's configuration, showing every key config.Load reads.
+#
+# Secrets are never written here. A key that holds one takes a reference
+# to where the deployment put it, as exactly one of:
+#
+#   { env = "NAME" }         an environment variable
+#   { credential = "NAME" }  a systemd credential: $CREDENTIALS_DIRECTORY/NAME,
+#                            from LoadCredential= or SetCredentialEncrypted=
+#   { file = "PATH" }        a file; a relative path is relative to this file
+#
+# A file or credential has one line ending (LF or CRLF) trimmed. A
+# plain string where a secret belongs is refused.
+#
+# Relative paths elsewhere are relative to this file too.
+
+[bot]
+# Starts a text command, as in "!roll 2d6". Defaults to "!".
+prefix = "!"
+
+# Model providers: OpenAI-compatible endpoints. The table key is the
+# provider's id, and a model is named as "id/model".
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+# A keyless local server leaves out api_key.
+models = [
+  # context_window and max_output are in tokens; 0 or absent leaves
+  # them unknown. reasoning marks a model that thinks before answering.
+  { id = "qwen3-32b", context_window = 32768, max_output = 8192, reasoning = true },
+]
+
+[providers.proxy]
+base_url = "https://llm.example.net/v1"
+api_key = { credential = "proxy-api-key" }
+models = [{ id = "gpt-5.5" }]
+
+# Agent turns. Without this table the bot runs plain commands only.
+[agent]
+# The model a turn uses when it names none.
+model = "local/qwen3-32b"
+# Required. Caps a turn that sets no budget of its own.
+budget = { max_turns = 8, max_tokens = 200000 }
+# Optional. Turns per user and per channel in a sliding window; these
+# are the defaults.
+rate = { per_user = 5, per_channel = 20, window = "10m" }
+
+# Who may start an agent turn, per platform. A platform with no list, or
+# an empty one, allows nobody.
+[agent.access.discord]
+users = ["123456789012345678"]
+roles = ["234567890123456789"]
+
+[agent.access.matrix]
+# Matrix has no roles. The members of each room in rooms may start a
+# turn too, as the room's member list says when they ask. Name a room by
+# its id, never an alias, which can be pointed at another room.
+users = ["@owner:example.org"]
+rooms = ["!members:example.org"]
+
+# Where agent sessions persist. Required with [agent].
+[store]
+path = "/var/lib/airut-sample/sessions.db"
+# Sessions idle longer than this are deleted. Defaults to 720h, 30 days.
+retention = "720h"
+
+# Each platform the bot serves has a table; leave out the others.
+[discord]
+token = { credential = "discord-token" }
+# Register commands in these guilds; empty or absent registers globally.
+guilds = ["345678901234567890"]
+
+[matrix]
+homeserver = "https://matrix.example.org"
+user_id = "@sample:example.org"
+# Logs in when no session is stored yet; optional once one is.
+password = { credential = "matrix-password" }
+# Keeps the Matrix session and the crypto store. Back it up.
+state_dir = "/var/lib/airut-sample/matrix"
+device_name = "airut sample"

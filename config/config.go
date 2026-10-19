@@ -1,0 +1,499 @@
+// Package config loads a bot's configuration file: its model providers,
+// its platforms, and the guards on its agent turns.
+//
+// The file is TOML. Secrets are never in it: each one is named as an
+// environment variable, a systemd credential, or a file, and Load reads
+// it from there. docs/config.example.toml shows every key.
+//
+// The package parses into plain Go types and imports no terva package;
+// agent.Providers turns the providers into terva clients.
+package config
+
+import (
+	"bytes"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/pelletier/go-toml/v2"
+)
+
+// Config is one bot's configuration.
+type Config struct {
+	Bot Bot
+	// Providers are the model providers, ordered by ID.
+	Providers []Provider
+	// Agent is nil when the file has no [agent] table, and the bot runs
+	// no agent turns.
+	Agent *Agent
+	// Store is where agent sessions persist. Its Path is empty without
+	// an agent.
+	Store Store
+	// Discord and Matrix are nil for a platform the bot does not serve.
+	Discord *Discord
+	Matrix  *Matrix
+}
+
+// Bot is the settings every platform shares.
+type Bot struct {
+	// Prefix triggers a text command. Empty leaves the core's default.
+	Prefix string
+}
+
+// Provider is one OpenAI-compatible endpoint.
+type Provider struct {
+	// ID names the provider; models are referred to as ID/model.
+	ID      string
+	BaseURL string
+	// APIKey is zero for a keyless endpoint, such as a local server.
+	APIKey Secret
+	Models []Model
+}
+
+// Model is one model a provider serves.
+type Model struct {
+	ID            string
+	ContextWindow int
+	MaxOutput     int
+	Reasoning     bool
+}
+
+// ModelRef names a model by its provider.
+type ModelRef struct {
+	Provider string
+	Model    string
+}
+
+func (r ModelRef) String() string { return r.Provider + "/" + r.Model }
+
+// Agent is how agent turns run and who may start them.
+type Agent struct {
+	// Model is the default model.
+	Model ModelRef
+	// Budget is the default for a turn that sets none.
+	Budget Budget
+	Rate   Rate
+	// Access lists who may start an agent turn, by platform. A platform
+	// with no entry allows nobody.
+	Access map[string]Access
+}
+
+// Budget caps one agent turn.
+type Budget struct {
+	MaxTurns  int
+	MaxTokens int
+}
+
+// Rate limits agent turns in a sliding window.
+type Rate struct {
+	PerUser    int
+	PerChannel int
+	Window     time.Duration
+}
+
+// Access lists platform user and role ids, and the rooms whose members
+// may start a turn.
+type Access struct {
+	Users []string
+	Roles []string
+	// Rooms admit their members. Only Matrix reads it.
+	Rooms []string
+}
+
+// Store is the agent's session database.
+type Store struct {
+	Path      string
+	Retention time.Duration
+}
+
+// Discord is the Discord platform's settings.
+type Discord struct {
+	Token Secret
+	// Guilds register commands in these guilds; empty registers them
+	// globally.
+	Guilds []string
+}
+
+// Matrix is the Matrix platform's settings.
+type Matrix struct {
+	Homeserver string
+	UserID     string
+	// Password logs in when no session is stored yet. It may be zero
+	// once one is.
+	Password   Secret
+	StateDir   string
+	DeviceName string
+}
+
+// Defaults for keys a file may leave out.
+const (
+	DefaultRetention  = 30 * 24 * time.Hour
+	DefaultPerUser    = 5
+	DefaultPerChannel = 20
+	DefaultWindow     = 10 * time.Minute
+)
+
+// The file's shape. Secrets decode as any, so that a plain string can be
+// refused with a reason rather than accepted.
+type fileConfig struct {
+	Bot       fileBot                 `toml:"bot"`
+	Providers map[string]fileProvider `toml:"providers"`
+	Agent     *fileAgent              `toml:"agent"`
+	Store     *fileStore              `toml:"store"`
+	Discord   *fileDiscord            `toml:"discord"`
+	Matrix    *fileMatrix             `toml:"matrix"`
+	// App is the bot's own settings, which LoadApp decodes. It is any,
+	// not a table, so that a value of the wrong type is a problem
+	// reported with the rest rather than a failure of the whole decode.
+	App any `toml:"app"`
+}
+
+type fileBot struct {
+	Prefix string `toml:"prefix"`
+}
+
+type fileProvider struct {
+	BaseURL string      `toml:"base_url"`
+	APIKey  any         `toml:"api_key"`
+	Models  []fileModel `toml:"models"`
+}
+
+type fileModel struct {
+	ID            string `toml:"id"`
+	ContextWindow int    `toml:"context_window"`
+	MaxOutput     int    `toml:"max_output"`
+	Reasoning     bool   `toml:"reasoning"`
+}
+
+type fileAgent struct {
+	Model  string      `toml:"model"`
+	Budget *fileBudget `toml:"budget"`
+	Rate   *fileRate   `toml:"rate"`
+	Access fileAccess  `toml:"access"`
+}
+
+type fileBudget struct {
+	MaxTurns  int `toml:"max_turns"`
+	MaxTokens int `toml:"max_tokens"`
+}
+
+type fileRate struct {
+	PerUser    *int   `toml:"per_user"`
+	PerChannel *int   `toml:"per_channel"`
+	Window     string `toml:"window"`
+}
+
+type fileAccess struct {
+	Discord *fileIDs       `toml:"discord"`
+	Matrix  *fileMatrixIDs `toml:"matrix"`
+}
+
+type fileMatrixIDs struct {
+	Users []string `toml:"users"`
+	Roles []string `toml:"roles"`
+	Rooms []string `toml:"rooms"`
+}
+
+type fileIDs struct {
+	Users []string `toml:"users"`
+	Roles []string `toml:"roles"`
+}
+
+type fileStore struct {
+	Path      string `toml:"path"`
+	Retention string `toml:"retention"`
+}
+
+type fileDiscord struct {
+	Token  any      `toml:"token"`
+	Guilds []string `toml:"guilds"`
+}
+
+type fileMatrix struct {
+	Homeserver string `toml:"homeserver"`
+	UserID     string `toml:"user_id"`
+	Password   any    `toml:"password"`
+	StateDir   string `toml:"state_dir"`
+	DeviceName string `toml:"device_name"`
+}
+
+// Load reads and checks the config file at path, and reads the secrets
+// it names. Every problem is reported at once, as an *Error.
+func Load(path string) (*Config, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	return parse(path, src, reflect.Value{})
+}
+
+// parse reads src, the file at path, and decodes its [app] table into
+// app when app is a struct LoadApp was given.
+func parse(path string, src []byte, app reflect.Value) (*Config, error) {
+	var f fileConfig
+	dec := toml.NewDecoder(bytes.NewReader(src)).DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		return nil, decodeError(path, err)
+	}
+	p := &problems{file: path}
+	c := build(p, &f, filepath.Dir(path))
+	if f.App != nil {
+		table, isTable := f.App.(map[string]any)
+		switch {
+		case !app.IsValid():
+			p.add("app", "this program has no settings of its own to read from an [app] table")
+		case !isTable:
+			p.add("app", "the value is not a table")
+		default:
+			decodeTable(p, "app", table, app, filepath.Dir(path))
+		}
+	}
+	if err := p.err(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+var (
+	providerIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	snowflakeRE  = regexp.MustCompile(`^[0-9]{1,20}$`)
+)
+
+func build(p *problems, f *fileConfig, dir string) *Config {
+	c := &Config{Bot: Bot{Prefix: f.Bot.Prefix}}
+	if strings.ContainsAny(f.Bot.Prefix, " \t\r\n") {
+		p.add("bot.prefix", "a prefix cannot contain spaces")
+	}
+
+	ids := make([]string, 0, len(f.Providers))
+	for id := range f.Providers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		c.Providers = append(c.Providers, buildProvider(p, id, f.Providers[id], dir))
+	}
+
+	if f.Agent != nil {
+		c.Agent = buildAgent(p, f.Agent, c.Providers)
+		c.Store = buildStore(p, f.Store, dir)
+	} else if f.Store != nil {
+		p.add("store", "a session store needs an [agent] table; without one the bot runs no agent turns")
+	}
+
+	if f.Discord != nil {
+		d := &Discord{Guilds: f.Discord.Guilds}
+		if f.Discord.Token == nil {
+			p.add("discord.token", "required: the bot token, as a secret reference")
+		} else {
+			d.Token = resolveSecret(p, "discord.token", f.Discord.Token, dir)
+		}
+		for i, g := range d.Guilds {
+			if !snowflakeRE.MatchString(g) {
+				p.addf(fmt.Sprintf("discord.guilds.%d", i), "not a Discord id")
+			}
+		}
+		c.Discord = d
+	}
+	if f.Matrix != nil {
+		c.Matrix = buildMatrix(p, f.Matrix, dir)
+	}
+	if c.Discord == nil && c.Matrix == nil {
+		p.add("(file)", "no platform is configured; add a [discord] or [matrix] table")
+	}
+	return c
+}
+
+func buildProvider(p *problems, id string, f fileProvider, dir string) Provider {
+	key := "providers." + id
+	pr := Provider{ID: id, BaseURL: f.BaseURL}
+	if !providerIDRE.MatchString(id) {
+		p.addf(key, "a provider id is lowercase letters, digits, - and _, starting with a letter or digit")
+	}
+	checkURL(p, key+".base_url", f.BaseURL)
+	if f.APIKey != nil {
+		pr.APIKey = resolveSecret(p, key+".api_key", f.APIKey, dir)
+	}
+	if len(f.Models) == 0 {
+		p.add(key+".models", "a provider needs at least one model")
+	}
+	seen := map[string]bool{}
+	for i, m := range f.Models {
+		mkey := fmt.Sprintf("%s.models.%d", key, i)
+		switch {
+		case m.ID == "":
+			p.add(mkey+".id", "required")
+		case seen[m.ID]:
+			p.add(mkey+".id", "repeats an earlier model's id")
+		}
+		seen[m.ID] = true
+		if m.ContextWindow < 0 {
+			p.add(mkey+".context_window", "cannot be negative")
+		}
+		if m.MaxOutput < 0 {
+			p.add(mkey+".max_output", "cannot be negative")
+		}
+		pr.Models = append(pr.Models, Model(m))
+	}
+	return pr
+}
+
+func buildAgent(p *problems, f *fileAgent, providers []Provider) *Agent {
+	a := &Agent{Access: map[string]Access{}}
+
+	provider, model, ok := strings.Cut(f.Model, "/")
+	switch {
+	case f.Model == "":
+		p.add("agent.model", `required: the default model, as "provider/model"`)
+	case !ok || provider == "" || model == "":
+		p.add("agent.model", `a model is named as "provider/model"`)
+	default:
+		a.Model = ModelRef{Provider: provider, Model: model}
+		i := slices.IndexFunc(providers, func(pr Provider) bool { return pr.ID == provider })
+		if i < 0 {
+			p.add("agent.model", "names a provider that is not configured")
+		} else if !slices.ContainsFunc(providers[i].Models, func(m Model) bool { return m.ID == model }) {
+			p.add("agent.model", "names a model its provider does not list")
+		}
+	}
+
+	// A budget is required: it is what an agent turn may spend.
+	if f.Budget == nil {
+		p.add("agent.budget", "required: max_turns and max_tokens cap a turn that sets no budget")
+	} else {
+		a.Budget = Budget(*f.Budget)
+		if a.Budget.MaxTurns <= 0 {
+			p.add("agent.budget.max_turns", "must be at least 1")
+		}
+		if a.Budget.MaxTokens <= 0 {
+			p.add("agent.budget.max_tokens", "must be at least 1")
+		}
+	}
+
+	a.Rate = Rate{PerUser: DefaultPerUser, PerChannel: DefaultPerChannel, Window: DefaultWindow}
+	if r := f.Rate; r != nil {
+		if r.PerUser != nil {
+			a.Rate.PerUser = *r.PerUser
+		}
+		if r.PerChannel != nil {
+			a.Rate.PerChannel = *r.PerChannel
+		}
+		if a.Rate.PerUser <= 0 {
+			p.add("agent.rate.per_user", "must be at least 1")
+		}
+		if a.Rate.PerChannel <= 0 {
+			p.add("agent.rate.per_channel", "must be at least 1")
+		}
+		if r.Window != "" {
+			a.Rate.Window = duration(p, "agent.rate.window", r.Window)
+		}
+	}
+
+	if d := f.Access.Discord; d != nil {
+		for i, u := range d.Users {
+			if !snowflakeRE.MatchString(u) {
+				p.addf(fmt.Sprintf("agent.access.discord.users.%d", i), "not a Discord user id")
+			}
+		}
+		for i, r := range d.Roles {
+			if !snowflakeRE.MatchString(r) {
+				p.addf(fmt.Sprintf("agent.access.discord.roles.%d", i), "not a Discord role id")
+			}
+		}
+		a.Access["discord"] = Access{Users: d.Users, Roles: d.Roles}
+	}
+	if m := f.Access.Matrix; m != nil {
+		for i, u := range m.Users {
+			if !validMXID(u) {
+				p.addf(fmt.Sprintf("agent.access.matrix.users.%d", i), "not a Matrix user id, such as @name:example.org")
+			}
+		}
+		if len(m.Roles) > 0 {
+			p.add("agent.access.matrix.roles", "Matrix has no roles; list users or rooms")
+		}
+		for i, r := range m.Rooms {
+			if !validRoomID(r) {
+				p.addf(fmt.Sprintf("agent.access.matrix.rooms.%d", i), "not a Matrix room id, such as !abc:example.org")
+			}
+		}
+		a.Access["matrix"] = Access{Users: m.Users, Rooms: m.Rooms}
+	}
+	return a
+}
+
+func buildStore(p *problems, f *fileStore, dir string) Store {
+	s := Store{Retention: DefaultRetention}
+	if f == nil || f.Path == "" {
+		p.add("store.path", "required: an agent keeps its sessions in this database")
+		return s
+	}
+	s.Path = f.Path
+	if !filepath.IsAbs(s.Path) {
+		s.Path = filepath.Join(dir, s.Path)
+	}
+	if f.Retention != "" {
+		s.Retention = duration(p, "store.retention", f.Retention)
+	}
+	return s
+}
+
+func buildMatrix(p *problems, f *fileMatrix, dir string) *Matrix {
+	m := &Matrix{Homeserver: f.Homeserver, UserID: f.UserID, StateDir: f.StateDir, DeviceName: f.DeviceName}
+	checkURL(p, "matrix.homeserver", f.Homeserver)
+	if !validMXID(f.UserID) {
+		p.add("matrix.user_id", "required: the bot's Matrix user id, such as @bot:example.org")
+	}
+	if f.Password != nil {
+		m.Password = resolveSecret(p, "matrix.password", f.Password, dir)
+	}
+	if m.StateDir == "" {
+		p.add("matrix.state_dir", "required: the directory that keeps the Matrix session and crypto store")
+	} else if !filepath.IsAbs(m.StateDir) {
+		m.StateDir = filepath.Join(dir, m.StateDir)
+	}
+	return m
+}
+
+// checkURL requires an absolute http or https URL. It never quotes the
+// value, which could carry credentials in its userinfo.
+func checkURL(p *problems, key, raw string) {
+	if raw == "" {
+		p.add(key, "required")
+		return
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		p.add(key, "not an http or https URL")
+		return
+	}
+	if u.User != nil {
+		p.add(key, "a URL here cannot carry credentials; name the key as a secret reference")
+	}
+}
+
+func duration(p *problems, key, raw string) time.Duration {
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		p.add(key, `not a positive duration such as "10m" or "720h"`)
+		return 0
+	}
+	return d
+}
+
+func validMXID(s string) bool { return validSigiled(s, "@") }
+
+// validRoomID accepts a room id, not an alias: an alias can be moved to
+// another room, which would hand that room's members the access.
+func validRoomID(s string) bool { return validSigiled(s, "!") }
+
+func validSigiled(s, sigil string) bool {
+	local, server, ok := strings.Cut(strings.TrimPrefix(s, sigil), ":")
+	return strings.HasPrefix(s, sigil) && ok && local != "" && server != ""
+}
