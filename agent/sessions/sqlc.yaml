@@ -1,0 +1,12 @@
+# sqlc compiles queries/ against migrations/ into package dbq. Run it with
+# `go generate ./agent/sessions`; the output is committed, and
+# `just sqlc-check` fails when regenerating it changes anything.
+version: "2"
+sql:
+  - engine: sqlite
+    schema: migrations
+    queries: queries
+    gen:
+      go:
+        package: dbq
+        out: dbq
