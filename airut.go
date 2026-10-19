@@ -31,6 +31,14 @@ type Config struct {
 	// EditInterval is the least time between the edits that stream an
 	// agent's answer into a message. It defaults to one second.
 	EditInterval time.Duration
+	// MetricsAddr, if set, is the address Run serves the bot's metrics
+	// on, at /metrics in the Prometheus text format, as ":9464" or
+	// "127.0.0.1:9464". Run fails before it starts an adapter if it
+	// cannot listen there.
+	MetricsAddr string
+	// SummaryEvery, if positive, is how often Run logs a summary of the
+	// metrics that changed since the last one. It is off by default.
+	SummaryEvery time.Duration
 }
 
 // Bot holds a set of commands and serves them through adapters.
@@ -48,6 +56,7 @@ type Bot struct {
 	gate     *gate
 	running  bool
 	inflight sync.WaitGroup
+	metrics  *Metrics
 }
 
 // New returns a Bot with no commands. It panics on a Gate whose limits
@@ -65,8 +74,12 @@ func New(cfg Config) *Bot {
 	if cfg.EditInterval <= 0 {
 		cfg.EditInterval = time.Second
 	}
-	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate)}
+	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics()}
 }
+
+// Metrics returns the bot's metrics: those the core records, and any
+// the bot records itself.
+func (b *Bot) Metrics() *Metrics { return b.metrics }
 
 var (
 	ctxType   = reflect.TypeFor[*Ctx]()
@@ -182,21 +195,46 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var wg sync.WaitGroup
+	if b.cfg.MetricsAddr != "" {
+		stop, err := b.serveMetrics(b.cfg.MetricsAddr)
+		if err != nil {
+			// Nothing started, so the bot may be run again.
+			b.mu.Lock()
+			b.running = false
+			b.mu.Unlock()
+			return err
+		}
+		defer stop()
+	}
+	if b.cfg.SummaryEvery > 0 {
+		wg.Go(func() { b.summarize(ctx, b.cfg.SummaryEvery) })
+	}
 	h := host{b}
 	errs := make([]error, len(adapters))
-	var wg sync.WaitGroup
+	var adapterWG sync.WaitGroup
 	for i, a := range adapters {
-		wg.Go(func() {
+		platform := string(a.Platform())
+		b.metrics.Set("airut_adapter_up", 1, "platform", platform)
+		adapterWG.Go(func() {
 			err := a.Run(ctx, h)
+			b.metrics.Set("airut_adapter_up", 0, "platform", platform)
 			if err != nil && ctx.Err() == nil {
 				errs[i] = fmt.Errorf("airut: %s adapter: %w", a.Platform(), err)
-				b.cfg.Logger.Error("adapter stopped", "platform", string(a.Platform()))
+				b.cfg.Logger.Error("adapter stopped", "platform", platform)
 			}
 			cancel()
 		})
 	}
-	wg.Wait()
+	adapterWG.Wait()
 	b.inflight.Wait()
+	cancel()
+	wg.Wait()
+	if b.cfg.SummaryEvery > 0 {
+		// The last summary, with everything that finished while Run
+		// waited.
+		b.metrics.logSummary(b.cfg.Logger)
+	}
 	return errors.Join(errs...)
 }
 
@@ -231,30 +269,39 @@ func (h host) Dispatch(ctx context.Context, inv Invocation) {
 	b.mu.Unlock()
 	c := &Ctx{ctx: ctx, bot: b, cmd: cmd, inv: inv, resp: inv.Respond}
 	if cmd == nil {
-		// The name is whatever was typed, so only its size is logged.
+		// The name is whatever was typed, so only its size is logged, and
+		// it is no metric's label.
 		log.Info("unknown command", "name_bytes", len(inv.Command))
+		b.metrics.Add("airut_commands_total", 1, "command", "", "outcome", "unknown")
 		c.reportError(Errorf("There is no command %s%s.", b.cfg.Prefix, inv.Command))
 		return
 	}
 	log = log.With("command", cmd.spec.Name)
+	outcome := func(o string) { b.metrics.Add("airut_commands_total", 1, "command", cmd.spec.Name, "outcome", o) }
 	switch ok, err := cmd.Allows(c); {
 	case err != nil:
 		log.Info("command access check failed", "kind", errorKind(err))
+		outcome("access_check_failed")
 		c.reportError(err)
 		return
 	case !ok:
 		log.Info("command refused", "reason", RefusedAccess)
+		outcome("refused_" + RefusedAccess)
 		c.reportError(cmd.refusedTo())
 		return
 	}
+	start := time.Now()
 	raw, err := cmd.dispatchArgs(inv)
 	if err == nil {
 		err = cmd.invoke(c, raw, inv.Files)
 	}
+	b.metrics.Since("airut_command_seconds", start, "command", cmd.spec.Name)
 	if err == nil {
 		log.Debug("command finished")
+		outcome("ok")
 		return
 	}
+	outcome(errorKind(err))
 	var pe panicError
 	if errors.As(err, &pe) {
 		log.Error("command panicked", "stack", string(pe.stack))

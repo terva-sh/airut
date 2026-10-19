@@ -12,6 +12,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,6 +40,19 @@ type Config struct {
 	// Discord and Matrix are nil for a platform the bot does not serve.
 	Discord *Discord
 	Matrix  *Matrix
+	// Metrics is how the bot reports its metrics. Its zero value reports
+	// none, beyond what the core keeps in memory.
+	Metrics Metrics
+}
+
+// Metrics is where the bot serves its metrics, and how often it logs
+// them. They go to airut.Config's MetricsAddr and SummaryEvery.
+type Metrics struct {
+	// Listen is the address /metrics is served on, as "127.0.0.1:9464".
+	// Empty serves nothing.
+	Listen string
+	// SummaryEvery is how often a summary is logged; zero logs none.
+	SummaryEvery time.Duration
 }
 
 // Bot is the settings every platform shares.
@@ -149,6 +163,7 @@ type fileConfig struct {
 	Store     *fileStore              `toml:"store"`
 	Discord   *fileDiscord            `toml:"discord"`
 	Matrix    *fileMatrix             `toml:"matrix"`
+	Metrics   *fileMetrics            `toml:"metrics"`
 	// App is the bot's own settings, which LoadApp decodes. It is any,
 	// not a table, so that a value of the wrong type is a problem
 	// reported with the rest rather than a failure of the whole decode.
@@ -216,6 +231,11 @@ type fileDiscord struct {
 	Guilds []string `toml:"guilds"`
 }
 
+type fileMetrics struct {
+	Listen       string `toml:"listen"`
+	SummaryEvery string `toml:"summary_every"`
+}
+
 type fileMatrix struct {
 	Homeserver string `toml:"homeserver"`
 	UserID     string `toml:"user_id"`
@@ -270,6 +290,18 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 	c := &Config{Bot: Bot{Prefix: f.Bot.Prefix}}
 	if strings.ContainsAny(f.Bot.Prefix, " \t\r\n") {
 		p.add("bot.prefix", "a prefix cannot contain spaces")
+	}
+
+	if m := f.Metrics; m != nil {
+		c.Metrics.Listen = m.Listen
+		if m.Listen != "" {
+			if _, port, err := net.SplitHostPort(m.Listen); err != nil || port == "" {
+				p.add("metrics.listen", `not an address such as "127.0.0.1:9464" or ":9464"`)
+			}
+		}
+		if m.SummaryEvery != "" {
+			c.Metrics.SummaryEvery = duration(p, "metrics.summary_every", m.SummaryEvery)
+		}
 	}
 
 	ids := make([]string, 0, len(f.Providers))

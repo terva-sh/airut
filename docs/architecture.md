@@ -315,6 +315,50 @@ schema is a set of forward-only migrations embedded in the binary.
 The database holds conversation text. Protect it and back it up like the
 Matrix crypto store; airut never logs what is in it.
 
+## Metrics
+
+Every bot keeps metrics in memory, which `Bot.Metrics()` and
+`Ctx.Metrics()` return. The core records these:
+
+| Series | Labels | What it counts |
+|---|---|---|
+| `airut_commands_total` | `command`, `outcome` | invocations, by how each ended |
+| `airut_command_seconds` | `command` | how long a command that ran took |
+| `airut_events_total` | `kind`, `outcome` | event handler runs |
+| `airut_event_seconds` | `kind` | how long one event's handlers took |
+| `airut_agent_turns_total` | `command`, `outcome` | agent turns, refused ones included |
+| `airut_agent_turn_seconds` | `command` | how long a turn that started took |
+| `airut_agent_requests_total` | `command` | model requests |
+| `airut_agent_tokens_total` | `command` | tokens the provider reported |
+| `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `budget`, or `error` |
+| `airut_adapter_up` | `platform` | 1 while the adapter runs |
+| `airut_uptime_seconds` | | seconds since the bot was made |
+
+An outcome is `ok` or the error's kind, as the log names it: `arguments`,
+`user`, `handler`, `panic`, `refused_access`, `refused_rate`, and so on. A
+command is labelled with its registered name, and an unknown one with
+`""` and the outcome `unknown`, because what was typed is chat text. An
+agent turn started from an event handler has the command `""`.
+
+A bot adds its own with `Add` for a counter, `Set` for a gauge, and
+`Observe` or `Since` for a timing. A timing keeps a count, a sum, and a
+maximum. That is enough for a mean and a rate, and costs no buckets.
+Label values must be ids and kinds, never message text. Each distinct
+value is a series kept for the bot's lifetime, so a label taken from chat
+would let anyone grow memory without bound and would put the chat in the
+scrape. A malformed name or a name reused as another kind panics, since
+it is a mistake in the bot's code.
+
+Two settings report them. `Config.MetricsAddr` serves `/metrics` in the
+Prometheus text format, with a timing as a summary's `_count` and `_sum`
+and a `_max` gauge beside it. `Run` fails before it starts an adapter if
+it cannot listen. `Config.SummaryEvery` logs one `metrics summary` line
+of what changed since the last one. Counters and timings appear there as
+deltas. A bot without a scraper can read its rates from the log.
+
+The endpoint has no authentication. Bind it to an address only the
+scraper reaches.
+
 ## Configuration
 
 The engine reads no file and no environment variable, so the framework
@@ -324,7 +368,8 @@ supplies everything. Each bot has one TOML file, which
 - the model providers: OpenAI-compatible endpoints and their models;
 - the agent's default model, budget, rate limit, and access lists;
 - the session store;
-- each platform's settings.
+- each platform's settings;
+- where metrics are served, and how often they are logged.
 
 Secrets are never in the file. A key that holds one names where the
 deployment put it: an environment variable, a systemd credential, or a

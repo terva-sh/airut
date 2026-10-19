@@ -360,6 +360,16 @@ func TestBudgetStopsTheTurn(t *testing.T) {
 			if got, want := final(evs), "Rolling. \n\n"+c.note; got != want {
 				t.Errorf("answer = %q, want %q", got, want)
 			}
+			m := e.bot.Metrics()
+			if s, _ := m.Get("airut_agent_requests_total", "command", "ask"); s.Value != float64(c.requests) {
+				t.Errorf("requests metric = %v, want %d", s.Value, c.requests)
+			}
+			if s, _ := m.Get("airut_agent_tokens_total", "command", "ask"); s.Value != float64(100*c.requests) {
+				t.Errorf("tokens metric = %v, want %d", s.Value, 100*c.requests)
+			}
+			if s, _ := m.Get("airut_agent_stops_total", "command", "ask", "stop", "budget"); s.Value != 1 {
+				t.Errorf("budget stops = %v, want 1", s.Value)
+			}
 		})
 	}
 }

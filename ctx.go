@@ -50,6 +50,24 @@ func (c *Ctx) Command() string {
 	return c.cmd.spec.Name
 }
 
+// metricCommand is the command a metric is labelled with: the
+// registered name, or "" in an event handler. Never what was typed,
+// which is chat text.
+func (c *Ctx) metricCommand() string {
+	if c.cmd == nil {
+		return ""
+	}
+	return c.cmd.spec.Name
+}
+
+// Metrics returns the bot's metrics, for a handler or an agent to record
+// its own. Label values are ids and kinds, never message text.
+func (c *Ctx) Metrics() *Metrics { return c.bot.metrics }
+
+// MetricCommand is the label a metric about this invocation names its
+// command by: the registered name, or "" in an event handler.
+func (c *Ctx) MetricCommand() string { return c.metricCommand() }
+
 // Message is the message that triggered the invocation, when there was
 // one; a Discord application command has none. In an event handler it
 // is the event's message, or for a reaction the message reacted to.

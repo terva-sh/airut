@@ -158,9 +158,16 @@ func (b *Bot) deliver(ctx context.Context, ev Event, r Responder) {
 		return
 	}
 	log := b.cfg.Logger.With("event", inv.ID, "kind", kind, "platform", string(inv.Caller.Platform))
+	start := time.Now()
+	defer func() { b.metrics.Since("airut_event_seconds", start, "kind", kind) }()
 	for i, h := range handlers {
 		c := &Ctx{ctx: ctx, bot: b, inv: inv, resp: r}
 		err := runHandler(h, c, ev)
+		o := "ok"
+		if err != nil {
+			o = errorKind(err)
+		}
+		b.metrics.Add("airut_events_total", 1, "kind", kind, "outcome", o)
 		if err == nil {
 			continue
 		}

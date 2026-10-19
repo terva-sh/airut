@@ -85,6 +85,7 @@ func TestExample(t *testing.T) {
 		Discord: &Discord{Token: secret, Guilds: []string{"345678901234567890"}},
 		Matrix: &Matrix{Homeserver: "https://matrix.example.org", UserID: "@sample:example.org", Password: secret,
 			StateDir: "/var/lib/airut-sample/matrix", DeviceName: "airut sample"},
+		Metrics: Metrics{Listen: "127.0.0.1:9464", SummaryEvery: 15 * time.Minute},
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Errorf("example:\n got %+v\nwant %+v", c, want)
@@ -126,7 +127,7 @@ path = "sessions.db"
 
 	// A file with no [agent] runs plain commands only.
 	c, err = load(t, minimal)
-	if err != nil || c.Agent != nil || c.Store.Path != "" || c.Matrix != nil {
+	if err != nil || c.Agent != nil || c.Store.Path != "" || c.Matrix != nil || c.Metrics != (Metrics{}) {
 		t.Fatalf("minimal = %+v, %v", c, err)
 	}
 }
@@ -329,6 +330,7 @@ budget = { max_turns = 1, max_tokens = 1 }
 [store]
 path = "s"
 `, []string{"agent.model"}},
+		{"bad metrics", minimal + "[metrics]\nlisten = \"" + sentinel + "\"\nsummary_every = \"0s\"\n", []string{"metrics.listen", "metrics.summary_every"}},
 		{"a store without an agent", minimal + "[store]\npath = \"s\"\n", []string{"store"}},
 		{"bad platforms", "[discord]\nguilds = [\"general\"]\n[bot]\nprefix = \"! \"\n[matrix]\nhomeserver = \"example.org\"\n", []string{
 			"bot.prefix", "discord.guilds.0", "discord.token", "matrix.homeserver", "matrix.state_dir", "matrix.user_id",

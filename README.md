@@ -47,7 +47,7 @@ model.
 
 | Package | Holds | Imports |
 |---|---|---|
-| `terva.sh/airut` | commands, `Ctx`, routing, the portable reply surface | neither terva nor any platform library |
+| `terva.sh/airut` | commands, `Ctx`, routing, the portable reply surface, metrics | neither terva nor any platform library |
 | `terva.sh/airut/discord` | the Discord adapter | discordgo |
 | `terva.sh/airut/matrix` | the Matrix adapter | [rihma](https://github.com/terva-sh/rihma) |
 | `terva.sh/airut/agent` | `c.Agent(...)` on terva's engine | terva |

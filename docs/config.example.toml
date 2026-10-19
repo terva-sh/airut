@@ -76,3 +76,13 @@ password = { credential = "matrix-password" }
 # Keeps the Matrix session and the crypto store. Back it up.
 state_dir = "/var/lib/airut-sample/matrix"
 device_name = "airut sample"
+
+# Metrics. Without this table the bot keeps its metrics in memory only,
+# for a command that reports them.
+[metrics]
+# Serves /metrics in the Prometheus text format. Bind it to an address
+# only the scraper reaches: the metrics name commands and platforms,
+# never message text, but nothing guards the endpoint.
+listen = "127.0.0.1:9464"
+# Logs a summary of the metrics that changed since the last one.
+summary_every = "15m"

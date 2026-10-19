@@ -122,18 +122,32 @@ func (r *TurnRun) run(out TurnOutput) error {
 	case r.c.bot.cfg.Agent == nil:
 		return ErrNoAgent
 	}
+	m, command := r.c.bot.metrics, r.c.metricCommand()
 	g := r.c.bot.gate
 	if err := g.check(r.c); err != nil {
 		var rf *Refusal
 		errors.As(err, &rf)
 		r.c.bot.cfg.Logger.Info("agent turn refused", "invocation", r.c.inv.ID,
 			"platform", string(r.c.inv.Caller.Platform), "reason", rf.Reason)
+		m.Add("airut_agent_turns_total", 1, "command", command, "outcome", "refused_"+rf.Reason)
 		return err
 	}
 	t := r.t
 	t.Budget = g.budget(t.Budget)
 	t.Tools = r.c.reachable(t.Tools)
-	return r.c.bot.cfg.Agent.Run(r.c, t, out)
+	// Deferred, so a turn whose agent panics is counted as one: the
+	// panic goes on to the command's own recovery.
+	start, outcome := time.Now(), "panic"
+	defer func() {
+		m.Since("airut_agent_turn_seconds", start, "command", command)
+		m.Add("airut_agent_turns_total", 1, "command", command, "outcome", outcome)
+	}()
+	err := r.c.bot.cfg.Agent.Run(r.c, t, out)
+	outcome = "ok"
+	if err != nil {
+		outcome = errorKind(err)
+	}
+	return err
 }
 
 // Text runs the turn and returns the whole answer.

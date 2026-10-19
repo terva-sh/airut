@@ -192,8 +192,13 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 			out.ToolCall(e.Name)
 		}
 	})
+	stop := stopKind(err, budget.stopped)
 	a.log.Info("agent turn finished", "invocation", c.ID(), "platform", string(c.Platform()),
-		"requests", budget.allowed(steps), "tokens", budget.used(), "stop", stopKind(err, budget.stopped))
+		"requests", budget.allowed(steps), "tokens", budget.used(), "stop", stop)
+	m, command := c.Metrics(), c.MetricCommand()
+	m.Add("airut_agent_requests_total", float64(budget.allowed(steps)), "command", command)
+	m.Add("airut_agent_tokens_total", float64(budget.used()), "command", command)
+	m.Add("airut_agent_stops_total", 1, "command", command, "stop", stop)
 	if err != nil {
 		return err
 	}
