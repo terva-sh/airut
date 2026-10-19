@@ -1,0 +1,217 @@
+package airuttest_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"terva.sh/airut"
+	"terva.sh/airut/airuttest"
+)
+
+// fatalTB records what Start reports. Fatalf stops the caller with a
+// sentinel panic instead of the test's goroutine.
+type fatalTB struct {
+	testing.TB
+	cleanups []func()
+	fatal    string
+	errs     []string
+}
+
+type stopped struct{}
+
+func (f *fatalTB) Helper()                   {}
+func (f *fatalTB) Cleanup(fn func())         { f.cleanups = append(f.cleanups, fn) }
+func (f *fatalTB) Errorf(s string, a ...any) { f.errs = append(f.errs, fmt.Sprintf(s, a...)) }
+func (f *fatalTB) Fatalf(s string, a ...any) {
+	f.fatal = fmt.Sprintf(s, a...)
+	panic(stopped{})
+}
+
+func TestStartReportsAnEarlyFailureWithoutHanging(t *testing.T) {
+	b := airut.New(airut.Config{})
+	// A bot already running cannot Run again, so Start's Run fails at once.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := airuttest.New("first")
+	go b.Run(ctx, first)
+	<-first.Ready()
+
+	tb := &fatalTB{TB: t}
+	func() {
+		defer func() {
+			if r := recover(); r != (stopped{}) {
+				panic(r)
+			}
+		}()
+		airuttest.Start(tb, b)
+	}()
+	if !strings.Contains(tb.fatal, "Run called twice") {
+		t.Errorf("Fatalf = %q", tb.fatal)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for i := len(tb.cleanups) - 1; i >= 0; i-- {
+			tb.cleanups[i]()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start's cleanup hung after an early failure")
+	}
+	if len(tb.errs) != 0 {
+		t.Errorf("cleanup reported the failure again: %q", tb.errs)
+	}
+}
+
+func TestKeyedMessagesAreSentOnce(t *testing.T) {
+	b := airut.New(airut.Config{Prefix: "!"})
+	var refs []airut.MessageRef
+	b.Command("twice", "Reply twice with one key", func(c *airut.Ctx) error {
+		for range 2 {
+			ref, err := c.Send(airut.Message{Text: "once", Key: "reply-key"})
+			if err != nil {
+				return err
+			}
+			refs = append(refs, ref)
+		}
+		return nil
+	})
+	a := airuttest.Start(t, b)
+	got := a.Text("!twice")
+	if len(got) != 1 || len(refs) != 2 || refs[0] != refs[1] || refs[0].ID != got[0].Ref {
+		t.Errorf("a keyed reply sent twice: events %+v, refs %v", got, refs)
+	}
+	ch := airut.Channel{Platform: airuttest.Platform, ID: "room"}
+	first, _ := a.Send(context.Background(), ch, airut.Message{Text: "x", Key: "send-key"})
+	again, _ := a.Send(context.Background(), ch, airut.Message{Text: "x", Key: "send-key"})
+	other, _ := a.Send(context.Background(), ch, airut.Message{Text: "x", Key: "other-key"})
+	plain1, _ := a.Send(context.Background(), ch, airut.Message{Text: "x"})
+	plain2, _ := a.Send(context.Background(), ch, airut.Message{Text: "x"})
+	if first != again || other == first || plain1 == plain2 {
+		t.Errorf("sends: %v %v %v %v %v", first, again, other, plain1, plain2)
+	}
+	if n := len(a.Events()); n != 5 {
+		t.Errorf("%d events recorded, want 5: the reply, then send-key, other-key, and two unkeyed sends", n)
+	}
+}
+
+// TestConcurrentKeyedSendsRecordOne races replies and Conn sends that
+// share a key, round after round with a fresh key each: every round
+// records exactly one message, and all its sends get that message's ref.
+func TestConcurrentKeyedSendsRecordOne(t *testing.T) {
+	const rounds, racers = 200, 8
+	b := airut.New(airut.Config{Prefix: "!"})
+	var a *airuttest.Adapter
+	bad := 0
+	b.Command("race", "Send one key many ways at once", func(c *airut.Ctx) error {
+		for round := range rounds {
+			key := fmt.Sprintf("race-%d", round)
+			refs := make([]airut.MessageRef, racers)
+			var wg sync.WaitGroup
+			// go releases the racers together, so their sends overlap.
+			start := make(chan struct{})
+			for i := range racers {
+				wg.Go(func() {
+					<-start
+					if i%2 == 0 {
+						refs[i], _ = c.Responder().Reply(c.Context(), airut.Message{Text: "once", Key: key})
+					} else {
+						refs[i], _ = a.Send(c.Context(), c.Channel(), airut.Message{Text: "once", Key: key})
+					}
+				})
+			}
+			close(start)
+			wg.Wait()
+			for _, r := range refs {
+				if r != refs[0] || r.ID == "" {
+					bad++
+					break
+				}
+			}
+		}
+		return nil
+	})
+	a = airuttest.Start(t, b)
+	a.Text("!race")
+	if n := len(a.Events()); n != rounds || bad != 0 {
+		t.Errorf("%d messages recorded for %d keys; %d rounds handed out differing refs", n, rounds, bad)
+	}
+}
+
+func TestMentionCallsACommandOrReachesTheHandlers(t *testing.T) {
+	b := airut.New(airut.Config{Prefix: "!"})
+	b.Command("ping", "Answer pong", func(c *airut.Ctx) error {
+		_, err := c.Reply("pong")
+		return err
+	})
+	var seen []airut.MessageEvent
+	b.OnMessage(func(c *airut.Ctx, m airut.MessageEvent) error {
+		seen = append(seen, m)
+		return nil
+	})
+	a := airuttest.Start(t, b)
+	for _, line := range []string{"ping", "!ping"} {
+		if got := a.Mention(line); len(got) != 1 || got[0].Text != "pong" {
+			t.Errorf("Mention(%q) did %+v; want the ping command's answer", line, got)
+		}
+	}
+	a.Mention(" find a fox ")
+	a.Text("lunch?")
+	if len(seen) != 2 {
+		t.Fatalf("the handlers saw %d messages, want 2", len(seen))
+	}
+	if m := seen[0]; !m.Mentioned || m.Request != "find a fox " || m.Text != airuttest.BotName+":  find a fox " {
+		t.Errorf("a mention arrived as Mentioned %v, Request %q, Text %q", m.Mentioned, m.Request, m.Text)
+	}
+	if m := seen[1]; m.Mentioned || m.Request != "" {
+		t.Errorf("plain chat arrived as Mentioned %v, Request %q", m.Mentioned, m.Request)
+	}
+}
+
+func TestDeliveredMessagesAreDated(t *testing.T) {
+	b := airut.New(airut.Config{})
+	var seen []airut.MessageEvent
+	b.OnMessage(func(c *airut.Ctx, m airut.MessageEvent) error {
+		seen = append(seen, m)
+		return nil
+	})
+	a := airuttest.Start(t, b)
+	before := time.Now()
+	a.Text("now")
+	long := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	a.Text("then", airuttest.SentAt(long))
+	a.Mention("then too", airuttest.SentAt(long))
+	if len(seen) != 3 || seen[0].Sent.Before(before) || !seen[1].Sent.Equal(long) || !seen[2].Sent.Equal(long) {
+		t.Errorf("messages were sent at %v, %v, %v", seen[0].Sent, seen[1].Sent, seen[2].Sent)
+	}
+}
+
+// TestAMessageInAThreadIsAnsweredThere: as on Matrix, a reply to a
+// command or a message delivered in a thread goes into that thread.
+func TestAMessageInAThreadIsAnsweredThere(t *testing.T) {
+	b := airut.New(airut.Config{})
+	b.Command("ping", "Answer pong", func(c *airut.Ctx) error {
+		_, err := c.Reply("pong")
+		return err
+	})
+	b.OnMessage(func(c *airut.Ctx, m airut.MessageEvent) error {
+		_, err := c.Reply("heard")
+		return err
+	})
+	a := airuttest.Start(t, b)
+	for _, evs := range [][]airuttest.Event{a.Text("!ping", airuttest.InThread("t1")), a.Text("hello", airuttest.InThread("t1"))} {
+		if len(evs) != 1 || evs[0].Thread != "t1" {
+			t.Errorf("a message in thread t1 was answered with %+v", evs)
+		}
+	}
+	if evs := a.Text("!ping"); len(evs) != 1 || evs[0].Thread != "" {
+		t.Errorf("a message outside any thread was answered with %+v", evs)
+	}
+}
