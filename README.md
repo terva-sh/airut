@@ -24,15 +24,18 @@ bot.Command("ask", "Ask the assistant", func(c *airut.Ctx, a AskArgs) error {
     }).StreamTo(c)
 })
 
-err := bot.Run(ctx, discord.Adapter(dcfg), matrix.New(cfg.Matrix, matrix.Options{}))
+err := bot.Run(ctx, discord.New(cfg.Discord, discord.Options{}), matrix.New(cfg.Matrix, matrix.Options{}))
 ```
+
+[cmd/airut-example](cmd/airut-example) is a runnable version of this
+bot: a dice command and an `ask` command whose agent may roll, served on
+Discord, Matrix, or both, as its configuration file says.
 
 **Status: early.** The core is in place: commands, `Ctx`, routing, and
 the gate on agent turns, tested through the in-process fake adapter in
 `airuttest`. So are the agent package with its SQLite session store, and
-the Matrix adapter, tested against a throwaway Synapse. The Discord
-adapter is not written yet, so the last line above does not build
-today. The design is in [docs/architecture.md](docs/architecture.md).
+the Matrix adapter, tested against a throwaway Synapse, and the Discord
+adapter, tested against a fake Discord transport. The design is in [docs/architecture.md](docs/architecture.md).
 
 ## How it differs from terva's bot mode
 
