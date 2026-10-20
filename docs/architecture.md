@@ -60,7 +60,7 @@ registered: the name pattern, description lengths, at most 25
 parameters, and required parameters before optional ones. A definition
 that one platform would refuse therefore fails at startup on all of
 them. `Command` panics there, naming the command and the field. The
-Discord adapter maps a `Spec` to discordgo types.
+Discord adapter maps a `Spec` to an application command.
 
 A command called by the agent runs with the same `Ctx` type, marked as an
 agent call, so a handler can tell a person's request from the model's.
@@ -135,8 +135,10 @@ message answers and the step it belongs to. On Matrix each part's
 transaction id derives from the key, and the homeserver remembers a
 transaction for about a day, from the same device; a keyed message
 cannot carry files, because rihma's media upload takes no transaction
-id. `Ctx.Conn` and `Bot.Conn` return it from a
-handler or from anywhere else.
+id. On Discord each part's nonce derives from the key, and Discord
+enforces a nonce for a few minutes; an answer to a command takes no
+key, because Discord delivers each command once. `Ctx.Conn` and
+`Bot.Conn` return the Conn from a handler or from anywhere else.
 
 ## The Matrix adapter
 
@@ -203,6 +205,73 @@ encrypted history it could read before.
 The live tests run against a throwaway Synapse in a container, started
 by `just synapse`, and `just e2e` runs them. `just ci` builds them but
 does not run them.
+
+## The Discord adapter
+
+`discord.New(cfg.Discord, discord.Options{...})` runs on discordgo. It
+connects to the gateway with the bot token and asks only for the events
+it uses: guilds, messages, and reactions, in guilds and direct messages.
+
+- **Commands.** Commands are application commands, the slash commands a
+  person picks from Discord's menu, and their typed options arrive as
+  `Values`, users, channels, roles, and attachments included. Each time
+  the gateway session starts, the adapter replaces the application's
+  commands with the bot's in one bulk overwrite: in each guild the
+  configuration names, where changes show at once, or globally. A
+  restart therefore neither registers a command twice nor leaves a
+  removed one behind. Text commands with a prefix are not carried,
+  because reading other people's messages needs a privileged intent.
+- **Answering in time.** Discord wants an answer to a command within
+  three seconds. The adapter defers every command before its handler
+  runs, which shows the person a "thinking" placeholder, so a handler
+  or an agent turn may take as long as it needs.
+- **Replies.**
+  - The first public reply fills the placeholder, later ones follow it
+    up, and a private reply is an ephemeral follow-up only the caller
+    sees.
+  - Discord shows the first follow-up after a deferral in the
+    placeholder's place, with the placeholder's visibility, so a
+    private reply that comes first would be public. The adapter turns
+    the placeholder into "Answered privately." before such a reply. A
+    placeholder no public reply filled is deleted when the command
+    finishes.
+  - Text is split at Discord's 2000 characters. An edit that grows a
+    message past the limit, as a streamed answer does, continues it in
+    further messages, and one that shrinks it removes them.
+  - Discord accepts answers to a command for fifteen minutes. After
+    that, public replies go to the channel and private ones to a direct
+    message, never to the channel.
+  - Every message carries an empty `allowed_mentions`, so nothing in
+    a reply pings a person, a role, or `@everyone`.
+- **Asks.** An ask is a message with a button for each choice, at most
+  25. Only the person asked can answer; anyone else who presses is told
+  privately that it is not theirs. Answered or expired, the message
+  shows the outcome and loses its buttons, and a press on an ask from
+  before a restart closes it.
+- **Events.** Messages and reactions other than the bot's own reach the
+  handlers, with `Mentioned` set when a message mentions the bot.
+  Discord sends the text of other people's messages only to a bot with
+  the message content intent, which is privileged:
+  `Options.MessageContent` asks for it, once it is enabled for the
+  application in Discord's developer portal.
+- **The Conn.**
+  - `Send` derives each part's nonce from `Message.Key`, which Discord
+    enforces for a few minutes.
+  - `Open` downloads only from Discord's content servers, whose links
+    are signed, and never sends the bot's token.
+  - `History` pages back by message id and leaves out the bot's own
+    messages and system messages such as a member joining.
+  - `Member` checks membership of the channel's guild, or a direct
+    message's recipients. It says nothing of whether a member may read
+    the channel.
+- **Logs.** discordgo's own logging is off, because its errors can
+  quote gateway payloads, which hold message text. The adapter logs
+  ids and error kinds.
+
+The tests run discordgo against a fake transport that answers Discord's
+REST API and models its rules, such as the first follow-up after a
+deferral, and feed gateway events to the adapter directly. No test
+reaches Discord.
 
 ## Agent turns
 

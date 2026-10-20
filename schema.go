@@ -233,6 +233,8 @@ func tagBounds(p *Param, tag reflect.StructTag, where string) error {
 		switch {
 		case p.Kind == KindString && (v < 0 || v > maxStringLen || v != math.Trunc(v)):
 			return fmt.Errorf("%s: a string's %s length must be a whole number from 0 to %d", where, b.key, maxStringLen)
+		case p.Kind == KindString && b.key == "max" && v < 1:
+			return fmt.Errorf("%s: a string's max length must be at least 1", where)
 		case math.IsNaN(v) || math.Abs(v) > maxInteger:
 			return fmt.Errorf("%s: %s must be a number from %d to %d", where, b.key, -maxInteger, maxInteger)
 		case p.Kind == KindInteger && v != math.Trunc(v):

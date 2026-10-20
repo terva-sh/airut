@@ -68,10 +68,12 @@ type Message struct {
 	// Key makes sending idempotent. A second message with the same Key,
 	// from the same bot, posts nothing and returns the first one's ref,
 	// for as long as the platform remembers the key: about a day on
-	// Matrix. A bot that records what it sent uses it to resend safely
-	// after a restart that fell between a send and its record. The key
-	// is the bot's to make unique, such as the id of the event the
-	// message answers and a step name.
+	// Matrix, and a few minutes on Discord, which takes a key only for a
+	// message posted to a channel, not for an answer to a command. A bot
+	// that records what it sent uses it to resend safely after a restart
+	// that fell between a send and its record. The key is the bot's to
+	// make unique, such as the id of the event the message answers and a
+	// step name.
 	Key string
 }
 

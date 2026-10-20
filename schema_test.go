@@ -232,6 +232,11 @@ func TestRegistrationPanics(t *testing.T) {
 		}) error {
 			return nil
 		}, "from 0 to 6000"},
+		{"ok", "d", func(*Ctx, struct {
+			A string `desc:"a" max:"0"`
+		}) error {
+			return nil
+		}, "max length must be at least 1"},
 	}
 	for _, c := range cases {
 		t.Run(c.want, func(t *testing.T) {
