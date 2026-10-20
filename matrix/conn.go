@@ -121,3 +121,80 @@ func (s *session) Member(ctx context.Context, ch airut.Channel, u airut.User) (b
 	}
 	return m != nil && m.Membership == event.MembershipJoin, nil
 }
+
+// React sends an m.reaction to the message ref in ch and returns the
+// reaction's event id. mautrix never encrypts a reaction, so its
+// relation is readable even in an encrypted room. A homeserver refuses
+// a second identical reaction from the same sender, so when the send
+// fails React looks for the bot's own reaction with this key and
+// returns that.
+func (s *session) React(ctx context.Context, ch airut.Channel, ref airut.MessageRef, emoji string) (airut.MessageRef, error) {
+	room, target := id.RoomID(ch.ID), id.EventID(ref.ID)
+	resp, err := s.c.SendReaction(ctx, room, target, emoji)
+	if err == nil {
+		return airut.MessageRef{ID: string(resp.EventID)}, nil
+	}
+	if own, ok := s.ownReaction(ctx, room, target, emoji); ok {
+		return airut.MessageRef{ID: string(own)}, nil
+	}
+	return airut.MessageRef{}, err
+}
+
+// relationPage is how many reactions ownReaction reads a request. A
+// test lowers it to make the lookup page.
+var relationPage = 100
+
+// ownReaction finds the bot's live reaction with key on target. It reads
+// every page of target's reactions, until ctx ends, because the bot's
+// may be the oldest of many. It stops early if the homeserver hands back
+// a page token it already gave.
+func (s *session) ownReaction(ctx context.Context, room id.RoomID, target id.EventID, key string) (id.EventID, bool) {
+	req := &mautrix.ReqGetRelations{RelationType: event.RelAnnotation, EventType: event.EventReaction, Limit: relationPage}
+	seen := map[string]bool{}
+	for ctx.Err() == nil {
+		resp, err := s.c.GetRelations(ctx, room, target, req)
+		if err != nil {
+			return "", false
+		}
+		for _, evt := range resp.Chunk {
+			if evt.Sender != s.c.UserID {
+				continue
+			}
+			if err := evt.Content.ParseRaw(evt.Type); err != nil && !errors.Is(err, event.ErrContentAlreadyParsed) {
+				continue
+			}
+			if r := evt.Content.AsReaction(); r.RelatesTo.Key == key {
+				return evt.ID, true
+			}
+		}
+		if resp.NextBatch == "" || seen[resp.NextBatch] {
+			break
+		}
+		seen[resp.NextBatch] = true
+		req.From = resp.NextBatch
+	}
+	return "", false
+}
+
+// Unreact redacts a reaction the bot sent. It fetches the event first
+// and redacts only an m.reaction whose sender is the bot. An encrypted
+// event is refused unread, because the bot's reactions are never
+// encrypted.
+func (s *session) Unreact(ctx context.Context, ch airut.Channel, reaction airut.MessageRef) error {
+	room, ev := id.RoomID(ch.ID), id.EventID(reaction.ID)
+	if ev == "" {
+		return airut.ErrNotOwnReaction
+	}
+	evt, err := s.c.GetEvent(ctx, room, ev)
+	if err != nil {
+		return err
+	}
+	if evt.Type != event.EventReaction || evt.Sender != s.c.UserID {
+		return airut.ErrNotOwnReaction
+	}
+	if evt.Unsigned.RedactedBecause != nil {
+		return nil
+	}
+	_, err = s.c.RedactEvent(ctx, room, ev)
+	return err
+}

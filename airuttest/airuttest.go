@@ -24,7 +24,9 @@ const Platform airut.Platform = "test"
 // Event is one thing the bot did through the fake adapter.
 type Event struct {
 	// Kind is "reply", "edit", "react", "ask", "typing", or "thread",
-	// or "send" for a message posted through the adapter's Conn.
+	// or "send" for a message posted through the adapter's Conn. A
+	// reaction added through the Conn is also "react", with Channel and
+	// Reaction set, and one retracted through it is "unreact".
 	Kind    string
 	Ref     string // the message replied, edited, or reacted to
 	Text    string // the message text, the emoji, the question, or the thread name
@@ -34,8 +36,12 @@ type Event struct {
 	Thread  string // the thread the event happened in, if any
 	// ReplyTo is the message a reply answers, when it set one.
 	ReplyTo string
-	// Channel is the channel a send went to.
+	// Channel is the channel a send, or a reaction made through the
+	// Conn, went to.
 	Channel string
+	// Reaction is the ref Conn.React returned for the reaction added or
+	// retracted.
+	Reaction string
 }
 
 // Adapter is a fake platform. Slash and Text deliver invocations and
@@ -59,7 +65,14 @@ type Adapter struct {
 	memberErrs map[string]error                // channel id -> the error Member fails with
 	// keys maps a message's Key to the ref it was sent as.
 	keys map[string]string
+	// reactions holds the reactions made through the Conn, by ref, and
+	// live maps a channel, message, and emoji to the live one's ref.
+	reactions map[string]reaction
+	live      map[reaction]string
 }
+
+// reaction is one reaction the bot made through the Conn.
+type reaction struct{ channel, target, emoji string }
 
 // New returns a fake adapter for platform p, or for Platform when p is
 // empty.
@@ -78,7 +91,7 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 	a.mu.Lock()
 	a.host, a.ctx = h, ctx
 	a.mu.Unlock()
-	h.Ready(ctx, a)
+	h.Ready(ctx, a.Conn())
 	close(a.ready)
 	<-ctx.Done()
 	return nil
@@ -456,7 +469,57 @@ func (g *Agent) Results() []string {
 
 var _ airut.Agent = (*Agent)(nil)
 var _ airut.Adapter = (*Adapter)(nil)
-var _ airut.Conn = (*Adapter)(nil)
+var _ airut.Conn = conn{}
+
+// Conn returns the Conn the adapter announces to the bot. Its Send,
+// Open, History, and Member are the Adapter's own; React and Unreact
+// make and retract the bot's reactions, which the Adapter's React, a
+// member's reaction, does not.
+func (a *Adapter) Conn() airut.Conn { return conn{a} }
+
+// conn is the Adapter as the bot's Conn. It exists because the Adapter's
+// own React delivers a member's reaction to the bot.
+type conn struct{ *Adapter }
+
+// React records a reaction the bot added, and returns its ref. Reacting
+// again with the same emoji while the reaction stands records nothing
+// and returns the same ref, as both platforms do.
+func (c conn) React(_ context.Context, ch airut.Channel, ref airut.MessageRef, emoji string) (airut.MessageRef, error) {
+	a := c.Adapter
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r := reaction{ch.ID, ref.ID, emoji}
+	if own, ok := a.live[r]; ok {
+		return airut.MessageRef{ID: own}, nil
+	}
+	a.refSeq++
+	own := "reaction-" + strconv.Itoa(a.refSeq)
+	if a.reactions == nil {
+		a.reactions, a.live = map[string]reaction{}, map[reaction]string{}
+	}
+	a.reactions[own], a.live[r] = r, own
+	a.events = append(a.events, Event{Kind: "react", Ref: ref.ID, Text: emoji, Channel: ch.ID, Reaction: own})
+	return airut.MessageRef{ID: own}, nil
+}
+
+// Unreact records the retraction of a reaction React made in ch. Any
+// other ref fails with airut.ErrNotOwnReaction, and a reaction already
+// retracted records nothing.
+func (c conn) Unreact(_ context.Context, ch airut.Channel, ref airut.MessageRef) error {
+	a := c.Adapter
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	r, ok := a.reactions[ref.ID]
+	if !ok || r.channel != ch.ID {
+		return airut.ErrNotOwnReaction
+	}
+	if a.live[r] != ref.ID {
+		return nil
+	}
+	delete(a.live, r)
+	a.events = append(a.events, Event{Kind: "unreact", Ref: r.target, Text: r.emoji, Channel: ch.ID, Reaction: ref.ID})
+	return nil
+}
 
 // AddFile makes Conn.Open serve data for an attachment with this URL.
 func (a *Adapter) AddFile(url string, data []byte) {

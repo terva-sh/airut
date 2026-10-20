@@ -2,6 +2,7 @@ package airuttest_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -213,5 +214,68 @@ func TestAMessageInAThreadIsAnsweredThere(t *testing.T) {
 	}
 	if evs := a.Text("!ping"); len(evs) != 1 || evs[0].Thread != "" {
 		t.Errorf("a message outside any thread was answered with %+v", evs)
+	}
+}
+
+// TestConnReactionsSwap swaps a status reaction through the bot's Conn,
+// as a pipeline outside any invocation does, and checks what the Conn
+// refuses.
+func TestConnReactionsSwap(t *testing.T) {
+	b := airut.New(airut.Config{Prefix: "!"})
+	var conn airut.Conn
+	b.OnMessage(func(c *airut.Ctx, m airut.MessageEvent) error {
+		var err error
+		conn, err = c.Conn()
+		if err != nil {
+			return err
+		}
+		seen, err := conn.React(c.Context(), c.Channel(), m.Message, "👀")
+		if err != nil {
+			return err
+		}
+		if err := conn.Unreact(c.Context(), c.Channel(), seen); err != nil {
+			return err
+		}
+		_, err = conn.React(c.Context(), c.Channel(), m.Message, "✅")
+		return err
+	})
+	a := airuttest.Start(t, b)
+	evs := a.Text("a picture")
+	want := []string{"react 👀", "unreact 👀", "react ✅"}
+	if len(evs) != len(want) {
+		t.Fatalf("events = %+v", evs)
+	}
+	for i, e := range evs {
+		if got := e.Kind + " " + e.Text; got != want[i] || e.Channel != "channel-1" || e.Ref == "" || e.Reaction == "" {
+			t.Errorf("event %d = %+v, want %s", i, e, want[i])
+		}
+	}
+	if evs[0].Reaction != evs[1].Reaction || evs[1].Reaction == evs[2].Reaction {
+		t.Errorf("the retraction names %q, the reactions %q and %q", evs[1].Reaction, evs[0].Reaction, evs[2].Reaction)
+	}
+
+	ctx, ch, msg := context.Background(), airut.Channel{Platform: airuttest.Platform, ID: "channel-1"}, airut.MessageRef{ID: evs[0].Ref}
+	again, err := conn.React(ctx, ch, msg, "✅")
+	if err != nil || again.ID != evs[2].Reaction {
+		t.Errorf("reacting again = %v, %v, want the standing reaction %s", again, err, evs[2].Reaction)
+	}
+	for _, c := range []struct {
+		name string
+		ch   airut.Channel
+		ref  airut.MessageRef
+	}{
+		{"a message", ch, msg},
+		{"no ref", ch, airut.MessageRef{}},
+		{"another channel's reaction", airut.Channel{ID: "elsewhere"}, again},
+	} {
+		if err := conn.Unreact(ctx, c.ch, c.ref); !errors.Is(err, airut.ErrNotOwnReaction) {
+			t.Errorf("unreacting %s = %v, want ErrNotOwnReaction", c.name, err)
+		}
+	}
+	if err := conn.Unreact(ctx, ch, airut.MessageRef{ID: evs[0].Reaction}); err != nil {
+		t.Errorf("retracting a retracted reaction = %v", err)
+	}
+	if n := len(a.Events()); n != 3 {
+		t.Errorf("%d events after the repeats and refusals, want the 3 swaps alone", n)
 	}
 }

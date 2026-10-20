@@ -112,7 +112,8 @@ trigger.
 
 Some work belongs to no one invocation: posting a review to a
 moderators' channel, reading an image's bytes, walking a channel's
-history, or checking whether someone is in a channel. Each adapter
+history, checking whether someone is in a channel, or showing a long
+job's progress as a reaction. Each adapter
 announces a `Conn` through `Host.Ready` once it is connected:
 
 - `Send` posts to any channel, and `Message.ReplyTo` makes it a reply;
@@ -121,7 +122,14 @@ announces a `Conn` through `Host.Ready` once it is connected:
 - `History` pages back through a channel, newest first, with a cursor
   that survives a restart and an empty one at the start of what the bot
   may read;
-- `Member` reports whether a user is joined to a channel.
+- `Member` reports whether a user is joined to a channel;
+- `React` adds the bot's reaction to a message and returns a ref for
+  the reaction, and `Unreact` retracts one. Together they let a bot swap
+  a status reaction as work moves on. `Unreact` refuses anything that
+  is not the bot's own reaction, with `ErrNotOwnReaction`, so it cannot
+  remove a message or someone else's reaction. Reacting again with the
+  same emoji returns the standing reaction's ref, so a bot that
+  restarted before recording a ref can recover it.
 
 `bot.OnReady` runs each time an adapter announces its `Conn`, on a
 goroutine of its own that `Run` waits for, which is where a bot resumes
@@ -133,9 +141,9 @@ key, from the same bot, posts nothing and returns the first one's ref.
 The bot makes the key unique, typically from the id of the event the
 message answers and the step it belongs to. On Matrix each part's
 transaction id derives from the key, and the homeserver remembers a
-transaction for about a day, from the same device; a keyed message
-cannot carry files, because rihma's media upload takes no transaction
-id. On Discord each part's nonce derives from the key, and Discord
+transaction for about a day, from the same device. A file is a part
+too, so a keyed message with files posts each file once, but a resend
+uploads the file again and leaves that copy unreferenced. On Discord each part's nonce derives from the key, and Discord
 enforces a nonce for a few minutes; an answer to a command takes no
 key, because Discord delivers each command once. `Ctx.Conn` and
 `Bot.Conn` return the Conn from a handler or from anywhere else.
@@ -198,6 +206,12 @@ encrypted history it could read before.
     messages than asked for.
   - `Member` reads the state store, which knows the members of the rooms
     the bot is in.
+  - `React` sends an `m.reaction`, which mautrix never encrypts. The
+    homeserver refuses a second identical reaction from the same
+    sender, so on that refusal `React` finds the bot's standing one
+    through the relations API.
+  - `Unreact` fetches the event and redacts it only when it is an
+    `m.reaction` the bot sent. The redaction stays on record.
   - The adapter announces the `Conn` once a sync has been fully
     processed. On a first connect that is the second sync, so `OnReady`
     can wait up to the sync timeout of thirty seconds.
@@ -264,6 +278,10 @@ it uses: guilds, messages, and reactions, in guilds and direct messages.
   - `Member` checks membership of the channel's guild, or a direct
     message's recipients. It says nothing of whether a member may read
     the channel.
+  - `React` returns the message id and the emoji as the reaction's ref,
+    because Discord gives a reaction no id of its own. `Unreact` calls
+    the endpoint that removes only the bot's own reaction, and refuses a
+    ref whose parts are not an id and an emoji before any request.
 - **Logs.** discordgo's own logging is off, because its errors can
   quote gateway payloads, which hold message text. The adapter logs
   ids and error kinds.

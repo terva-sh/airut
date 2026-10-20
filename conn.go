@@ -9,7 +9,8 @@ import (
 
 // Conn is an adapter's connection to its platform, for what a bot does
 // outside any one invocation: posting to another channel, reading an
-// attachment, walking a channel's history, and checking membership. An
+// attachment, walking a channel's history, checking membership, and
+// adding and retracting the bot's own reactions. An
 // adapter announces its Conn through Host.Ready once it is connected.
 // Its methods must be safe for concurrent use.
 type Conn interface {
@@ -27,7 +28,22 @@ type Conn interface {
 	History(ctx context.Context, ch Channel, cursor string, limit int) (HistoryPage, error)
 	// Member reports whether u is joined to ch.
 	Member(ctx context.Context, ch Channel, u User) (bool, error)
+	// React reacts to the message ref in ch with emoji, and returns a
+	// ref for the reaction itself, which Unreact takes. Reacting again
+	// with the same emoji returns the same reaction's ref, so a bot that
+	// restarts before recording a ref can react again to recover it.
+	React(ctx context.Context, ch Channel, ref MessageRef, emoji string) (MessageRef, error)
+	// Unreact retracts a reaction that React returned. It fails with
+	// ErrNotOwnReaction for anything that is not the bot's own reaction,
+	// so it can never remove a message or someone else's reaction.
+	// Retracting a reaction already retracted is not an error. On Matrix
+	// the retraction is a redaction, which stays on record.
+	Unreact(ctx context.Context, ch Channel, reaction MessageRef) error
 }
+
+// ErrNotOwnReaction is returned by Conn.Unreact for a ref that does not
+// name a reaction the bot sent.
+var ErrNotOwnReaction = errors.New("airut: not a reaction the bot sent")
 
 // HistoryPage is one page of a channel's history.
 type HistoryPage struct {

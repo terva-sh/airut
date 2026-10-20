@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -459,9 +460,10 @@ func TestE2ECommandsEventsAndConn(t *testing.T) {
 	}
 }
 
-// TestE2EKeyedSendAcrossARestart sends a keyed message, restarts the
-// bot on the same state, as the same device, and sends it again, as a
-// bot resuming work after a crash would. The room gets one message.
+// TestE2EKeyedSendAcrossARestart sends a keyed message with a file,
+// restarts the bot on the same state, as the same device, and sends it
+// again, as a bot resuming work after a crash would. The room gets one
+// text event and one file event.
 func TestE2EKeyedSendAcrossARestart(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "encrypted"}[encrypted], func(t *testing.T) {
@@ -477,7 +479,8 @@ func TestE2EKeyedSendAcrossARestart(t *testing.T) {
 			alice := openHuman(t, ctx, hs, aliceName)
 			room := createRoom(t, ctx, alice, id.UserID("@"+botName+":localhost"), encrypted)
 			ch := airut.Channel{Platform: airut.Matrix, ID: string(room)}
-			keyed := airut.Message{Text: "once only", Key: "e2e/" + tg}
+			keyed := airut.Message{Text: "once only", Key: "e2e/" + tg,
+				Files: []airut.File{{Name: "once.txt", ContentType: "text/plain", Data: []byte("one file")}}}
 
 			s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
 			first, err := s.conn.Send(ctx, ch, keyed)
@@ -496,18 +499,115 @@ func TestE2EKeyedSendAcrossARestart(t *testing.T) {
 			}
 			alice.waitFor(t, ctx, "the message after the keyed sends", bodyIs("after the keyed sends"))
 			alice.mu.Lock()
-			n := 0
+			texts, files := 0, 0
 			for _, evt := range alice.got {
 				if bodyIs("once only")(evt) {
-					n++
+					texts++
+				}
+				if bodyIs("once.txt")(evt) {
+					files++
 				}
 			}
 			alice.mu.Unlock()
-			if n != 1 {
-				t.Errorf("a keyed message sent before and after a restart arrived %d times", n)
+			if texts != 1 || files != 1 {
+				t.Errorf("a keyed message sent before and after a restart arrived as %d text and %d file events, want 1 and 1", texts, files)
 			}
-			if _, err := s.conn.Send(ctx, ch, airut.Message{Text: "x", Key: "k", Files: []airut.File{{Name: "a.png", Data: []byte("x")}}}); err == nil {
-				t.Error("a keyed message with files was sent")
+		})
+	}
+}
+
+// TestE2EConnReactions swaps a status reaction through the Conn, as a
+// pipeline outside any invocation does, and checks that Unreact redacts
+// only the bot's own reactions.
+func TestE2EConnReactions(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "encrypted"}[encrypted], func(t *testing.T) {
+			hs := homeserver(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			tg := tag()
+			botName, aliceName := "bot-"+tg, "alice-"+tg
+			register(t, ctx, hs, botName)
+			register(t, ctx, hs, aliceName)
+			botID := id.UserID("@" + botName + ":localhost")
+			s := startBot(t, ctx, hs, botName, matrix.Options{})
+			alice := openHuman(t, ctx, hs, aliceName)
+			room := createRoom(t, ctx, alice, botID, encrypted)
+			ch := airut.Channel{Platform: airut.Matrix, ID: string(room)}
+			s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
+			conn := s.conn
+			picture := airut.MessageRef{ID: string(alice.send(t, ctx, room, "a picture"))}
+			reacted := func(key string) func(*event.Event) bool {
+				return func(evt *event.Event) bool {
+					return evt.Type == event.EventReaction && evt.Sender == botID && evt.Content.AsReaction().RelatesTo.Key == key
+				}
+			}
+			redacted := func(ref airut.MessageRef) bool {
+				evt, err := alice.GetEvent(ctx, room, id.EventID(ref.ID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return evt.Unsigned.RedactedBecause != nil
+			}
+
+			seen, err := conn.React(ctx, ch, picture, "👀")
+			if err != nil {
+				t.Fatal(err)
+			}
+			alice.waitFor(t, ctx, "the bot's 👀", reacted("👀"))
+			// The same reaction again, as after a restart that fell
+			// before the ref was recorded, returns the standing one.
+			if again, err := conn.React(ctx, ch, picture, "👀"); err != nil || again != seen {
+				t.Errorf("reacting again = %v, %v; want %v", again, err, seen)
+			}
+			if err := conn.Unreact(ctx, ch, seen); err != nil {
+				t.Fatal(err)
+			}
+			if !redacted(seen) {
+				t.Error("the retracted reaction was not redacted")
+			}
+			if err := conn.Unreact(ctx, ch, seen); err != nil {
+				t.Errorf("retracting it again = %v", err)
+			}
+			done, err := conn.React(ctx, ch, picture, "✅")
+			if err != nil || done == seen {
+				t.Fatalf("the swap = %v, %v", done, err)
+			}
+			alice.waitFor(t, ctx, "the bot's ✅", reacted("✅"))
+			if back, err := conn.React(ctx, ch, picture, "👀"); err != nil || back == seen {
+				t.Errorf("reacting with a retracted emoji = %v, %v; want a new reaction", back, err)
+			}
+
+			// The standing reaction is found however many reactions came
+			// after it: here three of hers, read one a page.
+			for _, e := range []string{"🐈", "🐕", "🐇"} {
+				if _, err := alice.SendReaction(ctx, room, id.EventID(picture.ID), e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer matrix.SetRelationPage(1)()
+			if again, err := conn.React(ctx, ch, picture, "✅"); err != nil || again != done {
+				t.Errorf("reacting again past a page of reactions = %v, %v; want %v", again, err, done)
+			}
+
+			// Nothing but the bot's own reaction is redacted.
+			hers, err := alice.SendReaction(ctx, room, id.EventID(picture.ID), "👍")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mine, err := conn.Send(ctx, ch, airut.Message{Text: "a post of the bot's"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, ref := range map[string]airut.MessageRef{
+				"her message": picture, "her reaction": {ID: string(hers.EventID)}, "the bot's message": mine, "no event": {},
+			} {
+				if err := conn.Unreact(ctx, ch, ref); !errors.Is(err, airut.ErrNotOwnReaction) {
+					t.Errorf("Unreact(%s) = %v, want ErrNotOwnReaction", name, err)
+				}
+				if ref.ID != "" && redacted(ref) {
+					t.Errorf("%s was redacted", name)
+				}
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -139,4 +140,41 @@ func (s *session) guildOf(channel string) string {
 		return c.GuildID
 	}
 	return ""
+}
+
+// React adds the bot's reaction to the message ref in ch. Discord gives
+// a reaction no id of its own, so the ref returned is the message id
+// and the emoji, joined by a slash. Adding a reaction the bot already
+// added succeeds, and returns the same ref.
+func (s *session) React(ctx context.Context, ch airut.Channel, ref airut.MessageRef, emoji string) (airut.MessageRef, error) {
+	e := reactionEmoji(emoji)
+	if !snowflake.MatchString(ch.ID) || !snowflake.MatchString(ref.ID) || !pathSafe(e) {
+		return airut.MessageRef{}, errors.New("discord: not a channel, message, and emoji Discord can react with")
+	}
+	if err := s.dg.MessageReactionAdd(ch.ID, ref.ID, e, discordgo.WithContext(ctx)); err != nil {
+		return airut.MessageRef{}, err
+	}
+	return airut.MessageRef{ID: ref.ID + "/" + e}, nil
+}
+
+// Unreact removes the bot's own reaction through the endpoint that
+// removes only the bot's, so no ref can reach anyone else's reaction. A
+// ref React did not make is refused before any request, and so is one
+// whose parts could change the request's path.
+func (s *session) Unreact(ctx context.Context, ch airut.Channel, reaction airut.MessageRef) error {
+	msg, e, ok := strings.Cut(reaction.ID, "/")
+	if !ok || !snowflake.MatchString(ch.ID) || !snowflake.MatchString(msg) || !pathSafe(e) {
+		return airut.ErrNotOwnReaction
+	}
+	return s.dg.MessageReactionRemove(ch.ID, msg, e, "@me", discordgo.WithContext(ctx))
+}
+
+// pathSafe reports whether an emoji, as reactionEmoji gives it, can go
+// into a request path as one segment: a custom emoji's name:id, or text
+// with none of the characters that end or escape a segment. A '#', as in
+// the keycap emoji, is allowed because discordgo's reaction calls escape
+// it, which TestConnReactions pins: unescaped, it would end the path
+// before the @me that limits a removal to the bot's own reaction.
+func pathSafe(e string) bool {
+	return e != "" && !strings.ContainsAny(e, "/\\?%. \t\r\n")
 }

@@ -2,6 +2,7 @@ package discord
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -282,4 +283,65 @@ func (r redirector) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Header.Set("Location", r.to)
 	}
 	return resp, err
+}
+
+func TestConnReactions(t *testing.T) {
+	x := start(t, airut.New(airut.Config{}))
+	x.f.on("PUT", "/channels/10/messages/20/reactions/*", 204, ``)
+	x.f.on("DELETE", "/channels/10/messages/20/reactions/*", 204, ``)
+	ctx, ch, msg := context.Background(), airut.Channel{ID: "10"}, airut.MessageRef{ID: "20"}
+
+	seen, err := x.s.React(ctx, ch, msg, "👀")
+	if err != nil || seen.ID != "20/👀" {
+		t.Fatalf("React = %v, %v", seen, err)
+	}
+	x.f.waitFor(t, "PUT", "/channels/10/messages/20/reactions/👀/@me")
+	if err := x.s.Unreact(ctx, ch, seen); err != nil {
+		t.Fatal(err)
+	}
+	// Only the endpoint for the bot's own reaction is ever called.
+	x.f.waitFor(t, "DELETE", "/channels/10/messages/20/reactions/👀/@me")
+	custom, err := x.s.React(ctx, ch, msg, "<:blob:30>")
+	if err != nil || custom.ID != "20/blob:30" {
+		t.Errorf("React with a custom emoji = %v, %v", custom, err)
+	}
+
+	// discordgo escapes a '#' in an emoji, such as the keycap's, so it
+	// cannot end the path early and drop the @me that limits a removal
+	// to the bot's own reaction. These requests are what was sent.
+	keycap, err := x.s.React(ctx, ch, msg, "#️⃣")
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.f.waitFor(t, "PUT", "/channels/10/messages/20/reactions/#️⃣/@me")
+	for _, ref := range []airut.MessageRef{keycap, {ID: "20/👍#"}, {ID: "20/#"}} {
+		if err := x.s.Unreact(ctx, ch, ref); err != nil {
+			t.Fatal(err)
+		}
+		_, e, _ := strings.Cut(ref.ID, "/")
+		x.f.waitFor(t, "DELETE", "/channels/10/messages/20/reactions/"+e+"/@me")
+	}
+	for _, r := range x.f.sent() {
+		if r.Method == "DELETE" && !strings.HasSuffix(r.Path, "/@me") {
+			t.Errorf("a removal reached %s, which is not the bot's own reaction", r.Path)
+		}
+	}
+
+	before := len(x.f.sent())
+	for _, ref := range []string{"20", "", "20/", "x/👀", "20/👀/../../..", "20/..", "20/a?b", "20/%2F"} {
+		if err := x.s.Unreact(ctx, ch, airut.MessageRef{ID: ref}); !errors.Is(err, airut.ErrNotOwnReaction) {
+			t.Errorf("Unreact(%q) = %v, want ErrNotOwnReaction", ref, err)
+		}
+	}
+	if err := x.s.Unreact(ctx, airut.Channel{ID: "c/1"}, seen); !errors.Is(err, airut.ErrNotOwnReaction) {
+		t.Errorf("Unreact in a channel that is not an id = %v", err)
+	}
+	for _, c := range []struct{ ch, msg, emoji string }{{"10", "20/x", "👀"}, {"10", "20", "a/b"}, {"1/0", "20", "👀"}, {"10", "20", ""}} {
+		if _, err := x.s.React(ctx, airut.Channel{ID: c.ch}, airut.MessageRef{ID: c.msg}, c.emoji); err == nil {
+			t.Errorf("React(%q, %q, %q) was sent", c.ch, c.msg, c.emoji)
+		}
+	}
+	if n := len(x.f.sent()) - before; n != 0 {
+		t.Errorf("%d requests left for refused refs: %v", n, x.f.sent()[before:])
+	}
 }
