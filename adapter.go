@@ -71,7 +71,8 @@ type Message struct {
 	// Matrix, and a few minutes on Discord, which takes a key only for a
 	// message posted to a channel, not for an answer to a command. A bot
 	// that records what it sent uses it to resend safely after a restart
-	// that fell between a send and its record. The key is the bot's to
+	// that fell between a send and its record. On Matrix a resent file is
+	// uploaded again, though it is posted once. The key is the bot's to
 	// make unique, such as the id of the event the message answers and a
 	// step name.
 	Key string

@@ -203,20 +203,19 @@ func identifier(kind airut.Kind, token string) (string, bool) {
 
 // send posts m into room, inside thread when it is set and as a reply to
 // replyTo when that is. Text longer than one event allows goes out as
-// several, and the reference names the first.
+// several, and the reference names the first. Each event, text or file,
+// gets its own transaction id from m.Key, numbered in the order sent.
 func (s *session) send(ctx context.Context, room id.RoomID, thread, replyTo id.EventID, m airut.Message) (airut.MessageRef, error) {
-	if m.Key != "" && len(m.Files) > 0 {
-		// rihma's SendMedia takes no transaction id.
-		return airut.MessageRef{}, errors.New("matrix: a message with a Key cannot carry files")
-	}
 	if err := s.c.Connect(ctx); err != nil {
 		return airut.MessageRef{}, err
 	}
 	rel := relation(thread, replyTo)
 	var first id.EventID
-	for i, content := range messages(m.Text) {
+	part := 0
+	for _, content := range messages(m.Text) {
 		content.RelatesTo = rel
-		resp, err := s.c.SendMessageEvent(ctx, room, event.EventMessage, content, mautrix.ReqSendEvent{TransactionID: txnID(m.Key, i)})
+		resp, err := s.c.SendMessageEvent(ctx, room, event.EventMessage, content, mautrix.ReqSendEvent{TransactionID: txnID(m.Key, part)})
+		part++
 		if err != nil {
 			return airut.MessageRef{ID: string(first)}, err
 		}
@@ -228,7 +227,9 @@ func (s *session) send(ctx context.Context, room id.RoomID, thread, replyTo id.E
 	for _, f := range m.Files {
 		ev, err := s.c.SendMedia(ctx, room, rihma.Media{
 			Data: f.Data, Name: f.Name, MimeType: f.ContentType, MsgType: mediaType(f.ContentType), RelatesTo: rel,
+			TransactionID: txnID(m.Key, part),
 		})
+		part++
 		if err != nil {
 			return airut.MessageRef{ID: string(first)}, err
 		}

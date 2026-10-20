@@ -8,7 +8,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	maunium.net/go/mautrix v0.31.0
 	modernc.org/sqlite v1.60.1
-	terva.sh/rihma v0.1.8
+	terva.sh/rihma v0.1.9
 	terva.sh/terva v0.141.5
 )
 

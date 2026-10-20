@@ -2,7 +2,6 @@ package matrix
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -399,13 +398,5 @@ func TestTxnID(t *testing.T) {
 	// A transaction id is a path segment; the key may hold anything.
 	if id := txnID("a/b c?#%"+strings.Repeat("x", 300), 2); strings.ContainsAny(id, "/ ?#%") || len(id) > 64 {
 		t.Errorf("transaction id %q is not a short, safe path segment", id)
-	}
-}
-
-func TestAKeyedMessageCarriesNoFiles(t *testing.T) {
-	s := &session{}
-	_, err := s.send(context.Background(), "!room:example.org", "", "", airut.Message{Text: "x", Key: "k", Files: []airut.File{{Name: "a.png"}}})
-	if err == nil || !strings.Contains(err.Error(), "Key") {
-		t.Errorf("a keyed message with files = %v", err)
 	}
 }
