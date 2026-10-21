@@ -90,7 +90,8 @@ func TestExample(t *testing.T) {
 		Discord: &Discord{Token: secret, Guilds: []string{"345678901234567890"}},
 		Matrix: &Matrix{Homeserver: "https://matrix.example.org", UserID: "@sample:example.org", Password: secret,
 			StateDir: "/var/lib/airut-sample/matrix", DeviceName: "airut sample", RecoveryKey: secret},
-		Metrics: Metrics{Listen: "127.0.0.1:9464", SummaryEvery: 15 * time.Minute},
+		Metrics:  Metrics{Listen: "127.0.0.1:9464", SummaryEvery: 15 * time.Minute},
+		Settings: map[string]string{"roll.max_dice": "10"},
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Errorf("example:\n got %+v\nwant %+v", c, want)

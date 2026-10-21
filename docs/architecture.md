@@ -494,6 +494,9 @@ trigger it. So before a turn reaches the agent, the core checks
 - **Budget:** each zero field of the turn's `Budget` takes the gate's
   default. The agent stops the turn at the budget it receives.
 
+On a bot with an Agent, the rate and budget are settings whose owners
+may tighten them from chat, as [Settings](#settings) describes.
+
 A refused turn returns a `*Refusal`, and the core answers it in the chat
 with the reason and, for a rate limit, how long to wait. The log gets the
 invocation id, the platform, and the reason, never the prompt.
@@ -726,6 +729,13 @@ what falls past a cap. `agent.Agent` keeps them in the session store.
     channel's, and the bot's, with their numbers and who noted them.
   - `unremember ID` removes one.
   A bot command of the same name takes a built-in's place.
+- **Who may use them.** `Config.MemoryAccess` is set as each built-in's
+  `RestrictTo` check, so it holds for the `remember` tool too: a turn
+  whose caller it refuses is never offered the tool. Nil lets everyone.
+  Restrict them where what a member writes should not reach the turns of
+  people who act on it, as a bot whose moderators' turns can edit
+  content passes `AnyOf(owners, MemberOf(modRoom))`. A check that
+  refuses everyone shuts them.
 - **The tool.** `remember` is also a tool. `Bot.Tools("remember")`,
   called in a handler, hands it to a turn, so "remember that I prefer
   metric" reaches the same rules. `Config.MemoryWrites` says, per scope,
@@ -781,6 +791,83 @@ The store's rules:
 Memory text never reaches a log: only ids, scopes, statuses, and
 counts.
 
+## Settings
+
+A bot declares runtime settings in code, and the people allowed to may
+change them from chat without a redeploy. Each setting has a kind, a
+default, bounds, a one-line description, and two checks:
+
+```go
+maxOpen := b.DeclareInt(airut.IntSetting{
+	Name: "proposals.max_open", Description: "Open proposals at once",
+	Default: 10, Min: 1, Max: 50,
+	Change: airut.AnyOf(owners, moderators), // nil defers to Settings.Owner
+})
+// Later, each time the value is used:
+if open >= maxOpen.Get() { ... }
+```
+
+The kinds are int, duration, bool, string, and enum, declared with
+`DeclareInt`, `DeclareDuration`, `DeclareBool`, `DeclareString`, and
+`DeclareEnum` before `Run`. Each returns a `*Setting[T]` whose `Get`
+reads the value in force. Read it at use time rather than copying it at
+construction, so a change takes effect at once. `OnChange` runs after a
+change is saved, one change at a time, for what has to be rebuilt; a
+panic in it is logged, and the change stands.
+
+- **Layers.** A value comes from the default, then the config file's
+  `[settings]` table, then an override set from chat. `Run` fails on a
+  name in `[settings]` that nothing declares, or a value its setting
+  refuses, so a misspelt setting cannot silently do nothing. A stored
+  override that no longer validates, as after its declaration changed,
+  is logged by name and ignored, and the layers beneath apply.
+- **Who.** airut has no roles, so `Config.Settings.Owner` is an access
+  check the bot supplies. A setting's `Change` check defaults to it, and
+  with no Owner nothing is changeable from chat. A setting's `Read`
+  check defaults to everyone. One the caller may not read is answered as
+  if it did not exist, so its name does not leak.
+- **Built-in commands.** A bot with settings gains three, which a bot
+  command of the same name replaces:
+  - `settings` lists, privately, the settings the caller may read, each
+    with its value and layer. `settings NAME` shows one with its bounds,
+    default, configured value, and latest changes.
+  - `set NAME VALUE` validates the value and answers old → new.
+  - `unset NAME` drops the override and answers with the value now in
+    force.
+- **The agent.** `settings`, `set`, and `unset` are tools too. A change
+  the model asks for runs the caller's `Change` check, then asks the
+  caller "Change NAME from OLD to NEW?" with the exact values, and is
+  made only if nothing changed the setting while they decided. A Chime
+  turn, which nobody asked for, cannot change a setting. The generic
+  approval question is not used, because it shows only the raw
+  arguments, before the old value is read.
+- **The store.** `Config.Settings.Store`, or the Agent when it is a
+  `SettingStore`, keeps overrides and a change log of name, old, new,
+  who, when, channel, and whether a command or the agent made it.
+  `agent.Agent` keeps them in the session database, at most 100 changes
+  per setting. Without a store, settings are listed but `set` and
+  `unset` are refused, because an override a restart forgets is not one
+  anybody can rely on.
+- **Notices.** `Config.Settings.Notices` names channels told of each
+  change, such as a moderators' room. A notice that fails is logged by
+  kind and does not undo the change.
+
+No setting kind holds a secret, and `[settings]` refuses a secret
+reference: a setting's value is shown in chat. A value never reaches a
+log either, since a string setting's value is chat text. The log gets
+the setting's name, the layer, the actor's id, and the source.
+
+On a bot with an Agent, the Gate's limits are settings:
+`agent.per_user`, `agent.per_channel`, `agent.window`,
+`agent.max_turns`, and `agent.max_tokens`. Their config layer is
+`Config.Gate`, from `[agent]` rate and budget, and it is also their
+ceiling: from chat a limit can be tightened, or loosened back to the
+configured value, and no further, so spend never exceeds what the
+deployed file allows. A cap needs a positive window, so the window is
+set first. The access lists stay out of settings for the reason owners
+do: a list someone can edit from chat lets them grant themselves
+access.
+
 ## Metrics
 
 Every bot keeps metrics in memory, which `Bot.Metrics()` and
@@ -803,6 +890,7 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_chime_misses_total` | `persona` | Chime replies marked as a miss |
 | `airut_memory_writes_total` | `scope`, `source`, `status` | memories saved, by how they were saved |
 | `airut_memory_consents_total` | `answer` | answers to a pending memory's question |
+| `airut_setting_changes_total` | `setting`, `source` | settings changed from chat, by a command or the agent |
 | `airut_adapter_up` | `platform` | 1 while the adapter runs |
 | `airut_uptime_seconds` | | seconds since the bot was made |
 
@@ -841,14 +929,15 @@ supplies everything. Each bot has one TOML file, which
 - the agent's default model, budget, rate limit, and access lists;
 - the session store;
 - each platform's settings;
-- where metrics are served, and how often they are logged.
+- where metrics are served, and how often they are logged;
+- the config layer of the bot's runtime settings, under `[settings]`.
 
 Secrets are never in the file. A key that holds one names where the
 deployment put it: an environment variable, a systemd credential, or a
 file. `config.Load` reads them, and returns every problem in the file
 at once, each named by its key and never quoting a value.
 
-A bot's own settings go in the same file, under an `[app]` table, and
+A bot's own configuration goes in the same file, under an `[app]` table, and
 `config.LoadApp(path, &settings)` decodes them into the bot's struct by
 toml tags. A field of type `config.Secret` takes a secret reference,
 exactly as airut's own secrets do. Unknown keys and wrong types in

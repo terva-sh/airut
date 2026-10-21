@@ -5,7 +5,9 @@
 //	airut-example -config /etc/airut-example/airut.toml
 //
 // It serves each platform whose table the file has. roll rolls dice, and
-// is also a tool the agent may call. ask puts a question to the agent,
+// is also a tool the agent may call. Its roll.max_dice setting is listed
+// by settings, and the owners the file's [app] table names may change it
+// with set. ask puts a question to the agent,
 // which may roll dice to answer it; it needs the file's [agent] table,
 // and only the users and roles its access tables name may use it. On
 // Matrix the bot joins a room only when one of the users named in
@@ -132,8 +134,25 @@ func readKey(ctx context.Context, in *os.File, out io.Writer, prompt string) (st
 	}
 }
 
+// app is the example's own [app] table.
+type app struct {
+	// Owners may change the bot's settings from chat: the user ids of
+	// each platform, as owners = { matrix = ["@you:example.org"] }.
+	Owners map[string][]string `toml:"owners"`
+}
+
+// owners is the access check of a.Owners.
+func (a app) owners() airut.AccessCheck {
+	access := map[airut.Platform]airut.Access{}
+	for p, users := range a.Owners {
+		access[airut.Platform(p)] = airut.Access{Users: users}
+	}
+	return airut.Listed(access)
+}
+
 func run(path string, log *slog.Logger) error {
-	cfg, err := config.Load(path)
+	var own app
+	cfg, err := config.LoadApp(path, &own)
 	if err != nil {
 		return err
 	}
@@ -144,6 +163,7 @@ func run(path string, log *slog.Logger) error {
 		Logger:       log,
 		MetricsAddr:  cfg.Metrics.Listen,
 		SummaryEvery: cfg.Metrics.SummaryEvery,
+		Settings:     airut.Settings{Owner: own.owners(), Values: cfg.Settings},
 	}
 	// Without an [agent] table, ask answers that it has no agent.
 	if cfg.Agent != nil {

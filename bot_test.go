@@ -631,7 +631,9 @@ func TestForgetCommand(t *testing.T) {
 	for _, s := range a.Specs() {
 		names = append(names, s.Name)
 	}
-	if !reflect.DeepEqual(names, []string{"forget", "roll"}) {
+	// The Gate's limits are settings on a bot with an Agent, so it has
+	// the settings commands too.
+	if !reflect.DeepEqual(names, []string{"forget", "roll", "set", "settings", "unset"}) {
 		t.Fatalf("specs = %v; an agent that can forget brings a forget command", names)
 	}
 

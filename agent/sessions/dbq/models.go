@@ -51,3 +51,22 @@ type Session struct {
 	CreatedAt  int64
 	LastActive int64
 }
+
+type SettingChange struct {
+	ID      int64
+	Name    string
+	Old     string
+	New     string
+	Unset   int64
+	Who     string
+	WhoName string
+	Channel string
+	Source  string
+	At      int64
+}
+
+type SettingOverride struct {
+	Name    string
+	Value   string
+	Updated int64
+}

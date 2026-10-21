@@ -396,6 +396,22 @@ func TestChimeTurnsAreTheChannels(t *testing.T) {
 		t.Errorf("a third turn in the channel: %v", err)
 	}
 
+	// PerChannel is read as a setting at each turn, so lowering it from
+	// chat holds for Chime turns too.
+	st := &settingStore{}
+	a, j, ran, _, _ = startChime(t, airut.Config{Agent: st, Gate: gate, Settings: airut.Settings{
+		Owner: func(c *airut.Ctx) (bool, error) { return c.Caller() == alice, nil },
+	}}, airut.ChimeOptions{Handler: turn})
+	if got := lastText(a.Text("!set agent.per_channel 1", airuttest.As(alice))); got != "agent.per_channel: 2 → 1." {
+		t.Fatalf("set: %q", got)
+	}
+	if err := chimeTurn(a, j, ran); err != nil {
+		t.Fatalf("the first turn under agent.per_channel 1: %v", err)
+	}
+	if err := chimeTurn(a, j, ran); !errors.As(err, &rf) || rf.Reason != airut.RefusedRate {
+		t.Errorf("a second turn under agent.per_channel 1: %v", err)
+	}
+
 	// A channel that is not listed may not start a turn, even when the
 	// sender may.
 	gate.Access = map[airut.Platform]airut.Access{"test": {Users: []string{"alice"}}}

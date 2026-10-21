@@ -96,7 +96,7 @@ func (c *Command) Call(parent *Ctx, args json.RawMessage) (string, error) {
 	}
 	child := &Ctx{
 		ctx: parent.ctx, bot: c.bot, cmd: c, inv: parent.inv, resp: parent.resp,
-		capture: &capture{}, turn: parent.turn,
+		capture: &capture{}, turn: parent.turn, chimed: parent.unasked(),
 	}
 	err = c.invoke(child, raw, nil)
 	return child.capture.text(), err

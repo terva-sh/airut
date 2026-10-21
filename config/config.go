@@ -44,6 +44,12 @@ type Config struct {
 	// Metrics is how the bot reports its metrics. Its zero value reports
 	// none, beyond what the core keeps in memory.
 	Metrics Metrics
+	// Settings are the [settings] table's values, by setting name, as
+	// text, for airut.Config's Settings.Values. A nested table's keys join
+	// with dots, so proposals.max_open names the same setting written
+	// either way. The bot checks them against its declared settings when
+	// it starts.
+	Settings map[string]string
 }
 
 // Metrics is where the bot serves its metrics, and how often it logs
@@ -235,6 +241,8 @@ type fileConfig struct {
 	Discord   *fileDiscord            `toml:"discord"`
 	Matrix    *fileMatrix             `toml:"matrix"`
 	Metrics   *fileMetrics            `toml:"metrics"`
+	// Settings is any for the reason App is.
+	Settings any `toml:"settings"`
 	// App is the bot's own settings, which LoadApp decodes. It is any,
 	// not a table, so that a value of the wrong type is a problem
 	// reported with the rest rather than a failure of the whole decode.
@@ -458,6 +466,9 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 	}
 	if f.Matrix != nil {
 		c.Matrix = buildMatrix(p, f.Matrix, dir)
+	}
+	if f.Settings != nil {
+		c.Settings = buildSettings(p, f.Settings)
 	}
 	if c.Discord == nil && c.Matrix == nil {
 		p.add("(file)", "no platform is configured; add a [discord] or [matrix] table")

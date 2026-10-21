@@ -2,6 +2,7 @@ package airut
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -106,23 +107,24 @@ func (g *gate) check(c *Ctx) error {
 		if !slices.Contains(g.cfg.Access[ch.Platform].Channels, ch.ID) {
 			return &Refusal{Reason: RefusedAccess, msg: "This channel is not allowed to start an agent turn by itself."}
 		}
-		room := g.cfg
+		room := g.limits()
 		room.PerUser = 0
 		return g.rate.take(room, c.inv)
 	}
 	if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
 		return errRefusedAccess()
 	}
-	return g.rate.take(g.cfg, c.inv)
+	return g.rate.take(g.limits(), c.inv)
 }
 
 // budget fills the zero fields of b from the gate's default.
 func (g *gate) budget(b Budget) Budget {
+	def := g.limits().Budget
 	if b.Turns == 0 {
-		b.Turns = g.cfg.Budget.Turns
+		b.Turns = def.Turns
 	}
 	if b.Tokens == 0 {
-		b.Tokens = g.cfg.Budget.Tokens
+		b.Tokens = def.Tokens
 	}
 	return b
 }
@@ -131,6 +133,88 @@ func (g *gate) budget(b Budget) Budget {
 type gate struct {
 	cfg  Gate
 	rate limiter
+	// knobs are the Gate's limits as settings, on a bot with an Agent.
+	knobs *gateSettings
+}
+
+// limits returns the Gate with the limits in force.
+func (g *gate) limits() Gate {
+	cfg := g.cfg
+	if k := g.knobs; k != nil {
+		cfg.PerUser, cfg.PerChannel, cfg.Window = k.perUser.Get(), k.perChannel.Get(), k.window.Get()
+		cfg.Budget = Budget{Turns: k.turns.Get(), Tokens: k.tokens.Get()}
+	}
+	return cfg
+}
+
+// gateSettings are the Gate's rate and budget as settings. Config.Gate
+// is their config layer and their ceiling: a chat override may tighten a
+// limit, or loosen it back to the configured value, and no further, so
+// that spend never exceeds what the deployed configuration allows. The
+// access lists stay out of them, because a list editable from chat lets
+// its editor grant themselves access.
+type gateSettings struct {
+	perUser, perChannel, turns, tokens *Setting[int]
+	window                             *Setting[time.Duration]
+}
+
+// maxGateWindow bounds the agent.window setting.
+const maxGateWindow = 7 * 24 * time.Hour
+
+func (b *Bot) declareGateSettings(cfg Gate) *gateSettings {
+	k := &gateSettings{}
+	// fromConfig makes the configured value the setting's config layer.
+	fromConfig := func(s *setting, v any) {
+		s.gate = true
+		val := &settingValue{v: v, layer: LayerConfig}
+		s.lower.Store(val)
+		s.cur.Store(val)
+	}
+	// limit declares a cap where 0 means none: an override of a positive
+	// configured cap stays from 1 to it, and one of no cap may be any.
+	limit := func(name, desc, none string, conf int, needsWindow bool) *Setting[int] {
+		st := b.DeclareInt(IntSetting{Name: name, Description: desc, Max: math.MaxInt})
+		s := st.s
+		s.bounds = "a whole number, 0 for " + none
+		if conf > 0 {
+			s.bounds = fmt.Sprintf("a whole number from 1 to %d, the configured value", conf)
+		}
+		s.limit = func(v any) error {
+			n := v.(int)
+			if conf > 0 && (n < 1 || n > conf) {
+				return Errorf("%s must be from 1 to %d: a setting may tighten the configured limit, not loosen it.", name, conf)
+			}
+			if needsWindow && n > 0 && k.window.Get() <= 0 {
+				return Errorf("Set agent.window first: %s needs a window to count turns in.", name)
+			}
+			return nil
+		}
+		fromConfig(s, conf)
+		return st
+	}
+	k.window = b.DeclareDuration(DurationSetting{Name: "agent.window",
+		Description: "The window agent.per_user and agent.per_channel count turns in", Max: maxGateWindow})
+	ws := k.window.s
+	ws.bounds = fmt.Sprintf("a duration up to %s, positive while a cap is set", formatDuration(maxGateWindow))
+	if cfg.Window > 0 {
+		ws.bounds = fmt.Sprintf("a duration from %s, the configured value, to %s", formatDuration(cfg.Window), formatDuration(maxGateWindow))
+	}
+	ws.limit = func(v any) error {
+		d := v.(time.Duration)
+		switch {
+		case d < cfg.Window:
+			return Errorf("agent.window must be at least %s: a setting may tighten the configured limit, not loosen it.", formatDuration(cfg.Window))
+		case d <= 0 && (k.perUser.Get() > 0 || k.perChannel.Get() > 0):
+			return Errorf("agent.window must be positive while agent.per_user or agent.per_channel is set.")
+		}
+		return nil
+	}
+	fromConfig(ws, cfg.Window)
+	k.perUser = limit("agent.per_user", "Agent turns one person may start in each window", "no cap", cfg.PerUser, true)
+	k.perChannel = limit("agent.per_channel", "Agent turns one channel may start in each window", "no cap", cfg.PerChannel, true)
+	k.turns = limit("agent.max_turns", "Model requests an agent turn may make when it sets no budget", "none", cfg.Budget.Turns, false)
+	k.tokens = limit("agent.max_tokens", "Tokens an agent turn may spend when it sets no budget", "none", cfg.Budget.Tokens, false)
+	return k
 }
 
 func newGate(cfg Gate) *gate {

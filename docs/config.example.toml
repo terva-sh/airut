@@ -147,3 +147,24 @@ recovery_key = { credential = "matrix-recovery-key" }
 listen = "127.0.0.1:9464"
 # Logs a summary of the metrics that changed since the last one.
 summary_every = "15m"
+
+# Runtime settings: the config layer of the settings the bot declares in
+# code. A value here replaces the setting's default, and an override set
+# from chat with `set NAME VALUE` replaces this, until `unset NAME` drops
+# it. The bot refuses to start on a name it does not declare, or on a
+# value outside the setting's bounds. A value is a whole number, true or
+# false, or a string, which is how a duration ("10m") or one of a fixed
+# set of values is written. A nested table's keys join with dots, so
+# [settings.roll] max_dice = 10 names the same setting. Secrets never go
+# here, because a setting's value is shown in chat.
+#
+# The Gate's limits are settings too, named agent.per_user,
+# agent.per_channel, agent.window, agent.max_turns, and agent.max_tokens.
+# They are set by [agent] rate and budget, never here, and those values
+# cap them: from chat they can be tightened, not loosened.
+#
+# Who may change a setting is the bot's to say. The sample bot reads its
+# owners from its own [app] table, as owners = { matrix = ["@you:example.org"] },
+# which only programs that read one accept.
+[settings]
+roll.max_dice = 10

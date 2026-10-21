@@ -25,7 +25,8 @@ type askArgs struct {
 }
 
 // Bounds on a roll, so one command cannot ask for a reply longer than a
-// message or a loop longer than a moment.
+// message or a loop longer than a moment. maxDice is the most the
+// roll.max_dice setting allows.
 const (
 	maxDice  = 20
 	maxSides = 1000
@@ -38,10 +39,14 @@ func newBot(cfg airut.Config, die func(sides int) int) *airut.Bot {
 		die = func(sides int) int { return rand.IntN(sides) + 1 }
 	}
 	b := airut.New(cfg)
+	// A setting the owners may lower from chat, as set roll.max_dice 5,
+	// and the config file's [settings] table may set.
+	most := b.DeclareInt(airut.IntSetting{Name: "roll.max_dice", Description: "The most dice one roll may throw",
+		Default: maxDice, Min: 1, Max: maxDice})
 	b.Command("roll", "Roll dice", func(c *airut.Ctx, a rollArgs) error {
-		n, sides, ok := parseDice(a.Dice)
+		n, sides, ok := parseDice(a.Dice, most.Get())
 		if !ok {
-			return airut.Errorf("Roll dice written like 2d6: up to %d dice of 2 to %d sides.", maxDice, maxSides)
+			return airut.Errorf("Roll dice written like 2d6: up to %d dice of 2 to %d sides.", most.Get(), maxSides)
 		}
 		rolls := make([]string, n)
 		total := 0
@@ -54,8 +59,10 @@ func newBot(cfg airut.Config, die func(sides int) int) *airut.Bot {
 		return err
 	}).AsTool()
 	// An agent that keeps memories brings the remember tool, so "remember
-	// that I prefer metric" asks the model to save it.
-	tools := []string{"roll"}
+	// that I prefer metric" asks the model to save it. The settings tools
+	// let the model read the settings, and change one for an owner, who
+	// confirms the exact change.
+	tools := []string{"roll", "settings", "set"}
 	if _, ok := cfg.Agent.(airut.MemoryKeeper); ok {
 		tools = append(tools, "remember")
 	}
@@ -69,8 +76,9 @@ func newBot(cfg airut.Config, die func(sides int) int) *airut.Bot {
 	return b
 }
 
-// parseDice reads NdS, such as 2d6 or d20, within the bounds above.
-func parseDice(s string) (n, sides int, ok bool) {
+// parseDice reads NdS, such as 2d6 or d20, of at most most dice and
+// within the bounds above.
+func parseDice(s string, most int) (n, sides int, ok bool) {
 	count, faces, found := strings.Cut(strings.ToLower(strings.TrimSpace(s)), "d")
 	if !found {
 		return 0, 0, false
@@ -83,7 +91,7 @@ func parseDice(s string) (n, sides int, ok bool) {
 		}
 	}
 	sides, err := strconv.Atoi(faces)
-	if err != nil || n < 1 || n > maxDice || sides < 2 || sides > maxSides {
+	if err != nil || n < 1 || n > most || sides < 2 || sides > maxSides {
 		return 0, 0, false
 	}
 	return n, sides, true

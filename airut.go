@@ -68,11 +68,23 @@ type Config struct {
 	// remove any channel or bot memory, such as a room's moderators. Nil
 	// approves nobody, so every bot memory waits for approval.
 	MemoryApprover func(*Ctx) bool
+	// MemoryAccess decides who may use the built-in remember, memories,
+	// and unremember commands, and the remember tool, as each command's
+	// RestrictTo check: a turn whose caller it refuses is not offered the
+	// tool. Nil lets everyone, and a check that refuses everyone shuts
+	// the commands. Restrict them where what a member writes should not
+	// reach the turns of people who act on it.
+	MemoryAccess AccessCheck
 	// OnPendingMemory is told of each bot memory that waits for
 	// approval, so the app can route it to an approver. It runs on the
 	// invocation's goroutine. An approver makes the memory active with
 	// MemoryKeeper.SetMemoryStatus.
 	OnPendingMemory func(*Ctx, Memory)
+	// Settings configures the bot's runtime settings: who may change
+	// them, the config file's values, where overrides are kept, and who
+	// hears of a change. A bot with an Agent has the Gate's limits as
+	// settings, and the config file's values cap them.
+	Settings Settings
 }
 
 // Bot holds a set of commands and serves them through adapters.
@@ -92,10 +104,15 @@ type Bot struct {
 	running  bool
 	inflight sync.WaitGroup
 	metrics  *Metrics
+	// settings are the declared settings, by name, and settingsMu
+	// serialises their changes, since one can be checked against another.
+	settings   map[string]*setting
+	settingsMu sync.Mutex
 }
 
 // New returns a Bot with no commands. It panics on a Gate whose limits
-// make no sense, such as a rate limit with no window.
+// make no sense, such as a rate limit with no window. With an Agent, the
+// bot has the Gate's limits as settings.
 func New(cfg Config) *Bot {
 	if cfg.Prefix == "" {
 		cfg.Prefix = "!"
@@ -123,8 +140,12 @@ func New(cfg Config) *Bot {
 			panic(fmt.Sprintf("airut: MemoryWrites[%q] = %q is not a scope and a write mode", s, w))
 		}
 	}
-	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics(),
+	b := &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics(),
 		judged: &limiter{now: time.Now, seen: map[string][]time.Time{}}}
+	if cfg.Agent != nil {
+		b.gate.knobs = b.declareGateSettings(cfg.Gate)
+	}
+	return b
 }
 
 // Metrics returns the bot's metrics: those the core records, and any
@@ -247,23 +268,42 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 			"remember": rememberCommand, "memories": memoriesCommand, "unremember": unrememberCommand,
 		} {
 			if b.commands[name] == nil {
-				b.commands[name] = mk(b, k)
+				c := mk(b, k)
+				// b.mu is held, so the field is set as RestrictTo would.
+				c.restrict = b.cfg.MemoryAccess
+				b.commands[name] = c
+			}
+		}
+	}
+	if len(b.settings) > 0 {
+		for name, mk := range map[string]func(*Bot) *Command{
+			"settings": settingsCommand, "set": setCommand, "unset": unsetCommand,
+		} {
+			if b.commands[name] == nil {
+				b.commands[name] = mk(b)
 			}
 		}
 	}
 	b.mu.Unlock()
 
+	// stopped lets the bot be run again when Run fails before anything
+	// started.
+	stopped := func(err error) error {
+		b.mu.Lock()
+		b.running = false
+		b.mu.Unlock()
+		return err
+	}
+	if err := b.startSettings(ctx); err != nil {
+		return stopped(err)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
 	if b.cfg.MetricsAddr != "" {
 		stop, err := b.serveMetrics(b.cfg.MetricsAddr)
 		if err != nil {
-			// Nothing started, so the bot may be run again.
-			b.mu.Lock()
-			b.running = false
-			b.mu.Unlock()
-			return err
+			return stopped(err)
 		}
 		defer stop()
 	}

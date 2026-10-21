@@ -26,6 +26,9 @@ type Ctx struct {
 	// chime is set in a Chime handler: its agent turns are the channel's,
 	// and its replies are remembered to count a miss.
 	chime *chime
+	// chimed is set in a tool an agent turn of a Chime handler calls,
+	// which nobody asked for either.
+	chimed bool
 }
 
 // Context is the invocation's context. It ends when the bot stops.

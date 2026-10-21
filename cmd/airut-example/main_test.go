@@ -62,8 +62,12 @@ func TestAskRollsThroughTheAgent(t *testing.T) {
 		t.Fatalf("turns = %d, want 1", len(turns))
 	}
 	tt := turns[0]
-	if tt.Prompt != "roll me a d20" || tt.Session != airut.PerChannel || len(tt.Tools) != 1 || tt.Tools[0].Name() != "roll" {
-		t.Errorf("turn = %+v", tt)
+	var names []string
+	for _, tl := range tt.Tools {
+		names = append(names, tl.Name())
+	}
+	if tt.Prompt != "roll me a d20" || tt.Session != airut.PerChannel || !reflect.DeepEqual(names, []string{"roll", "settings", "set"}) {
+		t.Errorf("turn = %+v, tools %v", tt, names)
 	}
 	if _, ok := personas[tt.Persona]; !ok {
 		t.Errorf("the turn names persona %q, which personas lacks", tt.Persona)
@@ -97,7 +101,7 @@ func TestParseDice(t *testing.T) {
 		{"d", 0, 0, false},
 		{"", 0, 0, false},
 	} {
-		n, sides, ok := parseDice(c.in)
+		n, sides, ok := parseDice(c.in, maxDice)
 		if n != c.n || sides != c.sides || ok != c.ok {
 			t.Errorf("parseDice(%q) = %d, %d, %v, want %d, %d, %v", c.in, n, sides, ok, c.n, c.sides, c.ok)
 		}
@@ -180,5 +184,33 @@ func TestReadKeyStopsWithItsContext(t *testing.T) {
 	}()
 	if key, err := readKey(context.Background(), r2, io.Discard, ""); key != "EsTc abcd" || err != nil {
 		t.Errorf("readKey = %q, %v", key, err)
+	}
+}
+
+func TestMaxDiceSetting(t *testing.T) {
+	a := airuttest.Start(t, newBot(airut.Config{Settings: airut.Settings{Values: map[string]string{"roll.max_dice": "2"}}}, threes))
+	if got := texts(a.Text("!roll 3d6")); !reflect.DeepEqual(got, []string{"reply:Roll dice written like 2d6: up to 2 dice of 2 to 1000 sides."}) {
+		t.Errorf("roll 3d6 under roll.max_dice 2 = %q", got)
+	}
+	if got := texts(a.Text("!roll 2d6")); !reflect.DeepEqual(got, []string{"reply:2d6: 3 + 3 = 6"}) {
+		t.Errorf("roll 2d6 = %q", got)
+	}
+	if got := texts(a.Text("!settings roll.max_dice")); len(got) != 1 || !strings.HasPrefix(got[0], "reply:roll.max_dice = 2, from the config.") {
+		t.Errorf("settings roll.max_dice = %q", got)
+	}
+}
+
+func TestOwners(t *testing.T) {
+	check := app{Owners: map[string][]string{string(airuttest.Platform): {"owner"}}}.owners()
+	b := newBot(airut.Config{Settings: airut.Settings{Owner: check}}, threes)
+	a := airuttest.Start(t, b)
+	// Nobody may change a setting without a store, but the refusal tells
+	// an owner from anyone else.
+	if got := texts(a.Text("!set roll.max_dice 3", airuttest.As(airut.User{Platform: airuttest.Platform, ID: "owner"}))); !reflect.DeepEqual(got,
+		[]string{"reply:Settings cannot be changed here: this bot has no store to keep them in."}) {
+		t.Errorf("an owner's set = %q", got)
+	}
+	if got := texts(a.Text("!set roll.max_dice 3")); !reflect.DeepEqual(got, []string{"reply:You are not allowed to change roll.max_dice."}) {
+		t.Errorf("someone else's set = %q", got)
 	}
 }
