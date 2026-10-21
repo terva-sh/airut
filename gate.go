@@ -17,10 +17,13 @@ type Gate struct {
 	// allowed when their user id, or the id of one of their roles, is
 	// listed for their platform, or when they are a member of a listed
 	// channel. A platform with no entry, or an empty one, allows nobody.
+	// A turn a Chime handler starts is the channel's, and is allowed when
+	// the channel itself is listed.
 	Access map[Platform]Access
 	// PerUser and PerChannel cap the turns one caller, and one channel,
 	// may start in any Window. Zero means no cap of that kind. Turns are
-	// counted in memory, so a restart forgets them.
+	// counted in memory, so a restart forgets them. A Chime turn counts
+	// against PerChannel only.
 	PerUser    int
 	PerChannel int
 	Window     time.Duration
@@ -93,7 +96,20 @@ func errRefusedAccess() *Refusal {
 // start for c. A turn it allows is counted against both limits. A
 // membership check that fails refuses the turn unless another channel
 // admits the caller; allows logs it.
+//
+// A turn a Chime handler starts is the channel's, since nobody asked
+// for it: the channel must be listed in Access.Channels, and the turn
+// takes one of PerChannel's turns and none of the sender's.
 func (g *gate) check(c *Ctx) error {
+	if c.chime != nil {
+		ch := c.inv.Channel
+		if !slices.Contains(g.cfg.Access[ch.Platform].Channels, ch.ID) {
+			return &Refusal{Reason: RefusedAccess, msg: "This channel is not allowed to start an agent turn by itself."}
+		}
+		room := g.cfg
+		room.PerUser = 0
+		return g.rate.take(room, c.inv)
+	}
 	if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
 		return errRefusedAccess()
 	}
@@ -164,6 +180,15 @@ func (l *limiter) take(cfg Gate, inv Invocation) error {
 		l.seen[channel] = append(l.seen[channel], now)
 	}
 	return nil
+}
+
+// atCap reports whether key has max starts inside window, without
+// counting one.
+func (l *limiter) atCap(key string, max int, window time.Duration) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, full := l.full(key, max, l.now(), window)
+	return full
 }
 
 // full drops key's starts that left the window and reports whether

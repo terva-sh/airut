@@ -23,6 +23,9 @@ type Ctx struct {
 	capture *capture
 	// turn is set while an agent turn started from this invocation runs.
 	turn *turnState
+	// chime is set in a Chime handler: its agent turns are the channel's,
+	// and its replies are remembered to count a miss.
+	chime *chime
 }
 
 // Context is the invocation's context. It ends when the bot stops.
@@ -124,7 +127,11 @@ func (c *Ctx) Send(m Message) (MessageRef, error) {
 	if c.capture != nil {
 		return c.capture.add(m), nil
 	}
-	return c.resp.Reply(c.ctx, m)
+	ref, err := c.resp.Reply(c.ctx, m)
+	if err == nil && c.chime != nil {
+		c.chime.sentBy(c.inv.Channel.Platform, ref)
+	}
+	return ref, err
 }
 
 // Edit replaces the text of a message this invocation sent.
