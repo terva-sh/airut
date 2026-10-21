@@ -296,9 +296,17 @@ func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func()) error {
 	// The agent and every tool it calls share the turn's state through
 	// a copy of the Ctx, so the handler's own Ctx is left as it was.
 	st := &turnState{flush: flush, scope: t.Session, key: key}
+	stopTyping := func() {}
 	if every := r.c.bot.cfg.TypingEvery; every > 0 && chat.capture == nil {
 		st.typing = startKeepalive(chat.ctx, chat.resp, r.c.bot.cfg.TypingDelay, every)
-		defer st.typing.stop()
+		stopped := false
+		stopTyping = func() {
+			if !stopped {
+				stopped = true
+				st.typing.stop()
+			}
+		}
+		defer stopTyping()
 	}
 	tc := *r.c
 	tc.turn = st
@@ -307,6 +315,19 @@ func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func()) error {
 	outcome = "ok"
 	if err != nil {
 		outcome = errorKind(err)
+	}
+	if k, ok := r.c.bot.cfg.Agent.(MemoryKeeper); ok && err == nil && r.c.chime == nil {
+		// Someone the agent was asked to remember things about is asked
+		// after their next turn, below its complete answer, so a question
+		// they ignore never holds the answer back. A turn nobody asked
+		// for asks nobody.
+		if flush != nil {
+			flush()
+		}
+		stopTyping()
+		if aerr := r.c.bot.askPendingMemories(r.c, k, maxPendingAsks); aerr != nil && !errors.Is(aerr, ErrAskTimeout) {
+			r.c.bot.cfg.Logger.Info("could not ask about pending memories", "invocation", r.c.inv.ID, "error_kind", errorKind(aerr))
+		}
 	}
 	return err
 }

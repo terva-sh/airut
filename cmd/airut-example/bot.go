@@ -53,10 +53,16 @@ func newBot(cfg airut.Config, die func(sides int) int) *airut.Bot {
 		_, err := c.Reply(a.Dice + ": " + strings.Join(rolls, " + ") + " = " + strconv.Itoa(total))
 		return err
 	}).AsTool()
+	// An agent that keeps memories brings the remember tool, so "remember
+	// that I prefer metric" asks the model to save it.
+	tools := []string{"roll"}
+	if _, ok := cfg.Agent.(airut.MemoryKeeper); ok {
+		tools = append(tools, "remember")
+	}
 	b.Command("ask", "Ask the assistant", func(c *airut.Ctx, a askArgs) error {
 		return c.Agent(airut.Turn{
 			Prompt:  a.Question,
-			Tools:   b.Tools("roll"),
+			Tools:   b.Tools(tools...),
 			Session: airut.PerChannel,
 		}).StreamTo(c)
 	})

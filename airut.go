@@ -22,6 +22,13 @@ type Config struct {
 	// Gate says who may start an agent turn, how often, and the budget of
 	// a turn that sets none. The zero Gate refuses every turn.
 	Gate Gate
+	// Judge decides the judgements Ctx.Judge asks for. Without one, every
+	// judgement abstains with ErrNoJudge.
+	Judge Judge
+	// JudgeRate caps the judgements a channel may ask for, apart from the
+	// Gate's rate, which a judgement never draws on. The zero value caps
+	// nothing.
+	JudgeRate JudgeRate
 	// Logger receives ids, kinds, and sizes, never message text. It
 	// defaults to slog.Default().
 	Logger *slog.Logger
@@ -52,6 +59,20 @@ type Config struct {
 	// a thread's conversation with the built-in forget command, which
 	// clears it for everyone in it. Nil lets nobody.
 	ForgetShared func(*Ctx) bool
+	// MemoryWrites says, per scope, what happens when the model asks to
+	// remember something, on an Agent that is a MemoryKeeper. A scope it
+	// leaves out takes the default: WriteAsk for a user, WriteAuto for a
+	// channel, and WriteOff for the bot.
+	MemoryWrites map[MemoryScope]MemoryWrite
+	// MemoryApprover decides who may write bot memories directly and
+	// remove any channel or bot memory, such as a room's moderators. Nil
+	// approves nobody, so every bot memory waits for approval.
+	MemoryApprover func(*Ctx) bool
+	// OnPendingMemory is told of each bot memory that waits for
+	// approval, so the app can route it to an approver. It runs on the
+	// invocation's goroutine. An approver makes the memory active with
+	// MemoryKeeper.SetMemoryStatus.
+	OnPendingMemory func(*Ctx, Memory)
 }
 
 // Bot holds a set of commands and serves them through adapters.
@@ -67,6 +88,7 @@ type Bot struct {
 	// conns are the connections adapters announced, by platform.
 	conns    map[Platform]Conn
 	gate     *gate
+	judged   *limiter // judgements per channel, under Config.JudgeRate
 	running  bool
 	inflight sync.WaitGroup
 	metrics  *Metrics
@@ -93,7 +115,16 @@ func New(cfg Config) *Bot {
 	if cfg.TypingEvery == 0 {
 		cfg.TypingEvery = defaultTypingEvery
 	}
-	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics()}
+	if cfg.JudgeRate.PerChannel < 0 || cfg.JudgeRate.PerChannel > 0 && cfg.JudgeRate.Window <= 0 {
+		panic("airut: JudgeRate needs a positive Window and a PerChannel that is not negative")
+	}
+	for s, w := range cfg.MemoryWrites {
+		if s != UserMemory && s != ChannelMemory && s != BotMemory || w != WriteOff && w != WriteAsk && w != WriteAuto {
+			panic(fmt.Sprintf("airut: MemoryWrites[%q] = %q is not a scope and a write mode", s, w))
+		}
+	}
+	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics(),
+		judged: &limiter{now: time.Now, seen: map[string][]time.Time{}}}
 }
 
 // Metrics returns the bot's metrics: those the core records, and any
@@ -113,6 +144,7 @@ var (
 // name in snake_case, and its description from its desc tag. Tags:
 //
 //	airut:"name,optional,rest"  name, and options; "-" skips the field
+//	airut:",optional,named"     set in text only as name=value or --name
 //	desc:"..."                  required, 1 to 100 characters
 //	choices:"a,b,c"             allowed values of a string
 //	min:"1" max:"6"             bounds of a number, or of a string's length
@@ -209,6 +241,15 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 	b.running = true
 	if f, ok := b.cfg.Agent.(SessionForgetter); ok && b.commands["forget"] == nil {
 		b.commands["forget"] = forgetCommand(b, f)
+	}
+	if k, ok := b.cfg.Agent.(MemoryKeeper); ok {
+		for name, mk := range map[string]func(*Bot, MemoryKeeper) *Command{
+			"remember": rememberCommand, "memories": memoriesCommand, "unremember": unrememberCommand,
+		} {
+			if b.commands[name] == nil {
+				b.commands[name] = mk(b, k)
+			}
+		}
 	}
 	b.mu.Unlock()
 

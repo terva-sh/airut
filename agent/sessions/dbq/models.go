@@ -24,6 +24,20 @@ type Link struct {
 	SessionID int64
 }
 
+type Memory struct {
+	ID         int64
+	Scope      string
+	ScopeKey   string
+	Key        string
+	Text       string
+	Source     string
+	Author     string
+	AuthorName string
+	Status     string
+	Created    int64
+	LastUsed   int64
+}
+
 type SchemaMigration struct {
 	Version   int64
 	Name      string

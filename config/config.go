@@ -12,6 +12,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -104,6 +105,49 @@ type Agent struct {
 	// Access lists who may start an agent turn, by platform. A platform
 	// with no entry allows nobody.
 	Access map[string]Access
+	// Judge is the [agent.judge] table, or nil when there is none.
+	Judge *Judge
+	// Memory is the [agent.memory] table. Its zero value takes every
+	// default.
+	Memory Memory
+}
+
+// Memory configures long-term memory.
+type Memory struct {
+	// ModelWrites says, per scope ("user", "channel", "bot"), what
+	// happens when the model asks to remember something: "off", "ask",
+	// or "auto". A scope it leaves out takes the core's default.
+	ModelWrites map[string]string
+	// MaxUser, MaxChannel, and MaxBot cap the active memories of one
+	// person, one channel, and the bot; zero takes the agent's default.
+	MaxUser    int
+	MaxChannel int
+	MaxBot     int
+}
+
+// Judge configures the judge: one tool-free call for each judgement, on
+// a model of its own.
+type Judge struct {
+	Model ModelRef
+	// Concurrency caps the judge calls in flight; zero means one.
+	Concurrency int
+	// Output is how the reply is constrained: "response_format",
+	// "json_schema", "grammar", or "none"; empty means response_format.
+	Output string
+	// Slots, if positive, pins each room to one of this many llama.cpp
+	// slots; CachePrompt sends llama.cpp's cache_prompt.
+	Slots       int
+	CachePrompt bool
+	// Timeout bounds a call; zero takes the judge's default.
+	Timeout time.Duration
+	// Rate caps the judgements per channel; zero caps nothing.
+	Rate JudgeRate
+}
+
+// JudgeRate caps judgements per channel in a sliding window.
+type JudgeRate struct {
+	PerChannel int
+	Window     time.Duration
 }
 
 // Budget caps one agent turn.
@@ -221,6 +265,28 @@ type fileAgent struct {
 	Rate    *fileRate    `toml:"rate"`
 	History *fileHistory `toml:"history"`
 	Access  fileAccess   `toml:"access"`
+	Judge   *fileJudge   `toml:"judge"`
+	Memory  *fileMemory  `toml:"memory"`
+}
+
+type fileMemory struct {
+	ModelWrites map[string]string `toml:"model_writes"`
+	MaxUser     int               `toml:"max_user"`
+	MaxChannel  int               `toml:"max_channel"`
+	MaxBot      int               `toml:"max_bot"`
+}
+
+type fileJudge struct {
+	Model       string `toml:"model"`
+	Concurrency int    `toml:"concurrency"`
+	Output      string `toml:"output"`
+	Slots       int    `toml:"slots"`
+	CachePrompt bool   `toml:"cache_prompt"`
+	Timeout     string `toml:"timeout"`
+	Rate        *struct {
+		PerChannel int    `toml:"per_channel"`
+		Window     string `toml:"window"`
+	} `toml:"rate"`
 }
 
 type fileHistory struct {
@@ -433,22 +499,82 @@ func buildProvider(p *problems, id string, f fileProvider, dir string) Provider 
 	return pr
 }
 
+// modelRef reads a model named as "provider/model" at key, and checks
+// that its provider is configured and lists it.
+func modelRef(p *problems, key, raw string, providers []Provider) ModelRef {
+	provider, model, ok := strings.Cut(raw, "/")
+	switch {
+	case raw == "":
+		p.add(key, `required: a model, as "provider/model"`)
+		return ModelRef{}
+	case !ok || provider == "" || model == "":
+		p.add(key, `a model is named as "provider/model"`)
+		return ModelRef{}
+	}
+	i := slices.IndexFunc(providers, func(pr Provider) bool { return pr.ID == provider })
+	if i < 0 {
+		p.add(key, "names a provider that is not configured")
+	} else if !slices.ContainsFunc(providers[i].Models, func(m Model) bool { return m.ID == model }) {
+		p.add(key, "names a model its provider does not list")
+	}
+	return ModelRef{Provider: provider, Model: model}
+}
+
+func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
+	j := &Judge{Model: modelRef(p, "agent.judge.model", f.Model, providers),
+		Concurrency: f.Concurrency, Output: f.Output, Slots: f.Slots, CachePrompt: f.CachePrompt}
+	if f.Concurrency < 0 {
+		p.add("agent.judge.concurrency", "must not be negative")
+	}
+	if f.Slots < 0 {
+		p.add("agent.judge.slots", "must not be negative")
+	}
+	switch f.Output {
+	case "", "response_format", "json_schema", "grammar", "none":
+	default:
+		p.add("agent.judge.output", `must be "response_format", "json_schema", "grammar", or "none"`)
+	}
+	if f.Timeout != "" {
+		j.Timeout = duration(p, "agent.judge.timeout", f.Timeout)
+	}
+	if r := f.Rate; r != nil {
+		j.Rate.PerChannel = r.PerChannel
+		if r.PerChannel < 0 {
+			p.add("agent.judge.rate.per_channel", "must not be negative")
+		}
+		if r.Window != "" {
+			j.Rate.Window = duration(p, "agent.judge.rate.window", r.Window)
+		} else if r.PerChannel > 0 {
+			p.add("agent.judge.rate.window", "required with per_channel")
+		}
+	}
+	return j
+}
+
 func buildAgent(p *problems, f *fileAgent, providers []Provider) *Agent {
 	a := &Agent{Access: map[string]Access{}}
 
-	provider, model, ok := strings.Cut(f.Model, "/")
-	switch {
-	case f.Model == "":
-		p.add("agent.model", `required: the default model, as "provider/model"`)
-	case !ok || provider == "" || model == "":
-		p.add("agent.model", `a model is named as "provider/model"`)
-	default:
-		a.Model = ModelRef{Provider: provider, Model: model}
-		i := slices.IndexFunc(providers, func(pr Provider) bool { return pr.ID == provider })
-		if i < 0 {
-			p.add("agent.model", "names a provider that is not configured")
-		} else if !slices.ContainsFunc(providers[i].Models, func(m Model) bool { return m.ID == model }) {
-			p.add("agent.model", "names a model its provider does not list")
+	a.Model = modelRef(p, "agent.model", f.Model, providers)
+	if f.Judge != nil {
+		a.Judge = buildJudge(p, f.Judge, providers)
+	}
+	if m := f.Memory; m != nil {
+		a.Memory = Memory{ModelWrites: m.ModelWrites, MaxUser: m.MaxUser, MaxChannel: m.MaxChannel, MaxBot: m.MaxBot}
+		for _, s := range slices.Sorted(maps.Keys(m.ModelWrites)) {
+			switch w := m.ModelWrites[s]; {
+			case s != "user" && s != "channel" && s != "bot":
+				p.add("agent.memory.model_writes."+s, `is not a scope: use "user", "channel", or "bot"`)
+			case w != "off" && w != "ask" && w != "auto":
+				p.add("agent.memory.model_writes."+s, `must be "off", "ask", or "auto"`)
+			}
+		}
+		for _, c := range []struct {
+			key string
+			n   int
+		}{{"max_bot", m.MaxBot}, {"max_channel", m.MaxChannel}, {"max_user", m.MaxUser}} {
+			if c.n < 0 {
+				p.add("agent.memory."+c.key, "must not be negative")
+			}
 		}
 	}
 

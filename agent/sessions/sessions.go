@@ -136,14 +136,24 @@ func (d *DB) sweepLoop() {
 }
 
 // Sweep deletes every session idle longer than the retention, with its
-// log, and reports how many it deleted.
+// log, and every user memory unused as long, pending ones included, and
+// reports how many sessions it deleted. Channel and bot memories are
+// kept.
 func (d *DB) Sweep(ctx context.Context) (int64, error) {
-	n, err := d.q.DeleteIdleSessions(ctx, d.now().Add(-d.retention).UnixMilli())
+	before := d.now().Add(-d.retention).UnixMilli()
+	n, err := d.q.DeleteIdleSessions(ctx, before)
 	if err != nil {
 		return 0, err
 	}
 	if n > 0 {
 		d.log.Info("sessions: expired idle sessions", "deleted", n)
+	}
+	m, err := d.q.DeleteIdleUserMemories(ctx, before)
+	if err != nil {
+		return n, err
+	}
+	if m > 0 {
+		d.log.Info("sessions: expired user memories", "deleted", m)
 	}
 	return n, nil
 }

@@ -59,6 +59,45 @@ rate = { per_user = 5, per_channel = 20, window = "10m" }
 # to 15m.
 history = { max_messages = 200, max_tokens = 60000, max_age = "168h", compaction = "summarize", room_messages = 10, follow_within = "15m" }
 
+# Optional. The judge: one call with no tools for each judgement a bot
+# asks for, such as whether to speak up in a conversation, on a model of
+# its own. Without this table every judgement abstains.
+[agent.judge]
+model = "local/qwen3-32b"
+# Judge calls in flight across the bot; more wait, and a room's waiting
+# call is replaced by its newer one. Set it to the server's parallel
+# slots. Defaults to 1.
+concurrency = 2
+# How the reply is held to the verdict's JSON: "response_format" (the
+# default, OpenAI's and llama-server's), "json_schema" or "grammar"
+# (llama.cpp's own fields), or "none".
+output = "json_schema"
+# llama.cpp only: pin each room to one of this many slots, and ask the
+# server to keep the prompt cached, so a room's next judgement reuses
+# it. 0 and false leave both to the server.
+slots = 2
+cache_prompt = true
+# Bounds a call, waiting included. Defaults to 30s.
+timeout = "20s"
+# Judgements per channel in a sliding window, apart from the turn rate,
+# which a judgement never uses. Without it nothing caps them.
+rate = { per_channel = 60, window = "1h" }
+
+# Optional. Long-term memory, which the built-in remember, memories, and
+# unremember commands and the remember tool write.
+[agent.memory]
+# What happens when the model asks to remember something, per scope:
+# "off", "ask" (the person it is talking to is asked first), or "auto".
+# A memory about someone else always waits for that person's consent,
+# and one for the whole bot for an approver's. Defaults: ask, auto, off.
+model_writes = { user = "ask", channel = "auto", bot = "off" }
+# Active memories kept per person, per channel, and for the bot; past
+# these the least recently used is archived, and recalled when a request
+# mentions it. Defaults: 20, 50, 50.
+max_user = 20
+max_channel = 50
+max_bot = 50
+
 # Who may start an agent turn, per platform. A platform with no list, or
 # an empty one, allows nobody.
 [agent.access.discord]

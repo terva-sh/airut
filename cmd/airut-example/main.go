@@ -152,7 +152,7 @@ func run(path string, log *slog.Logger) error {
 			return err
 		}
 		defer ag.Close()
-		bc.Agent, bc.Gate = ag, agent.Gate(cfg)
+		bc.Agent, bc.Gate, bc.MemoryWrites = ag, agent.Gate(cfg), agent.MemoryWrites(cfg)
 	}
 	as := adapters(cfg, log)
 	if len(as) == 0 {

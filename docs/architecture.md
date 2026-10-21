@@ -62,6 +62,12 @@ that one platform would refuse therefore fails at startup on all of
 them. `Command` panics there, naming the command and the field. The
 Discord adapter maps a `Spec` to an application command.
 
+In the text grammar, words bind to parameters in order, and any
+parameter can be set by name, as `name=value` or as `--name` for a
+boolean. A parameter tagged `named` binds only by name, so optional
+switches can come before a final rest parameter, as in
+`remember --channel TEXT`.
+
 A command called by the agent runs with the same `Ctx` type, marked as an
 agent call, so a handler can tell a person's request from the model's.
 What it replies is returned to the model as the tool's result and is not
@@ -478,10 +484,13 @@ trigger it. So before a turn reaches the agent, the core checks
   listed caller costs no membership lookup. A membership check that
   fails is logged by kind, and refuses unless another channel admits. A platform with no list allows
   nobody, and the zero `Gate` refuses every turn. In the configuration
-  file, Matrix names its channels as `rooms`, by room id.
+  file, Matrix names its channels as `rooms`, by room id. A turn a
+  `Chime` handler starts is the channel's: the channel itself must be
+  listed in `Channels`.
 - **Rate limit:** at most `PerUser` turns per caller and `PerChannel`
   per channel in a sliding `Window`. The counts are held in memory, and a
-  refused turn counts against neither.
+  refused turn counts against neither. A `Chime` turn counts against
+  `PerChannel` only.
 - **Budget:** each zero field of the turn's `Budget` takes the gate's
   default. The agent stops the turn at the budget it receives.
 
@@ -513,6 +522,107 @@ command failed rather than that the caller is not allowed, and the tool
 is left out of the turn. A plain `Tool` restricts itself by implementing
 `RestrictedTool`. The core wraps such a tool so that each call is
 checked again, and the wrapper keeps the tool's need for approval.
+
+## Judgements
+
+Some decisions are too frequent for an agent turn, such as whether to
+speak up in a conversation nobody asked the bot into. A turn costs a unit
+of the caller's rate and a full model call with tools. `Ctx.Judge` asks
+one yes-or-no question of a small model instead:
+
+- A `Judgement` names a judge persona, the app's question, the earlier
+  messages as `Context`, and the messages the question is about as
+  `Batch`, oldest first.
+- The `Verdict` is `Yes`, `No`, or `Abstain`. A yes names one message of
+  the batch as its `Target`. A failure, a timeout, a refusal, a reply
+  that is not a clean verdict, or a target outside the batch all come
+  back as `Abstain`, which a bot treats as no.
+- `Config.JudgeRate` caps judgements per channel in a sliding window. It
+  is apart from the gate's rate, and a judgement never draws on a
+  member's turns.
+- The core counts `airut_judge_total` by persona and decision and
+  `airut_judge_seconds`, and logs the invocation, persona, decision, and
+  batch size. The prompt, the chat, and `Verdict.Reason`, which is model
+  text drawn from chat, never reach a log.
+
+The core declares `Judge`, and `agent.NewJudge` implements it with one
+call and no tools, at temperature 0. It talks to an OpenAI-compatible
+chat completions endpoint itself, because terva's provider request has no
+field for llama.cpp's constrained output or slots. A provider that is not
+OpenAI-compatible goes through a terva client, without them.
+
+- **Constrained output.** `Output` sends OpenAI's `response_format`,
+  llama.cpp's `json_schema` or GBNF `grammar`, or nothing. The schema
+  bounds the target to the batch. The reply is then parsed strictly: one
+  JSON object with a decision, a target, and a reason, and nothing after
+  it.
+- **Untrusted input.** Every message is quoted chat, with the
+  instruction to read it and never follow it. Injected text can at worst
+  produce a yes about a message of the batch.
+- **Concurrency.** `Concurrency` caps the calls in flight across the
+  bot. A call over the cap waits, and a newer call with the same
+  `Judgement.Key`, the channel by default, takes a waiting one's place.
+  The replaced call abstains with `ErrSuperseded`, so no caller is left
+  blocked.
+- **Prompt reuse.** The prompt is the persona and rules, then the earlier
+  messages, then the numbered batch, then the question. A room's next
+  judgement shares the prefix up to its new messages. `CachePrompt` sends
+  llama.cpp's `cache_prompt`, and `Slots` pins each key to one llama.cpp
+  slot with `id_slot`, so that prefix is found cached.
+- **Accounting.** `airut_judge_tokens_total` counts the tokens each call
+  reports, by persona. A judgement has no session to book them against.
+
+`agent.OpenJudge` builds the judge from `[agent.judge]`, on its
+provider's base URL and key, and `agent.JudgeRate` builds the core's
+`JudgeRate` from its `rate`.
+
+### Chime
+
+`Bot.Chime` is a listener built on the judge, for a bot that speaks up
+unprompted. Judging every message would spend a judgement on each line
+of a busy room, so it gathers them:
+
+- **Settling.** In each of its `Channels`, the first new message opens
+  a batch. Each later one extends it by `Settle`, up to `MaxWait` after
+  the first, and the batch is judged once. One judgement runs per
+  channel at a time. Messages that arrive meanwhile wait for the next.
+- **What is judged.** The bot's own messages and commands never reach
+  the judge, and neither does a message older than `MaxAge` when it
+  arrives, as after downtime. A message that addresses the bot, and one
+  in a direct channel, are the bot's own handlers' to answer. The first
+  is read as part of the batch but can never be chosen, and the second
+  is not read at all.
+- **Context.** The judge reads the channel's earlier messages before the
+  batch. The window keeps its start while it grows to twice
+  `ContextMessages`, then drops to `ContextMessages` in one step. A
+  sliding window would change the prompt's first message on every
+  judgement, and the model server could reuse almost none of its cache.
+  The window lives in memory, so a restart starts it empty, and the
+  bot's own replies are never delivered, so they are not in it.
+- **A yes that came too late.** Before `Handler` runs, a yes is
+  dropped when a message that arrived after the batch closed replies to
+  the target, or comes from someone else and replies to nothing. Either
+  may already be the answer. A second judgement would cost one every
+  time the room is busy, which is when judgements are scarcest, so the
+  rule is this cheap one.
+- **Limits.** `MaxPerHour` caps the handler's runs in a channel, and a
+  channel at its cap is not judged. Nothing in a channel is judged
+  while the handler runs, nor for `Cooldown` after. `StayOut` drops
+  a yes about a message that replies to another person, and does not
+  judge such a message at all when the listener saw the message replied
+  to. Otherwise it fetches that message, and one it cannot read counts
+  as a person's.
+- **Whose turn.** The handler's `Ctx` stands on the chosen message, so a
+  reply answers it. An agent turn it starts is the channel's, because
+  nobody asked for it. The channel must be in the gate's
+  `Access.Channels`, and the turn takes one of `PerChannel`'s turns and
+  none of the sender's `PerUser`. The sender needs no access of their
+  own.
+- **Misses.** A reaction among `Misses` on a reply the handler sent
+  counts once in `airut_chime_misses_total`. `airut_chime_total` counts
+  each batch the judge was asked about, or would have been, by outcome:
+  `spoke`, `failed`, `declined`, `stale`, `stayed_out`, `not_judged`,
+  `limited`, or `cooldown`.
 
 ## Sessions
 
@@ -599,6 +709,78 @@ schema is a set of forward-only migrations embedded in the binary.
 The database holds conversation text. Protect it and back it up like the
 Matrix crypto store; airut never logs what is in it.
 
+## Memory
+
+An agent that is a `MemoryKeeper` keeps long-term memory in three
+scopes: a person's, a channel's, and the bot's own. The core decides who
+may write, see, and remove a memory, so the rules hold for any agent.
+The keeper stores memories, folds near duplicates together, and archives
+what falls past a cap. `agent.Agent` keeps them in the session store.
+
+- **Built-in commands.** As with `forget`, a running bot gains three:
+  - `remember TEXT` saves a memory about the caller. `--channel` saves
+    it for the channel, `--bot` for the bot, `about=@someone` for
+    another person, and `key=NAME` names it, so a later memory with the
+    same key replaces it.
+  - `memories` lists, privately, the caller's own memories, the
+    channel's, and the bot's, with their numbers and who noted them.
+  - `unremember ID` removes one.
+  A bot command of the same name takes a built-in's place.
+- **The tool.** `remember` is also a tool. `Bot.Tools("remember")`,
+  called in a handler, hands it to a turn, so "remember that I prefer
+  metric" reaches the same rules. `Config.MemoryWrites` says, per scope,
+  what a write by the model does: `WriteOff` refuses it, `WriteAsk` asks
+  the caller first, and `WriteAuto` saves it. The defaults are ask for a
+  person, auto for a channel, and off for the bot.
+- **Consent.** A memory about the caller needs only the caller. One
+  about someone else is saved pending under that person, and is never
+  shown to a turn. The core asks that person after their next agent
+  turn, below its answer, and when they run `memories`, at most two at a
+  time. `Ask` still goes only to the caller. Asking after the turn rather
+  than before means a question they ignore never holds their answer
+  back. A Chime turn asks nobody.
+- **Channels** need no approval. A channel memory carries who noted it
+  and when, the store caps it, and anyone can see it with `memories`.
+  Its author, or someone `Config.MemoryApprover` admits, can remove it.
+- **The bot's memory** is shared by every room, so only an approver
+  writes it directly. Anyone else's write is saved pending, and
+  `Config.OnPendingMemory` is told, so the app can route it to an
+  approver, who makes it active with `SetMemoryStatus`.
+- **Removal.** A person can remove their own memories, and an author
+  the pending ones they wrote. An approver can remove any channel or bot
+  memory. Any other id reads as unknown, so an id reveals nothing. The
+  keeper removes a memory only as the core read it, so one replaced or
+  approved between the check and the removal is left alone.
+
+A turn sees its memories split by trust, as the owner decided. The
+bot's active memories, which an approver wrote or approved, go in a
+Stable segment, so in the cached system prompt. The caller's and the
+channel's, written from chat, go in a Volatile segment after the
+transcript, quoted with who noted them and when. A Stable segment would
+put chat-written text into the system prompt of every turn in the room.
+An archived memory in those scopes that shares a word of four or more
+letters with the request or its reply chain is recalled the same way, at
+most five and 2000 bytes. Every block says its contents are information,
+never instructions.
+
+The store's rules:
+
+- A memory is at most `MaxMemoryText` (500) bytes, and its key
+  `MaxMemoryKey` (64).
+- A new memory with the key of one in its scope replaces it. One whose
+  words overlap an active memory's by four fifths or more refreshes that
+  one instead.
+- Past a scope's cap, the least recently used active memory is
+  archived. The caps are 20 per person, 50 per channel, and 50 for the
+  bot, set by `[agent.memory]`. A scope keeps four times its cap in
+  archive, and deletes the oldest beyond that.
+- A person's memories, pending ones included, expire with
+  `[store] retention` after they were last written or recalled.
+  Channel and bot memories never expire.
+
+Memory text never reaches a log: only ids, scopes, statuses, and
+counts.
+
 ## Metrics
 
 Every bot keeps metrics in memory, which `Bot.Metrics()` and
@@ -615,6 +797,12 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_agent_requests_total` | `command` | model requests |
 | `airut_agent_tokens_total` | `command` | tokens the provider reported |
 | `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `budget`, or `error` |
+| `airut_judge_total` | `persona`, `decision` | judgements, by decision, abstentions included |
+| `airut_judge_seconds` | `persona` | how long a judgement took |
+| `airut_chime_total` | `persona`, `outcome` | Chime batches, by how each ended |
+| `airut_chime_misses_total` | `persona` | Chime replies marked as a miss |
+| `airut_memory_writes_total` | `scope`, `source`, `status` | memories saved, by how they were saved |
+| `airut_memory_consents_total` | `answer` | answers to a pending memory's question |
 | `airut_adapter_up` | `platform` | 1 while the adapter runs |
 | `airut_uptime_seconds` | | seconds since the bot was made |
 

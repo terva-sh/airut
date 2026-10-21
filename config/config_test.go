@@ -81,6 +81,10 @@ func TestExample(t *testing.T) {
 				"discord": {Users: []string{"123456789012345678"}, Roles: []string{"234567890123456789"}},
 				"matrix":  {Users: []string{"@owner:example.org"}, Rooms: []string{"!members:example.org"}},
 			},
+			Judge: &Judge{Model: ModelRef{Provider: "local", Model: "qwen3-32b"}, Concurrency: 2, Output: "json_schema",
+				Slots: 2, CachePrompt: true, Timeout: 20 * time.Second, Rate: JudgeRate{PerChannel: 60, Window: time.Hour}},
+			Memory: Memory{ModelWrites: map[string]string{"user": "ask", "channel": "auto", "bot": "off"},
+				MaxUser: 20, MaxChannel: 50, MaxBot: 50},
 		},
 		Store:   Store{Path: "/var/lib/airut-sample/sessions.db", Retention: 720 * time.Hour},
 		Discord: &Discord{Token: secret, Guilds: []string{"345678901234567890"}},
@@ -298,6 +302,38 @@ path = "s.db"
 retention = "-1h"
 `, []string{"agent.budget.max_tokens", "agent.budget.max_turns", "agent.model", "store.retention"}},
 		{"a model without a provider", minimal + "[agent]\nmodel = \"m\"\nbudget = { max_turns = 1, max_tokens = 1 }\n[store]\npath = \"s\"\n", []string{"agent.model"}},
+		{"a bad judge", minimal + `
+[providers.local]
+base_url = "http://localhost/v1"
+models = [{ id = "m" }]
+[agent]
+model = "local/m"
+budget = { max_turns = 1, max_tokens = 1 }
+[agent.judge]
+model = "elsewhere/m"
+concurrency = -1
+output = "xml"
+slots = -2
+timeout = "soon"
+rate = { per_channel = 5 }
+[store]
+path = "s.db"
+`, []string{"agent.judge.concurrency", "agent.judge.model", "agent.judge.output", "agent.judge.rate.window", "agent.judge.slots", "agent.judge.timeout"}},
+		{"a bad memory table", minimal + `
+[providers.local]
+base_url = "http://localhost/v1"
+models = [{ id = "m" }]
+[agent]
+model = "local/m"
+budget = { max_turns = 1, max_tokens = 1 }
+[agent.memory]
+model_writes = { user = "always", room = "auto" }
+max_user = -1
+max_channel = -2
+max_bot = -3
+[store]
+path = "s.db"
+`, []string{"agent.memory.max_bot", "agent.memory.max_channel", "agent.memory.max_user", "agent.memory.model_writes.room", "agent.memory.model_writes.user"}},
 		{"bad access lists", minimal + `
 [providers.p]
 base_url = "http://localhost/v1"

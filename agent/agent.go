@@ -31,8 +31,12 @@ type Options struct {
 	// is the persona of a turn that names none. A turn naming a persona
 	// that is not here fails.
 	Personas map[string]string
-	// Sessions keeps the conversations turns remember.
+	// Sessions keeps the conversations turns remember, and the bot's
+	// long-term memories.
 	Sessions *sessions.DB
+	// MemoryCaps cap the active memories per scope. A zero field takes
+	// its default.
+	MemoryCaps MemoryCaps
 	// History bounds what a turn resumes in each field the turn's own
 	// History leaves zero. The zero value bounds nothing.
 	History airut.History
@@ -53,6 +57,7 @@ type Agent struct {
 	personas map[string]string
 	db       *sessions.DB
 	history  airut.History
+	caps     MemoryCaps
 	now      func() time.Time
 	ownsDB   bool
 	log      *slog.Logger
@@ -88,13 +93,26 @@ func New(o Options) (*Agent, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.MemoryCaps.User < 0 || o.MemoryCaps.Channel < 0 || o.MemoryCaps.Bot < 0 {
+		return nil, errors.New("agent: Options.MemoryCaps cannot be negative")
+	}
+	caps := o.MemoryCaps
+	if caps.User == 0 {
+		caps.User = DefaultMaxUserMemories
+	}
+	if caps.Channel == 0 {
+		caps.Channel = DefaultMaxChannelMemories
+	}
+	if caps.Bot == 0 {
+		caps.Bot = DefaultMaxBotMemories
+	}
 	personas := make(map[string]string, len(o.Personas))
 	for k, v := range o.Personas {
 		personas[k] = v
 	}
 	return &Agent{
 		client: client, catalog: o.Catalog, model: o.Model, personas: personas,
-		db: o.Sessions, history: o.History, now: o.Now, log: o.Logger,
+		db: o.Sessions, history: o.History, caps: caps, now: o.Now, log: o.Logger,
 	}, nil
 }
 
@@ -113,6 +131,7 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 	a, err := New(Options{
 		Clients: clients, Catalog: catalog, Model: c.Agent.Model,
 		Personas: personas, Sessions: db, Logger: log,
+		MemoryCaps: MemoryCaps{User: c.Agent.Memory.MaxUser, Channel: c.Agent.Memory.MaxChannel, Bot: c.Agent.Memory.MaxBot},
 		History: airut.History{
 			MaxMessages:  c.Agent.History.MaxMessages,
 			MaxTokens:    c.Agent.History.MaxTokens,
@@ -230,7 +249,9 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		return fmt.Errorf("agent: the turn's History: %w", err)
 	}
 	h := history(t.History, a.history)
-	opts = append(opts, core.WithAssembler(assembler{system: system, quoted: a.quoted(c, h.RoomMessages)}))
+	stable, volatile := a.memories(c, t.Prompt)
+	opts = append(opts, core.WithAssembler(assembler{system: system, stable: stable,
+		quoted: append(volatile, a.quoted(c, h.RoomMessages)...)}))
 	var resume *core.Transcript
 	if key := c.SessionKey(t.Session); key != "" {
 		// One turn at a time per session, so two never resume the same

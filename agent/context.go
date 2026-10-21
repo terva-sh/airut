@@ -12,12 +12,14 @@ import (
 	"terva.sh/airut"
 )
 
-// assembler is a turn's frame: the persona's system prompt, cached, and
-// after the transcript the chat the turn is shown, which terva sends
-// with each request and never writes to the transcript. So a resumed
+// assembler is a turn's frame: the persona's system prompt and the
+// bot's approved memories, cached, and after the transcript the chat
+// and chat-written memories the turn is shown, which terva sends with
+// each request and never writes to the transcript. So a resumed
 // conversation never replays an old quote as if it were said in it.
 type assembler struct {
 	system string
+	stable []core.Segment
 	quoted []core.Segment
 }
 
@@ -26,6 +28,7 @@ func (a assembler) Assemble(core.AssembleMode) core.Frame {
 	if a.system != "" {
 		f.Segments = append(f.Segments, core.Segment{Stability: core.Stable, Tag: "system", Content: a.system})
 	}
+	f.Segments = append(f.Segments, a.stable...)
 	f.Segments = append(f.Segments, a.quoted...)
 	return f
 }
