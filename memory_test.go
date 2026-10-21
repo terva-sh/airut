@@ -427,3 +427,45 @@ func TestUnrememberChecksWhatItRemoves(t *testing.T) {
 		t.Errorf("the replacement is %+v, %v", m, ok)
 	}
 }
+
+func TestMemoryAccess(t *testing.T) {
+	onlyMod := func(c *airut.Ctx) (bool, error) { return c.Caller().ID == "mod", nil }
+	k := &keeper{}
+	a, _ := memoryBot(t, k, airut.Config{MemoryAccess: onlyMod})
+	for _, line := range []string{"!remember I like tea", "!memories", "!unremember 1"} {
+		name := strings.Fields(line)[0]
+		if got := lastText(a.Text(line, airuttest.As(tester))); got != "You are not allowed to use "+name+"." {
+			t.Errorf("%s by someone MemoryAccess refuses: %q", line, got)
+		}
+	}
+	if got := lastText(a.Text("!remember --channel standup is at nine", airuttest.As(approver))); got != "Remembered (memory 1)." {
+		t.Errorf("remember by someone MemoryAccess allows: %q", got)
+	}
+	if got := lastText(a.Text("!unremember 1", airuttest.As(approver))); got != "Forgot memory 1." {
+		t.Errorf("unremember by someone MemoryAccess allows: %q", got)
+	}
+}
+
+func TestMemoryAccessCoversTheTool(t *testing.T) {
+	onlyMod := func(c *airut.Ctx) (bool, error) { return c.Caller().ID == "mod", nil }
+	for _, c := range []struct {
+		as     airut.User
+		result string
+		saved  int64
+	}{
+		// The tool is left out of a refused caller's turn, so the model is
+		// never offered it.
+		{tester, "refused: the turn does not name tool remember", 0},
+		{approver, "Remembered (memory 1).", 1},
+	} {
+		k := &keeper{Agent: airuttest.Agent{Steps: []airuttest.Step{{Call: "remember", Args: `{"text": "standup is at nine", "channel": true}`}}}}
+		a, _ := memoryBot(t, k, airut.Config{MemoryAccess: onlyMod})
+		a.Text("!ask", airuttest.As(c.as))
+		if res := k.Results(); len(res) != 1 || res[0] != c.result {
+			t.Errorf("a turn of %s: tool results %q, want %q", c.as.ID, res, c.result)
+		}
+		if k.next != c.saved {
+			t.Errorf("a turn of %s saved %d memories, want %d", c.as.ID, k.next, c.saved)
+		}
+	}
+}
