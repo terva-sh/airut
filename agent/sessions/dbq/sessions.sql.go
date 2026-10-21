@@ -33,6 +33,57 @@ func (q *Queries) DeleteSession(ctx context.Context, key string) (int64, error) 
 	return result.RowsAffected()
 }
 
+const deleteSessionsWithPrefix = `-- name: DeleteSessionsWithPrefix :execrows
+DELETE FROM sessions WHERE substr(key, 1, length(CAST(?1 AS TEXT))) = ?1
+`
+
+// substr rather than LIKE, whose _ and % would match more than the
+// prefix says.
+func (q *Queries) DeleteSessionsWithPrefix(ctx context.Context, prefix string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteSessionsWithPrefix, prefix)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const followSession = `-- name: FollowSession :execrows
+INSERT INTO follows (person, session_id, at)
+SELECT ?, id, ? FROM sessions WHERE key = ?
+ON CONFLICT (person) DO UPDATE SET session_id = excluded.session_id, at = excluded.at
+`
+
+type FollowSessionParams struct {
+	Person string
+	At     int64
+	Key    string
+}
+
+// A person follows only a session that exists, as a link does.
+func (q *Queries) FollowSession(ctx context.Context, arg FollowSessionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, followSession, arg.Person, arg.At, arg.Key)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const followedSession = `-- name: FollowedSession :one
+SELECT s.key, f.at FROM follows f JOIN sessions s ON s.id = f.session_id WHERE f.person = ?
+`
+
+type FollowedSessionRow struct {
+	Key string
+	At  int64
+}
+
+func (q *Queries) FollowedSession(ctx context.Context, person string) (FollowedSessionRow, error) {
+	row := q.db.QueryRowContext(ctx, followedSession, person)
+	var i FollowedSessionRow
+	err := row.Scan(&i.Key, &i.At)
+	return i, err
+}
+
 const insertEntry = `-- name: InsertEntry :exec
 INSERT INTO entries (session_id, seq, kind, body) VALUES (?, ?, ?, ?)
 `
@@ -52,6 +103,52 @@ func (q *Queries) InsertEntry(ctx context.Context, arg InsertEntryParams) error 
 		arg.Body,
 	)
 	return err
+}
+
+const linkMessage = `-- name: LinkMessage :execrows
+INSERT INTO links (platform, channel, message, session_id)
+SELECT ?, ?, ?, id FROM sessions WHERE key = ?
+ON CONFLICT (platform, channel, message) DO UPDATE SET session_id = excluded.session_id
+`
+
+type LinkMessageParams struct {
+	Platform string
+	Channel  string
+	Message  string
+	Key      string
+}
+
+// A message is linked only to a session that exists, so a link written
+// after its session was forgotten is never made.
+func (q *Queries) LinkMessage(ctx context.Context, arg LinkMessageParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, linkMessage,
+		arg.Platform,
+		arg.Channel,
+		arg.Message,
+		arg.Key,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const linkedSession = `-- name: LinkedSession :one
+SELECT s.key FROM links l JOIN sessions s ON s.id = l.session_id
+WHERE l.platform = ? AND l.channel = ? AND l.message = ?
+`
+
+type LinkedSessionParams struct {
+	Platform string
+	Channel  string
+	Message  string
+}
+
+func (q *Queries) LinkedSession(ctx context.Context, arg LinkedSessionParams) (string, error) {
+	row := q.db.QueryRowContext(ctx, linkedSession, arg.Platform, arg.Channel, arg.Message)
+	var key string
+	err := row.Scan(&key)
+	return key, err
 }
 
 const listEntries = `-- name: ListEntries :many

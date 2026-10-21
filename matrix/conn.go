@@ -65,7 +65,8 @@ func (s *session) Open(ctx context.Context, a airut.Attachment) (io.ReadCloser, 
 // that were commands, edits, redacted, or the bot's own are left out, and
 // so are encrypted ones it cannot decrypt, so a page can hold fewer than
 // limit messages, or none, and still have a Next.
-func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, limit int) (airut.HistoryPage, error) {
+func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, limit int, opts ...airut.HistoryOption) (airut.HistoryPage, error) {
+	withBot := airut.ReadHistoryOptions(opts).IncludeBot
 	if limit <= 0 {
 		limit = defaultPage
 	}
@@ -94,17 +95,25 @@ func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, 
 			}
 			evt = dec
 		}
-		if evt.Type != event.EventMessage || evt.Sender == s.c.UserID {
+		own := evt.Sender == s.c.UserID
+		if evt.Type != event.EventMessage || own && !withBot {
 			continue
 		}
 		in, ok := s.parse(evt)
 		if !ok {
 			continue
 		}
-		if _, _, cmd := in.command(s.h.Prefix(), s.me, s.known); cmd {
+		if own {
+			// The bot's answer as it ended, not the first fragment its
+			// streaming posted.
+			page.Messages = append(page.Messages, s.asMessage(ctx, room, in, true))
 			continue
 		}
-		page.Messages = append(page.Messages, in.messageEvent(s.user(ctx, room, evt.Sender), s.me))
+		direct := s.isDirect(ctx, room, evt.Sender)
+		if _, _, cmd := in.command(s.h.Prefix(), s.me, s.known, direct); cmd {
+			continue
+		}
+		page.Messages = append(page.Messages, in.messageEvent(s.user(ctx, room, evt.Sender), s.me, direct))
 	}
 	if undecryptable > 0 {
 		s.log.Info("history held messages it could not decrypt", "room", string(room), "count", undecryptable)
@@ -197,4 +206,30 @@ func (s *session) Unreact(ctx context.Context, ch airut.Channel, reaction airut.
 	}
 	_, err = s.c.RedactEvent(ctx, room, ev)
 	return err
+}
+
+// Direct reports whether ch is a direct room: named in the account's
+// m.direct, encrypted, joinable only by invitation, and with nobody
+// joined or invited but the bot and one other person, whom it returns.
+// It reads the state store as it is now.
+func (s *session) Direct(ctx context.Context, ch airut.Channel) (airut.User, bool, error) {
+	room := id.RoomID(ch.ID)
+	members, err := s.c.StateStore.GetAllMembers(ctx, room)
+	if err != nil {
+		return airut.User{}, false, err
+	}
+	var other id.UserID
+	for who, m := range members {
+		if who == s.c.UserID || m == nil || (m.Membership != event.MembershipJoin && m.Membership != event.MembershipInvite) {
+			continue
+		}
+		if other != "" {
+			return airut.User{}, false, nil
+		}
+		other = who
+	}
+	if other == "" || !s.isDirect(ctx, room, other) {
+		return airut.User{}, false, nil
+	}
+	return s.user(ctx, room, other), true, nil
 }

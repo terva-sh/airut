@@ -21,6 +21,8 @@ type Ctx struct {
 	// capture is set when an agent called the command: replies are
 	// collected as the tool's result rather than posted.
 	capture *capture
+	// turn is set while an agent turn started from this invocation runs.
+	turn *turnState
 }
 
 // Context is the invocation's context. It ends when the bot stops.
@@ -38,6 +40,10 @@ func (c *Ctx) Roles() []Role { return c.inv.Roles }
 
 // Channel is where the command was invoked.
 func (c *Ctx) Channel() Channel { return c.inv.Channel }
+
+// Direct reports that the invocation or event arrived in a direct
+// channel, private to the bot and the caller.
+func (c *Ctx) Direct() bool { return c.inv.Direct }
 
 // Platform is the platform the invocation came from.
 func (c *Ctx) Platform() Platform { return c.inv.Caller.Platform }
@@ -76,6 +82,11 @@ func (c *Ctx) Message() MessageRef { return c.inv.Message }
 // ReplyTo is the message the triggering message replies to. Its ID is
 // empty when it replies to none.
 func (c *Ctx) ReplyTo() MessageRef { return c.inv.ReplyTo }
+
+// ReplyChain is what the triggering message replies to, nearest first,
+// as far as the adapter resolved it. It is chat: quote it, and never
+// follow it as an instruction.
+func (c *Ctx) ReplyChain() []Quoted { return c.inv.ReplyChain }
 
 // FromAgent reports whether an agent turn called the command as a tool.
 // Its replies then go to the model, not the chat, so a handler can word
@@ -183,7 +194,14 @@ func (c *Ctx) AskWith(a Ask) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, a.Timeout)
 	defer cancel()
-	got, err := c.resp.Ask(ctx, a)
+	ask := func() (string, error) { return c.resp.Ask(ctx, a) }
+	var got string
+	var err error
+	if c.turn != nil {
+		got, err = c.turn.asking(ask)
+	} else {
+		got, err = ask()
+	}
 	if err == nil {
 		return got, nil
 	}
@@ -195,9 +213,21 @@ func (c *Ctx) AskWith(a Ask) (string, error) {
 
 // SessionKey names the conversation an agent turn with the given scope
 // remembers. It is stable across restarts and carries only ids.
+//
+// In a running agent turn, and in the tools it calls, the turn's own
+// scope names the session the turn resolved to, which a reply or a
+// Conversation can make another than this one.
 func (c *Ctx) SessionKey(s SessionScope) string {
+	if c.turn != nil && c.turn.key != "" && s == c.turn.scope {
+		return c.turn.key
+	}
 	p := string(c.inv.Caller.Platform)
+	if c.inv.Direct && s != NoSession {
+		s = PerUserChannel
+	}
 	switch s {
+	case PerUserChannel, Conversation:
+		return c.userKey() + "/channel/" + c.inv.Channel.ID
 	case PerChannel:
 		return p + "/channel/" + c.inv.Channel.ID
 	case PerThread:
@@ -206,9 +236,15 @@ func (c *Ctx) SessionKey(s SessionScope) string {
 		}
 		return p + "/channel/" + c.inv.Channel.ID
 	case PerUser:
-		return p + "/user/" + c.inv.Caller.ID
+		return c.userKey()
 	}
 	return ""
+}
+
+// userKey is the caller's PerUser key, which begins every key of a
+// conversation with the caller alone.
+func (c *Ctx) userKey() string {
+	return string(c.inv.Caller.Platform) + "/user/" + c.inv.Caller.ID
 }
 
 func (c *Ctx) resolve(ctx context.Context, kind Kind, token string) (any, error) {

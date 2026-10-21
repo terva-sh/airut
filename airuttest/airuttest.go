@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +24,9 @@ const Platform airut.Platform = "test"
 
 // Event is one thing the bot did through the fake adapter.
 type Event struct {
-	// Kind is "reply", "edit", "react", "ask", "typing", or "thread",
-	// or "send" for a message posted through the adapter's Conn. A
+	// Kind is "reply", "edit", "react", "ask", "ask-all", "answered",
+	// "typing", "typing-stop", or "thread", or "send" for a message
+	// posted through the adapter's Conn. A
 	// reaction added through the Conn is also "react", with Channel and
 	// Reaction set, and one retracted through it is "unreact".
 	Kind    string
@@ -57,6 +59,7 @@ type Adapter struct {
 	invSeq int
 	refSeq int
 	answer func(airut.Ask) (string, error)
+	bundle func(airut.Bundle) []Answer
 
 	// What the adapter's Conn serves.
 	files      map[string][]byte
@@ -69,6 +72,9 @@ type Adapter struct {
 	// live maps a channel, message, and emoji to the live one's ref.
 	reactions map[string]reaction
 	live      map[reaction]string
+	// direct maps a channel id to the person Conn.Direct reports it as
+	// private to.
+	direct map[string]airut.User
 }
 
 // reaction is one reaction the bot made through the Conn.
@@ -143,6 +149,25 @@ func (a *Adapter) OnAsk(f func(airut.Ask) (string, error)) {
 	a.mu.Unlock()
 }
 
+// Answer is one answer to a bundle question, from By.
+type Answer struct {
+	By    airut.User
+	Roles []airut.Role
+	Key   string
+	Text  string
+}
+
+// OnAskAll sets how bundles are answered: f returns the answers people
+// give, in order. As on a real platform, an answer from someone the
+// bundle's Who refuses, to a key the bundle lacks, or to a question
+// already answered is ignored. Without it, a bundle waits until it times
+// out.
+func (a *Adapter) OnAskAll(f func(airut.Bundle) []Answer) {
+	a.mu.Lock()
+	a.bundle = f
+	a.mu.Unlock()
+}
+
 // Events returns everything the bot did through the adapter, in order.
 func (a *Adapter) Events() []Event {
 	a.mu.Lock()
@@ -171,6 +196,11 @@ func As(u airut.User) Option { return func(i *delivery) { i.Caller = u } }
 
 // In delivers the invocation in channel ch.
 func In(ch airut.Channel) Option { return func(i *delivery) { i.Channel = ch } }
+
+// InDirect delivers the invocation, message, or reaction as one in a
+// direct channel, private to the bot and the caller. DirectMessage
+// applies it, and the rules for reading a line there, itself.
+func InDirect() Option { return func(i *delivery) { i.Direct = true } }
 
 // InThread delivers the invocation in the thread with this id.
 func InThread(id string) Option { return func(i *delivery) { i.Thread = id } }
@@ -202,7 +232,8 @@ func (a *Adapter) Text(line string, opts ...Option) []Event {
 		return a.deliver(airut.Invocation{Text: line}, opts, func(inv airut.Invocation, sent time.Time) airut.Event {
 			return airut.MessageEvent{
 				ID: inv.ID, Message: inv.Message, Sender: inv.Caller, Roles: inv.Roles, Channel: inv.Channel,
-				Thread: inv.Thread, Text: inv.Text, Files: inv.Files, ReplyTo: inv.ReplyTo, Native: inv.Native, Sent: sent,
+				Thread: inv.Thread, Direct: inv.Direct, Text: inv.Text, Files: inv.Files, ReplyTo: inv.ReplyTo,
+				Native: inv.Native, Sent: sent,
 			}
 		})
 	}
@@ -229,8 +260,34 @@ func (a *Adapter) Mention(line string, opts ...Option) []Event {
 	return a.deliver(airut.Invocation{Text: BotName + ": " + line}, opts, func(inv airut.Invocation, sent time.Time) airut.Event {
 		return airut.MessageEvent{
 			ID: inv.ID, Message: inv.Message, Sender: inv.Caller, Roles: inv.Roles, Channel: inv.Channel,
-			Thread: inv.Thread, Text: inv.Text, Mentioned: true, Request: request, Files: inv.Files,
-			ReplyTo: inv.ReplyTo, Native: inv.Native, Sent: sent,
+			Thread: inv.Thread, Direct: inv.Direct, Text: inv.Text, Mentioned: true, Request: request, Files: inv.Files,
+			ReplyTo: inv.ReplyTo, ReplyChain: inv.ReplyChain, Native: inv.Native, Sent: sent,
+		}
+	})
+}
+
+// DirectMessage delivers a line of chat in a direct channel, private to
+// the bot and the caller, and returns what the bot did in answer. As on
+// Matrix, every line there addresses the bot: a line that starts with
+// the prefix and a command name calls it, and so does a bare first word
+// that names a registered command. Any other line reaches the OnMessage
+// handlers with Direct and Mentioned set, and the line itself as
+// Request. The channel is the default one unless In names another.
+func (a *Adapter) DirectMessage(line string, opts ...Option) []Event {
+	opts = append(opts, InDirect())
+	if prefix := a.host.Prefix(); prefix != "" {
+		if name, rest, ok := airut.SplitCommand(line, prefix); ok {
+			return a.deliver(airut.Invocation{Command: name, Text: rest}, opts, nil)
+		}
+	}
+	if name, rest, ok := airut.SplitCommand(line, ""); ok && a.known(name) {
+		return a.deliver(airut.Invocation{Command: name, Text: rest}, opts, nil)
+	}
+	return a.deliver(airut.Invocation{Text: line}, opts, func(inv airut.Invocation, sent time.Time) airut.Event {
+		return airut.MessageEvent{
+			ID: inv.ID, Message: inv.Message, Sender: inv.Caller, Roles: inv.Roles, Channel: inv.Channel,
+			Thread: inv.Thread, Direct: true, Text: inv.Text, Mentioned: true, Request: inv.Text, Files: inv.Files,
+			ReplyTo: inv.ReplyTo, ReplyChain: inv.ReplyChain, Native: inv.Native, Sent: sent,
 		}
 	})
 }
@@ -250,13 +307,26 @@ func (a *Adapter) React(ref airut.MessageRef, emoji string, opts ...Option) []Ev
 	return a.deliver(airut.Invocation{}, opts, func(inv airut.Invocation, sent time.Time) airut.Event {
 		return airut.ReactionEvent{
 			ID: inv.ID, Sender: inv.Caller, Roles: inv.Roles, Channel: inv.Channel, Thread: inv.Thread,
-			Target: ref, Emoji: emoji, Native: inv.Native,
+			Direct: inv.Direct, Target: ref, Emoji: emoji, Native: inv.Native,
 		}
 	})
 }
 
 // ReplyingTo makes the delivered message a reply to ref.
 func ReplyingTo(ref airut.MessageRef) Option { return func(i *delivery) { i.ReplyTo = ref } }
+
+// WithReplyChain delivers the line as a reply whose chain, nearest first,
+// is chain, and whose ReplyTo is the first link's ref. As on a real
+// platform, an invocation and a message that addresses the bot carry
+// the chain; ordinary chat carries only ReplyTo.
+func WithReplyChain(chain ...airut.Quoted) Option {
+	return func(i *delivery) {
+		i.ReplyChain = chain
+		if len(chain) > 0 {
+			i.ReplyTo = chain[0].Ref
+		}
+	}
+}
 
 // deliver fills in the invocation's defaults and applies opts, then
 // dispatches it as a command, or as the event asEvent builds from it.
@@ -358,6 +428,47 @@ func (r *responder) React(_ context.Context, ref airut.MessageRef, emoji string)
 func (r *responder) Typing(context.Context) error {
 	r.record(Event{Kind: "typing"})
 	return nil
+}
+
+func (r *responder) StopTyping(context.Context) error {
+	r.record(Event{Kind: "typing-stop"})
+	return nil
+}
+
+// AskAll records an "ask-all" event, whose Text lists the questions one
+// a line and whose Choices are the keys, then plays the answers OnAskAll
+// gives, recording an "answered" event for each one it takes.
+func (r *responder) AskAll(ctx context.Context, b airut.Bundle) (map[string]airut.Answer, error) {
+	var lines, keys []string
+	if b.Intro != "" {
+		lines = append(lines, b.Intro)
+	}
+	for i, q := range b.Questions {
+		lines = append(lines, fmt.Sprintf("%d. %s", i+1, q.Text))
+		keys = append(keys, q.Key)
+	}
+	r.record(Event{Kind: "ask-all", Text: strings.Join(lines, "\n"), Choices: keys})
+	r.a.mu.Lock()
+	f := r.a.bundle
+	r.a.mu.Unlock()
+	got := map[string]airut.Answer{}
+	if f != nil {
+		for _, ans := range f(b) {
+			if !slices.Contains(keys, ans.Key) || !b.Who(airut.Answerer{User: ans.By, Roles: ans.Roles}) {
+				continue
+			}
+			if _, done := got[ans.Key]; done {
+				continue
+			}
+			got[ans.Key] = airut.Answer{Text: ans.Text, By: ans.By}
+			r.record(Event{Kind: "answered", Text: ans.Key + ": " + ans.Text})
+		}
+		if len(got) == len(keys) {
+			return got, nil
+		}
+	}
+	<-ctx.Done()
+	return got, ctx.Err()
 }
 
 func (r *responder) Ask(ctx context.Context, q airut.Ask) (string, error) {
@@ -586,11 +697,18 @@ func (a *Adapter) Open(_ context.Context, att airut.Attachment) (io.ReadCloser, 
 }
 
 // History pages newest first through the messages added with AddHistory.
-// A cursor is the index the next page ends before.
-func (a *Adapter) History(_ context.Context, ch airut.Channel, cursor string, limit int) (airut.HistoryPage, error) {
+// A cursor is the index the next page ends before. A message marked
+// FromBot is left out unless IncludeBot is given.
+func (a *Adapter) History(_ context.Context, ch airut.Channel, cursor string, limit int, opts ...airut.HistoryOption) (airut.HistoryPage, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	msgs := a.history[ch.ID]
+	withBot := airut.ReadHistoryOptions(opts).IncludeBot
+	var msgs []airut.MessageEvent
+	for _, m := range a.history[ch.ID] {
+		if withBot || !m.FromBot {
+			msgs = append(msgs, m)
+		}
+	}
 	end := len(msgs)
 	if cursor != "" {
 		n, err := strconv.Atoi(cursor)
@@ -611,6 +729,44 @@ func (a *Adapter) History(_ context.Context, ch airut.Channel, cursor string, li
 		page.Next = strconv.Itoa(start)
 	}
 	return page, nil
+}
+
+// Fetch returns the message with ref among those added to the channel
+// with AddHistory, the bot's own included.
+func (a *Adapter) Fetch(_ context.Context, ch airut.Channel, ref airut.MessageRef) (airut.MessageEvent, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, m := range a.history[ch.ID] {
+		if m.Message == ref {
+			m.ReplyChain = nil
+			return m, nil
+		}
+	}
+	return airut.MessageEvent{}, fmt.Errorf("airuttest: no message %s in %s", ref.ID, ch.ID)
+}
+
+// SetDirect makes Conn.Direct report the channel with this id as a
+// direct channel private to u. A zero u makes it report the channel as
+// not direct again, as after a third person joined.
+func (a *Adapter) SetDirect(channel string, u airut.User) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.direct == nil {
+		a.direct = map[string]airut.User{}
+	}
+	if u == (airut.User{}) {
+		delete(a.direct, channel)
+		return
+	}
+	a.direct[channel] = u
+}
+
+// Direct reports what SetDirect set for the channel.
+func (c conn) Direct(_ context.Context, ch airut.Channel) (airut.User, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	u, ok := c.direct[ch.ID]
+	return u, ok, nil
 }
 
 // FailMember makes Conn.Member fail with err for the channel, as a

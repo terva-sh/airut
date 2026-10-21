@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"terva.sh/terva/packages/core"
 	"terva.sh/terva/packages/provider"
@@ -31,27 +33,36 @@ type Options struct {
 	Personas map[string]string
 	// Sessions keeps the conversations turns remember.
 	Sessions *sessions.DB
+	// History bounds what a turn resumes in each field the turn's own
+	// History leaves zero. The zero value bounds nothing.
+	History airut.History
+	// Now is the clock MaxAge is measured by, for tests. Nil means
+	// time.Now.
+	Now func() time.Time
 	// Logger receives ids, counts, and stop reasons, never text. Nil
 	// discards them.
 	Logger *slog.Logger
 }
 
 // Agent runs airut's agent turns on terva's engine. It implements
-// airut.Agent and airut.SessionForgetter.
+// airut.Agent and airut.SessionPrefixForgetter.
 type Agent struct {
 	client   provider.Client
 	catalog  provider.ModelCatalog
 	model    config.ModelRef
 	personas map[string]string
 	db       *sessions.DB
+	history  airut.History
+	now      func() time.Time
 	ownsDB   bool
 	log      *slog.Logger
 	locks    keyLocks
 }
 
 var (
-	_ airut.Agent            = (*Agent)(nil)
-	_ airut.SessionForgetter = (*Agent)(nil)
+	_ airut.Agent                  = (*Agent)(nil)
+	_ airut.SessionPrefixForgetter = (*Agent)(nil)
+	_ airut.SessionLinker          = (*Agent)(nil)
 )
 
 // New returns an Agent. It makes no network request.
@@ -71,13 +82,19 @@ func New(o Options) (*Agent, error) {
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
+	if err := checkHistory(o.History); err != nil {
+		return nil, fmt.Errorf("agent: Options.History: %w", err)
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
 	personas := make(map[string]string, len(o.Personas))
 	for k, v := range o.Personas {
 		personas[k] = v
 	}
 	return &Agent{
 		client: client, catalog: o.Catalog, model: o.Model, personas: personas,
-		db: o.Sessions, log: o.Logger,
+		db: o.Sessions, history: o.History, now: o.Now, log: o.Logger,
 	}, nil
 }
 
@@ -96,6 +113,14 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 	a, err := New(Options{
 		Clients: clients, Catalog: catalog, Model: c.Agent.Model,
 		Personas: personas, Sessions: db, Logger: log,
+		History: airut.History{
+			MaxMessages:  c.Agent.History.MaxMessages,
+			MaxTokens:    c.Agent.History.MaxTokens,
+			MaxAge:       c.Agent.History.MaxAge,
+			RoomMessages: c.Agent.History.RoomMessages,
+			FollowWithin: c.Agent.History.FollowWithin,
+			Compaction:   airut.Compaction(c.Agent.History.Compaction),
+		},
 	})
 	if err != nil {
 		db.Close()
@@ -124,6 +149,59 @@ func (a *Agent) ForgetSession(ctx context.Context, key string) error {
 	return a.db.Forget(ctx, key)
 }
 
+// ForgetSessionsWithPrefix deletes every session whose key starts with
+// prefix. A turn running in one of them finishes first; one that starts
+// while the sessions are deleted may fail to record what it says.
+func (a *Agent) ForgetSessionsWithPrefix(ctx context.Context, prefix string) error {
+	for _, key := range a.locks.held(prefix) {
+		unlock, err := a.locks.lock(ctx, key)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	return a.db.ForgetPrefix(ctx, prefix)
+}
+
+// LinkSession records that the session named key produced the bot's
+// message ref in ch. It records nothing once the session is forgotten.
+func (a *Agent) LinkSession(ctx context.Context, ref airut.MessageRef, ch airut.Channel, key string) error {
+	return a.db.Link(ctx, message(ref, ch), key)
+}
+
+// LinkedSession returns the session that produced the bot's message ref
+// in ch, while the session is kept.
+func (a *Agent) LinkedSession(ctx context.Context, ref airut.MessageRef, ch airut.Channel) (string, bool, error) {
+	return a.db.Linked(ctx, message(ref, ch))
+}
+
+// FollowSession records that person spoke, now, in the session named
+// key.
+func (a *Agent) FollowSession(ctx context.Context, person, key string) error {
+	return a.db.Follow(ctx, person, key)
+}
+
+// FollowedSession returns the session person last spoke in, if that was
+// within within, or within the agent's default FollowWithin when within
+// is zero.
+func (a *Agent) FollowedSession(ctx context.Context, person string, within time.Duration) (string, bool, error) {
+	if within == 0 {
+		within = a.history.FollowWithin
+	}
+	if within == 0 {
+		within = airut.DefaultFollowWithin
+	}
+	key, at, ok, err := a.db.Followed(ctx, person)
+	if err != nil || !ok || a.now().Sub(at) > within {
+		return "", false, err
+	}
+	return key, true, nil
+}
+
+func message(ref airut.MessageRef, ch airut.Channel) sessions.Message {
+	return sessions.Message{Platform: string(ch.Platform), Channel: ch.ID, ID: ref.ID}
+}
+
 // Run runs one agent turn started from c. The core has already checked
 // the Gate and filled in the budget.
 func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
@@ -148,9 +226,11 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		core.WithProvider(a.model.Provider),
 		core.WithComponent(budget),
 	}
-	if system != "" {
-		opts = append(opts, core.WithAssembler(core.StaticSystem(system)))
+	if err := checkHistory(t.History); err != nil {
+		return fmt.Errorf("agent: the turn's History: %w", err)
 	}
+	h := history(t.History, a.history)
+	opts = append(opts, core.WithAssembler(assembler{system: system, quoted: a.quoted(c, h.RoomMessages)}))
 	var resume *core.Transcript
 	if key := c.SessionKey(t.Session); key != "" {
 		// One turn at a time per session, so two never resume the same
@@ -168,8 +248,10 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		if err != nil {
 			return err
 		}
+		tr, due := window(tr, h, a.now())
 		resume = &tr
-		opts = append(opts, core.WithTranscriptStore(s))
+		opts = append(opts, core.WithTranscriptStore(s),
+			core.WithCompactionPolicy(policy{due: due, keep: keepTail(tr.Messages, h)}))
 	}
 	eng, err := core.New(a.client, a.model.Model, opts...)
 	if err != nil {
@@ -344,6 +426,21 @@ type keyLocks struct {
 type keyLock struct {
 	ch   chan struct{}
 	refs int
+}
+
+// held returns, sorted, the keys starting with prefix that a turn holds
+// or waits for.
+func (l *keyLocks) held(prefix string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var keys []string
+	for k := range l.m {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func (l *keyLocks) lock(ctx context.Context, key string) (func(), error) {

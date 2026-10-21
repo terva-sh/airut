@@ -156,6 +156,62 @@ func (d *DB) Forget(ctx context.Context, key string) error {
 	return err
 }
 
+// ForgetPrefix deletes every session whose key starts with prefix,
+// matched byte for byte, with its log, as Forget deletes one.
+func (d *DB) ForgetPrefix(ctx context.Context, prefix string) error {
+	if prefix == "" {
+		return errors.New("sessions: forgetting by prefix needs a prefix")
+	}
+	_, err := d.q.DeleteSessionsWithPrefix(ctx, prefix)
+	return err
+}
+
+// Message names one of the bot's messages: its platform, the channel it
+// is in, and its id.
+type Message struct {
+	Platform, Channel, ID string
+}
+
+// Link records that the session named key produced the message m. It
+// replaces an earlier link for m, and records nothing when there is no
+// such session, as after a forget. The link goes with its session.
+func (d *DB) Link(ctx context.Context, m Message, key string) error {
+	_, err := d.q.LinkMessage(ctx, dbq.LinkMessageParams{Platform: m.Platform, Channel: m.Channel, Message: m.ID, Key: key})
+	return err
+}
+
+// Linked returns the key of the session that produced m, if a link is
+// recorded and the session is still kept.
+func (d *DB) Linked(ctx context.Context, m Message) (key string, ok bool, err error) {
+	key, err = d.q.LinkedSession(ctx, dbq.LinkedSessionParams{Platform: m.Platform, Channel: m.Channel, Message: m.ID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return key, err == nil, err
+}
+
+// Follow records that person spoke, at the store's time, in the session
+// named key, replacing what was recorded for them before. It records
+// nothing when there is no such session. The record goes with its
+// session.
+func (d *DB) Follow(ctx context.Context, person, key string) error {
+	_, err := d.q.FollowSession(ctx, dbq.FollowSessionParams{Person: person, At: d.now().UnixMilli(), Key: key})
+	return err
+}
+
+// Followed returns the session person last spoke in, as Follow recorded
+// it, and when, while the session is kept.
+func (d *DB) Followed(ctx context.Context, person string) (key string, at time.Time, ok bool, err error) {
+	row, err := d.q.FollowedSession(ctx, person)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return row.Key, time.UnixMilli(row.At), true, nil
+}
+
 // Session opens the session named key, creating it if there is none, and
 // counts the open as activity.
 func (d *DB) Session(ctx context.Context, key string) (*Session, error) {

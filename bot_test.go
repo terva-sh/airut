@@ -245,7 +245,9 @@ func TestAgentTurn(t *testing.T) {
 		{Call: "roll", Args: `{"dice":"3d6","times":99}`},
 		{Text: "You got 11."},
 	}}
-	b, _ := newBot(airut.Config{Gate: openGate, Agent: agent, EditInterval: time.Nanosecond})
+	// With the keepalive off, typing shows at each tool call, as before
+	// there was one.
+	b, _ := newBot(airut.Config{Gate: openGate, Agent: agent, EditInterval: time.Nanosecond, TypingEvery: -1})
 	b.Command("secret", "Not for the agent", func(c *airut.Ctx) error {
 		t.Error("the agent reached a command its turn did not name")
 		return nil
@@ -328,7 +330,7 @@ func TestSessionKeys(t *testing.T) {
 	b := airut.New(airut.Config{})
 	var keys []string
 	b.Command("keys", "Keys", func(c *airut.Ctx) error {
-		for _, s := range []airut.SessionScope{airut.NoSession, airut.PerChannel, airut.PerThread, airut.PerUser} {
+		for _, s := range []airut.SessionScope{airut.NoSession, airut.PerChannel, airut.PerThread, airut.PerUser, airut.PerUserChannel} {
 			keys = append(keys, c.SessionKey(s))
 		}
 		return nil
@@ -351,10 +353,15 @@ func TestSessionKeys(t *testing.T) {
 	a := airuttest.Start(t, b)
 	a.Text("!keys")
 	a.Text("!keys", airuttest.InThread("t9"))
+	// In a direct channel every scope but NoSession is the one
+	// conversation there, so nothing said in it resumes elsewhere.
+	a.Text("!keys", airuttest.InDirect(), airuttest.In(airut.Channel{Platform: airuttest.Platform, ID: "dm-1"}))
 	a.Text("!open")
+	dm := "test/user/user-1/channel/dm-1"
 	want := []string{
-		"", "test/channel/channel-1", "test/channel/channel-1", "test/user/user-1",
-		"", "test/channel/channel-1", "test/thread/channel-1/t9", "test/user/user-1",
+		"", "test/channel/channel-1", "test/channel/channel-1", "test/user/user-1", "test/user/user-1/channel/channel-1",
+		"", "test/channel/channel-1", "test/thread/channel-1/t9", "test/user/user-1", "test/user/user-1/channel/channel-1",
+		"", dm, dm, dm, dm,
 		"test/thread/channel-1/t9",
 	}
 	if !reflect.DeepEqual(keys, want) {
@@ -629,7 +636,7 @@ func TestForgetCommand(t *testing.T) {
 	}
 
 	evs := a.Text("!forget", airuttest.InThread("t1"))
-	wantEvents(t, evs, "reply:The agent has forgotten your conversation with it.")
+	wantEvents(t, evs, "reply:The agent has forgotten your conversations with it.")
 	if len(evs) == 1 && !evs[0].Private {
 		t.Error("the answer to forget was not private")
 	}
@@ -641,6 +648,68 @@ func TestForgetCommand(t *testing.T) {
 	ag.err = errors.New("disk on fire")
 	if evs := a.Text("!forget"); len(evs) != 1 || strings.Contains(evs[0].Text, "disk on fire") {
 		t.Fatalf("a failed forget answered %q; its error text must not reach the chat", texts(evs))
+	}
+}
+
+// prefixForgetter can also forget every session under a prefix.
+type prefixForgetter struct {
+	forgetter
+	prefixes []string
+}
+
+func (f *prefixForgetter) ForgetSessionsWithPrefix(_ context.Context, prefix string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prefixes = append(f.prefixes, prefix)
+	return f.err
+}
+
+func TestForgetCommandForms(t *testing.T) {
+	ag := &prefixForgetter{}
+	var admit bool
+	b, _ := newBot(airut.Config{Gate: openGate, Agent: ag, ForgetShared: func(*airut.Ctx) bool { return admit }})
+	a := airuttest.Start(t, b)
+
+	// Plain forget clears the caller's conversations in every channel
+	// too, and only theirs: the slash keeps user-10 out of user-1's.
+	a.Text("!forget")
+	if got := ag.forgotten(); !reflect.DeepEqual(got, []string{"test/user/user-1"}) || !reflect.DeepEqual(ag.prefixes, []string{"test/user/user-1/"}) {
+		t.Fatalf("forgot %q and prefixes %q", got, ag.prefixes)
+	}
+
+	// A shared conversation needs ForgetShared's say-so.
+	ag.keys = nil
+	for _, line := range []string{"!forget channel", "!forget thread"} {
+		evs := a.Text(line, airuttest.InThread("t1"))
+		if len(evs) != 1 || !strings.Contains(evs[0].Text, "may not") {
+			t.Fatalf("%s by someone not admitted answered %q", line, texts(evs))
+		}
+	}
+	if len(ag.forgotten()) != 0 {
+		t.Fatalf("forgot %q without ForgetShared's say-so", ag.forgotten())
+	}
+	admit = true
+	wantEvents(t, a.Text("!forget channel", airuttest.InThread("t1")), "reply:The agent has forgotten this channel's conversation.")
+	wantEvents(t, a.Text("!forget thread", airuttest.InThread("t1")), "reply:The agent has forgotten this thread's conversation.")
+	if got := ag.forgotten(); !reflect.DeepEqual(got, []string{"test/channel/channel-1", "test/thread/channel-1/t1"}) {
+		t.Fatalf("forgot %q", got)
+	}
+	if evs := a.Text("!forget thread"); len(evs) != 1 || !strings.Contains(evs[0].Text, "not a thread") {
+		t.Fatalf("forget thread outside a thread answered %q", texts(evs))
+	}
+
+	// From a direct channel too, plain forget clears the conversation
+	// the caller has everywhere, not only the direct channel's.
+	ag.keys, ag.prefixes = nil, nil
+	a.Text("!forget", airuttest.InDirect(), airuttest.In(airut.Channel{Platform: airuttest.Platform, ID: "dm-1"}))
+	if got := ag.forgotten(); !reflect.DeepEqual(got, []string{"test/user/user-1"}) || !reflect.DeepEqual(ag.prefixes, []string{"test/user/user-1/"}) {
+		t.Fatalf("forget in a direct channel forgot %q and prefixes %q", got, ag.prefixes)
+	}
+
+	// Without ForgetShared nobody may.
+	b, _ = newBot(airut.Config{Gate: openGate, Agent: &forgetter{}})
+	if evs := airuttest.Start(t, b).Text("!forget channel"); len(evs) != 1 || !strings.Contains(evs[0].Text, "may not") {
+		t.Fatalf("forget channel with no ForgetShared answered %q", texts(evs))
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"terva.sh/terva/packages/provider"
 
+	"terva.sh/airut"
 	"terva.sh/airut/config"
 )
 
@@ -99,4 +100,44 @@ token = { env = "AIRUT_TEST_KEY" }
 
 func providerRequest(model string) provider.Request {
 	return provider.Request{Model: model, MaxTokens: 16, Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Content{provider.TextBlock{Text: "hi"}}}}}
+}
+
+// TestOpenTakesTheHistoryDefaults checks that agent.Open hands every
+// [agent.history] key to the agent.
+func TestOpenTakesTheHistoryDefaults(t *testing.T) {
+	t.Setenv("AIRUT_TEST_KEY", "token")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "airut.toml")
+	src := `
+[providers.local]
+base_url = "http://127.0.0.1:1/v1"
+models = [{ id = "m" }]
+
+[agent]
+model = "local/m"
+budget = { max_turns = 4, max_tokens = 1000 }
+history = { max_messages = 5, max_tokens = 600, max_age = "2h", compaction = "drop", room_messages = 7, follow_within = "3m" }
+
+[store]
+path = "sessions.db"
+
+[discord]
+token = { env = "AIRUT_TEST_KEY" }
+`
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Open(context.Background(), cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	want := airut.History{MaxMessages: 5, MaxTokens: 600, MaxAge: 2 * time.Hour, Compaction: airut.CompactDrop, RoomMessages: 7, FollowWithin: 3 * time.Minute}
+	if a.history != want {
+		t.Errorf("the agent's history = %+v, want %+v", a.history, want)
+	}
 }

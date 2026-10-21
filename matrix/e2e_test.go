@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +95,7 @@ func openHuman(t *testing.T, ctx context.Context, hs, localpart string) *human {
 	}
 	c.Handlers().OnEventType(event.EventMessage, record)
 	c.Handlers().OnEventType(event.EventReaction, record)
+	c.Handlers().OnEventType(event.EphemeralEventTyping, record)
 	c.Handlers().OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
 		if evt.GetStateKey() == string(c.UserID) && evt.Content.AsMember().Membership == event.MembershipInvite {
 			c.JoinRoomByID(ctx, evt.RoomID)
@@ -139,6 +141,18 @@ func (h *human) send(t *testing.T, ctx context.Context, room id.RoomID, text str
 	return resp.EventID
 }
 
+// reply sends text as a reply to the message to.
+func (h *human) reply(t *testing.T, ctx context.Context, room id.RoomID, to id.EventID, text string) id.EventID {
+	t.Helper()
+	c := &event.MessageEventContent{MsgType: event.MsgText, Body: text,
+		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: to}}}
+	resp, err := h.SendMessageEvent(ctx, room, event.EventMessage, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.EventID
+}
+
 func body(evt *event.Event) string { return evt.Content.AsMessage().Body }
 
 func bodyIs(text string) func(*event.Event) bool {
@@ -153,6 +167,8 @@ type seen struct {
 	conn      airut.Conn
 	// threads are the ids of the threads the thread command opened.
 	threads []string
+	// chains are the reply chains the chain command saw.
+	chains [][]airut.Quoted
 	// stop stops the bot and waits for it, as a restart would.
 	stop func()
 }
@@ -193,8 +209,20 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		defer logMu.Unlock()
 		return logs.Write(p)
 	}), &slog.HandlerOptions{Level: slog.LevelDebug}))
-	b := airut.New(airut.Config{Logger: log, AskTimeout: 30 * time.Second})
+	// Only the bot's counterpart Alice, named by the same tag, may start
+	// the slow agent turn the work command runs.
+	alice := "@" + strings.Replace(localpart, "bot-", "alice-", 1) + ":localhost"
+	b := airut.New(airut.Config{
+		Logger: log, AskTimeout: 30 * time.Second,
+		Agent: slowAgent{},
+		Gate:  airut.Gate{Access: map[airut.Platform]airut.Access{airut.Matrix: {Users: []string{alice}}}},
+		// Typing at once, renewed well inside its 30 seconds.
+		TypingDelay: -1, TypingEvery: 2 * time.Second,
+	})
 	s := &seen{}
+	b.Command("work", "Run a slow agent turn", func(c *airut.Ctx) error {
+		return c.Agent(airut.Turn{Prompt: "work"}).StreamTo(c)
+	})
 	b.Command("ping", "Answer pong", func(c *airut.Ctx) error {
 		_, err := c.Reply("pong")
 		return err
@@ -205,6 +233,21 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 			return err
 		}
 		_, err = c.Reply("chose " + got)
+		return err
+	})
+	b.Command("bundle", "Ask three things at once", func(c *airut.Ctx) error {
+		got, err := c.AskAll(airut.Bundle{
+			Intro: "Before I retag these:",
+			Questions: []airut.Question{
+				{Key: "post", Text: "Which post?", Choices: []string{"the troll", "the Tolkien one"}},
+				{Key: "rating", Text: "Keep the rating?", Choices: []string{"yes", "no"}},
+				{Key: "why", Text: "Why?"},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		_, err = c.Reply("got " + got["post"].Text + " | " + got["rating"].Text + " | " + got["why"].Text + " from " + got["why"].By.ID)
 		return err
 	})
 	b.Command("whisper", "Reply privately", func(c *airut.Ctx) error {
@@ -220,6 +263,19 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 			return err
 		}
 		return c.React(ref, "👍")
+	})
+	b.Command("post", "Reply, then edit the reply, as a streamed answer is", func(c *airut.Ctx) error {
+		ref, err := c.Reply("draft")
+		if err != nil {
+			return err
+		}
+		return c.Edit(ref, "final post")
+	})
+	b.Command("chain", "Record the reply chain", func(c *airut.Ctx) error {
+		s.mu.Lock()
+		s.chains = append(s.chains, c.ReplyChain())
+		s.mu.Unlock()
+		return nil
 	})
 	b.Command("thread", "Reply in a thread", func(c *airut.Ctx) error {
 		tc, err := c.Thread("a thread")
@@ -268,7 +324,7 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		s.mu.Unlock()
 	})
 	if o.AcceptInvite == nil {
-		o.AcceptInvite = func(string, string) bool { return true }
+		o.AcceptInvite = func(matrix.Invite) bool { return true }
 	}
 	a := matrix.New(&config.Matrix{
 		Homeserver: hs,
@@ -293,7 +349,7 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		s.stop()
 		logMu.Lock()
 		defer logMu.Unlock()
-		for _, leak := range []string{"pw-" + localpart, "just for you", "final words", "hello there", "Proceed?"} {
+		for _, leak := range []string{"pw-" + localpart, "just for you", "final words", "hello there", "Proceed?", "final post", "which post?"} {
 			if strings.Contains(logs.String(), leak) {
 				t.Errorf("the bot's log holds %q:\n%s", leak, logs.String())
 			}
@@ -303,6 +359,19 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		}
 	})
 	return s
+}
+
+// slowAgent works for three seconds and then answers.
+type slowAgent struct{}
+
+func (slowAgent) Run(c *airut.Ctx, _ airut.Turn, out airut.TurnOutput) error {
+	select {
+	case <-time.After(3 * time.Second):
+	case <-c.Context().Done():
+		return c.Context().Err()
+	}
+	out.Text("worked")
+	return nil
 }
 
 type writerFunc func([]byte) (int, error)
@@ -613,6 +682,342 @@ func TestE2EConnReactions(t *testing.T) {
 	}
 }
 
+// TestE2EReplyChain checks that a message that replies to others
+// arrives with what it replies to, read as it reads now: the bot's own
+// streamed answer by its last edit, and decrypted in an encrypted room.
+// Fetch and History read the bot's messages the same way.
+func TestE2EReplyChain(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "encrypted"}[encrypted], func(t *testing.T) {
+			hs := homeserver(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			tg := tag()
+			botName, aliceName := "bot-"+tg, "alice-"+tg
+			register(t, ctx, hs, botName)
+			register(t, ctx, hs, aliceName)
+			botID := id.UserID("@" + botName + ":localhost")
+			s := startBot(t, ctx, hs, botName, matrix.Options{})
+			alice := openHuman(t, ctx, hs, aliceName)
+			room := createRoom(t, ctx, alice, botID, encrypted)
+			ch := airut.Channel{Platform: airut.Matrix, ID: string(room)}
+
+			// The bot answers, in a reply, then edits its answer.
+			command := alice.send(t, ctx, room, "!post")
+			post := alice.waitFor(t, ctx, "the draft", bodyIs("draft")).ID
+			alice.waitFor(t, ctx, "the edit", func(evt *event.Event) bool {
+				c := evt.Content.AsMessage()
+				return evt.Type == event.EventMessage && c.NewContent != nil && c.NewContent.Body == "final post"
+			})
+			isPost := func(q airut.Quoted) bool {
+				return q.Ref.ID == string(post) && q.Text == "final post" && q.FromBot && q.Sender.ID == string(botID)
+			}
+			isCommand := func(q airut.Quoted) bool {
+				return q.Ref.ID == string(command) && q.Text == "!post" && !q.FromBot && q.Sender.ID == string(alice.UserID)
+			}
+
+			// Chat that mentions the bot, replying to its answer.
+			question := alice.reply(t, ctx, room, post, botName+": which post?")
+			s.wait(t, ctx, "the mention", func(s *seen) bool {
+				return len(s.messages) > 0 && s.messages[len(s.messages)-1].Message.ID == string(question)
+			})
+			s.mu.Lock()
+			if got := s.messages[len(s.messages)-1].ReplyChain; len(got) != 2 || !isPost(got[0]) || !isCommand(got[1]) {
+				t.Errorf("the mention's chain = %+v, want the bot's edited answer and the command it answered", got)
+			}
+			s.mu.Unlock()
+
+			// A command replying to that sees all three, nearest first,
+			// which is the default depth.
+			alice.reply(t, ctx, room, question, "!chain")
+			s.wait(t, ctx, "the chain command", func(s *seen) bool { return len(s.chains) == 1 })
+			s.mu.Lock()
+			got := s.chains[0]
+			s.mu.Unlock()
+			if len(got) != 3 || got[0].Ref.ID != string(question) || got[0].Text != botName+": which post?" ||
+				got[0].FromBot || got[0].Sender.ID != string(alice.UserID) || !isPost(got[1]) || !isCommand(got[2]) {
+				t.Errorf("the command's chain = %+v", got)
+			}
+
+			// Fetch and History read the bot's answer as it reads now.
+			s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
+			if m, err := s.conn.Fetch(ctx, ch, airut.MessageRef{ID: string(post)}); err != nil || m.Text != "final post" || !m.FromBot {
+				t.Errorf("Fetch = %+v, %v", m, err)
+			}
+			if m, err := s.conn.Fetch(ctx, ch, airut.MessageRef{ID: string(question)}); err != nil || m.FromBot || m.Sender.ID != string(alice.UserID) {
+				t.Errorf("Fetch of hers = %+v, %v", m, err)
+			}
+			find := func(opts ...airut.HistoryOption) (airut.MessageEvent, bool) {
+				page, err := s.conn.History(ctx, ch, "", 50, opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range page.Messages {
+					if m.Message.ID == string(post) {
+						return m, true
+					}
+				}
+				return airut.MessageEvent{}, false
+			}
+			if _, ok := find(); ok {
+				t.Error("History returned the bot's own message without IncludeBot")
+			}
+			if m, ok := find(airut.IncludeBot); !ok || m.Text != "final post" || !m.FromBot {
+				t.Errorf("History with IncludeBot = %+v, %v; want the edited answer", m, ok)
+			}
+
+			// Edits by anyone else do not count, however many come after
+			// the bot's own: here two of hers, read one a page.
+			for range 2 {
+				if _, err := alice.SendMessageEvent(ctx, room, event.EventMessage, &event.MessageEventContent{
+					MsgType: event.MsgText, Body: "* not the bot's words",
+					NewContent: &event.MessageEventContent{MsgType: event.MsgText, Body: "not the bot's words"},
+					RelatesTo:  &event.RelatesTo{Type: event.RelReplace, EventID: post},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer matrix.SetEditPage(1)()
+			if m, err := s.conn.Fetch(ctx, ch, airut.MessageRef{ID: string(post)}); err != nil || m.Text != "final post" {
+				t.Errorf("Fetch past a page of her edits = %+v, %v; want the bot's own edit", m, err)
+			}
+		})
+	}
+}
+
+// TestE2EDirectRoom opens a direct chat with the bot as a client does,
+// and checks that the bot takes every message there as addressed to it,
+// and stops the moment a third person is invited.
+func TestE2EDirectRoom(t *testing.T) {
+	hs := homeserver(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	tg := tag()
+	botName, aliceName, carolName := "bot-"+tg, "alice-"+tg, "carol-"+tg
+	for _, n := range []string{botName, aliceName, carolName} {
+		register(t, ctx, hs, n)
+	}
+	botID := id.UserID("@" + botName + ":localhost")
+	// The bot reads its m.direct afresh for every check, so a change from
+	// another client shows at once. Registered before the bot starts, the
+	// restore runs after it stops.
+	t.Cleanup(matrix.SetDirectReload(0))
+	var invites sync.Map
+	s := startBot(t, ctx, hs, botName, matrix.Options{AcceptInvite: func(inv matrix.Invite) bool {
+		invites.Store(inv.Room, inv.Direct)
+		return true
+	}})
+	alice := openHuman(t, ctx, hs, aliceName)
+	s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
+
+	// A direct chat, as a client opens one.
+	resp, err := alice.CreateRoom(ctx, &mautrix.ReqCreateRoom{
+		Preset: "trusted_private_chat", IsDirect: true, Invite: []id.UserID{botID},
+		InitialState: []*event.Event{{
+			Type:    event.StateEncryption,
+			Content: event.Content{Parsed: &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dm := resp.RoomID
+	for {
+		m, err := alice.StateStore.GetMember(ctx, dm, botID)
+		if err == nil && m != nil && m.Membership == event.MembershipJoin {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("the bot never joined the direct chat")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if direct, _ := invites.Load(string(dm)); direct != true {
+		t.Errorf("the invite to a direct chat arrived with Direct %v", direct)
+	}
+	// A plain private room with the same two people is not direct.
+	group := createRoom(t, ctx, alice, botID, true)
+
+	last := func(text string) func(*seen) bool {
+		return func(s *seen) bool { return len(s.messages) > 0 && s.messages[len(s.messages)-1].Text == text }
+	}
+	ping := alice.send(t, ctx, dm, "ping")
+	alice.waitFor(t, ctx, "a pong for a bare command", func(evt *event.Event) bool { return bodyIs("pong")(evt) && replyTo(evt) == ping })
+	alice.send(t, ctx, dm, "hello there")
+	s.wait(t, ctx, "the chat in the direct chat", last("hello there"))
+	s.mu.Lock()
+	if m := s.messages[len(s.messages)-1]; !m.Direct || !m.Mentioned || m.Request != "hello there" {
+		t.Errorf("chat in a direct chat arrived with Direct %v, Mentioned %v, Request %q", m.Direct, m.Mentioned, m.Request)
+	}
+	s.mu.Unlock()
+	alice.send(t, ctx, group, "in the group")
+	s.wait(t, ctx, "the chat in the plain room", last("in the group"))
+	s.mu.Lock()
+	if m := s.messages[len(s.messages)-1]; m.Direct || m.Mentioned {
+		t.Errorf("chat in a plain private room arrived with Direct %v, Mentioned %v", m.Direct, m.Mentioned)
+	}
+	s.mu.Unlock()
+	conn := s.conn
+	if who, ok, err := conn.Direct(ctx, airut.Channel{Platform: airut.Matrix, ID: string(dm)}); err != nil || !ok || who.ID != string(alice.UserID) {
+		t.Errorf("Conn.Direct(the direct chat) = %v, %v, %v", who, ok, err)
+	}
+	if _, ok, err := conn.Direct(ctx, airut.Channel{Platform: airut.Matrix, ID: string(group)}); err != nil || ok {
+		t.Errorf("Conn.Direct(the plain room) = %v, %v", ok, err)
+	}
+
+	// A room another client takes out of m.direct is no longer direct,
+	// and is again once it is put back.
+	setDirect(t, ctx, hs, botName, event.DirectChatsEventContent{})
+	alice.send(t, ctx, dm, "after unlisting")
+	s.wait(t, ctx, "the chat after unlisting", last("after unlisting"))
+	s.mu.Lock()
+	if m := s.messages[len(s.messages)-1]; m.Direct || m.Mentioned {
+		t.Errorf("chat in a room taken out of m.direct arrived with Direct %v, Mentioned %v", m.Direct, m.Mentioned)
+	}
+	s.mu.Unlock()
+	setDirect(t, ctx, hs, botName, event.DirectChatsEventContent{alice.UserID: {dm}})
+	alice.send(t, ctx, dm, "after relisting")
+	s.wait(t, ctx, "the chat after relisting", last("after relisting"))
+	s.mu.Lock()
+	if m := s.messages[len(s.messages)-1]; !m.Direct {
+		t.Error("chat in a room put back in m.direct arrived without Direct")
+	}
+	s.mu.Unlock()
+
+	// Once a third person is invited, the room is no longer direct.
+	if _, err := alice.InviteUser(ctx, dm, &mautrix.ReqInviteUser{UserID: id.UserID("@" + carolName + ":localhost")}); err != nil {
+		t.Fatal(err)
+	}
+	alice.send(t, ctx, dm, "after the invite")
+	s.wait(t, ctx, "the chat after the invite", last("after the invite"))
+	s.mu.Lock()
+	if m := s.messages[len(s.messages)-1]; m.Direct || m.Mentioned {
+		t.Errorf("chat after a third person was invited arrived with Direct %v, Mentioned %v", m.Direct, m.Mentioned)
+	}
+	s.mu.Unlock()
+	if _, ok, err := conn.Direct(ctx, airut.Channel{Platform: airut.Matrix, ID: string(dm)}); err != nil || ok {
+		t.Errorf("Conn.Direct after a third person was invited = %v, %v", ok, err)
+	}
+}
+
+// edited matches the bot's edit of ev to text holding want.
+func edited(ev id.EventID, want string) func(*event.Event) bool {
+	return func(evt *event.Event) bool {
+		c := evt.Content.AsMessage()
+		return evt.Type == event.EventMessage && c.RelatesTo.GetReplaceID() == ev && c.NewContent != nil && strings.Contains(c.NewContent.Body, want)
+	}
+}
+
+func TestE2EBundle(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "encrypted"}[encrypted], func(t *testing.T) {
+			hs := homeserver(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			tg := tag()
+			botName, aliceName, carolName := "bot-"+tg, "alice-"+tg, "carol-"+tg
+			for _, n := range []string{botName, aliceName, carolName} {
+				register(t, ctx, hs, n)
+			}
+			botID := id.UserID("@" + botName + ":localhost")
+			s := startBot(t, ctx, hs, botName, matrix.Options{})
+			alice := openHuman(t, ctx, hs, aliceName)
+			carol := openHuman(t, ctx, hs, carolName)
+			room := createRoom(t, ctx, alice, botID, encrypted)
+			if _, err := alice.InviteUser(ctx, room, &mautrix.ReqInviteUser{UserID: id.UserID("@" + carolName + ":localhost")}); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				if m, err := alice.StateStore.GetMember(ctx, room, carol.UserID); err == nil && m != nil && m.Membership == event.MembershipJoin {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("carol never joined")
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+
+			alice.send(t, ctx, room, "!bundle")
+			asked := alice.waitFor(t, ctx, "the bundle", func(evt *event.Event) bool {
+				return evt.Type == event.EventMessage && strings.Contains(body(evt), "Reply to this message")
+			})
+			if b := body(asked); !strings.Contains(b, "1. Which post? (the troll / the Tolkien one)") || strings.Contains(b, "all yes") {
+				t.Errorf("the bundle reads:\n%s", b)
+			}
+
+			// Carol may not answer, so her reply is ordinary chat.
+			carol.reply(t, ctx, room, asked.ID, "1 the troll")
+			s.wait(t, ctx, "carol's reply as chat", func(s *seen) bool {
+				return len(s.messages) > 0 && s.messages[len(s.messages)-1].Text == "1 the troll"
+			})
+			// Alice answers two, then the third; each lands on the bundle.
+			alice.reply(t, ctx, room, asked.ID, "1 the Tolkien one, 2 yes")
+			alice.waitFor(t, ctx, "the first answers shown", edited(asked.ID, "1. Which post? Answer: the Tolkien one"))
+			alice.reply(t, ctx, room, asked.ID, "3 because, of the elves")
+			alice.waitFor(t, ctx, "the answers", bodyIs("got the Tolkien one | yes | because, of the elves from "+string(alice.UserID)))
+			s.mu.Lock()
+			for _, m := range s.messages {
+				if strings.Contains(m.Text, "Tolkien") || strings.Contains(m.Text, "elves") {
+					t.Errorf("an answer reached the bot's handlers as chat: %q", m.Text)
+				}
+			}
+			s.mu.Unlock()
+		})
+	}
+}
+
+// typing matches a typing event that does or does not list user.
+func typing(user id.UserID, listed bool) func(*event.Event) bool {
+	return func(evt *event.Event) bool {
+		return evt.Type == event.EphemeralEventTyping && slices.Contains(evt.Content.AsTyping().UserIDs, user) == listed
+	}
+}
+
+// after returns, of the events the human has received, those after
+// the first that match accepts.
+func (h *human) after(match func(*event.Event) bool) []*event.Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, evt := range h.got {
+		if match(evt) {
+			return slices.Clone(h.got[i+1:])
+		}
+	}
+	return nil
+}
+
+func TestE2ETypingKeepalive(t *testing.T) {
+	hs := homeserver(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tg := tag()
+	botName, aliceName := "bot-"+tg, "alice-"+tg
+	register(t, ctx, hs, botName)
+	register(t, ctx, hs, aliceName)
+	botID := id.UserID("@" + botName + ":localhost")
+	startBot(t, ctx, hs, botName, matrix.Options{})
+	alice := openHuman(t, ctx, hs, aliceName)
+	room := createRoom(t, ctx, alice, botID, false)
+
+	alice.send(t, ctx, room, "!work")
+	alice.waitFor(t, ctx, "the bot typing", typing(botID, true))
+	answer := alice.waitFor(t, ctx, "the answer", bodyIs("worked"))
+	// The notice comes down when the turn ends, not when its 30 seconds
+	// run out.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if slices.ContainsFunc(alice.after(func(e *event.Event) bool { return e == answer }), typing(botID, false)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the typing notice stayed up after the answer")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func TestE2EAskThreadAndPrivate(t *testing.T) {
 	hs := homeserver(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -739,9 +1144,9 @@ func TestE2EStaleCommandsAndInvites(t *testing.T) {
 	var invites sync.Map
 	s := startBot(t, ctx, hs, botName, matrix.Options{
 		MaxCommandAge: time.Nanosecond,
-		AcceptInvite: func(room, inviter string) bool {
-			_, refused := invites.Load(room)
-			return !refused && inviter == string(alice.UserID)
+		AcceptInvite: func(inv matrix.Invite) bool {
+			_, refused := invites.Load(inv.Room)
+			return !refused && inv.Inviter == string(alice.UserID)
 		},
 	})
 	room := createRoom(t, ctx, alice, botID, false)

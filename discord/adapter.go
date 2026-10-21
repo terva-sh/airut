@@ -58,6 +58,10 @@ type Options struct {
 	// connection. Without it, a MessageEvent's Text is empty except in
 	// direct messages and in messages that mention the bot.
 	MessageContent bool
+	// ReplyDepth is how far up a reply chain the adapter resolves for a
+	// message that addresses the bot. Zero means
+	// airut.DefaultReplyDepth, and a negative value resolves none.
+	ReplyDepth int
 	// Logger receives the adapter's logs. Nil means the Host's.
 	Logger *slog.Logger
 }
@@ -115,6 +119,9 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	s := newSession(ctx, dg, h, log, a.cfg.Guilds, func(err error) { cancel(err) })
+	if a.opts.ReplyDepth != 0 {
+		s.replyDepth = max(a.opts.ReplyDepth, 0)
+	}
 	s.register()
 	if err := dg.Open(); err != nil {
 		return fmt.Errorf("discord: connecting to the gateway: %w", errKindOnly(err))
@@ -138,8 +145,11 @@ type session struct {
 	fail   func(error)
 	// now is the clock, which tests replace.
 	now func() time.Time
+	// replyDepth is how far up a reply chain the adapter resolves.
+	replyDepth int
 
-	asks asks
+	asks    asks
+	bundles bundles
 
 	mu sync.Mutex
 	// me is the bot's own user id.
@@ -149,7 +159,7 @@ type session struct {
 }
 
 func newSession(ctx context.Context, dg *discordgo.Session, h airut.Host, log *slog.Logger, guilds []string, fail func(error)) *session {
-	return &session{ctx: ctx, dg: dg, h: h, log: log, guilds: guilds, fail: fail, now: time.Now}
+	return &session{ctx: ctx, dg: dg, h: h, log: log, guilds: guilds, fail: fail, now: time.Now, replyDepth: airut.DefaultReplyDepth}
 }
 
 func (s *session) register() {
@@ -223,8 +233,20 @@ func (s *session) onInteraction(_ *discordgo.Session, ic *discordgo.InteractionC
 	if ic.Interaction == nil {
 		return
 	}
-	if ic.Type == discordgo.InteractionMessageComponent {
-		s.spawn(func() { s.onComponent(ic) })
+	switch ic.Type {
+	case discordgo.InteractionMessageComponent:
+		s.spawn(func() {
+			data := ic.MessageComponentData()
+			if !s.onBundle(ic, data.CustomID, func() []string { return data.Values }, nil) {
+				s.onComponent(ic)
+			}
+		})
+		return
+	case discordgo.InteractionModalSubmit:
+		s.spawn(func() {
+			data := ic.ModalSubmitData()
+			s.onBundle(ic, data.CustomID, nil, func() map[string]string { return typedValues(data.Components) })
+		})
 		return
 	}
 	if ic.Type != discordgo.InteractionApplicationCommand {
@@ -256,6 +278,7 @@ func (s *session) invocation(ic *discordgo.InteractionCreate, r airut.Responder)
 	if ch, err := s.dg.State.Channel(ic.ChannelID); err == nil && ch.IsThread() {
 		inv.Thread = ch.ID
 	}
+	inv.Direct = s.direct(ic.ChannelID, ic.GuildID)
 	switch {
 	case ic.Member != nil && ic.Member.User != nil:
 		inv.Caller = user(ic.Member.User, ic.Member)

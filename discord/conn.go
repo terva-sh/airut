@@ -85,7 +85,8 @@ func (s *session) Open(ctx context.Context, a airut.Attachment) (io.ReadCloser, 
 // bot's own messages, and messages other than plain ones and replies,
 // such as a member joining, are left out, so a page can hold fewer than
 // limit messages and still have a Next. The cursor is a message id.
-func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, limit int) (airut.HistoryPage, error) {
+func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, limit int, opts ...airut.HistoryOption) (airut.HistoryPage, error) {
+	withBot := airut.ReadHistoryOptions(opts).IncludeBot
 	if limit <= 0 {
 		limit = defaultPage
 	}
@@ -102,11 +103,49 @@ func (s *session) History(ctx context.Context, ch airut.Channel, cursor string, 
 		if m.GuildID == "" {
 			m.GuildID = s.guildOf(ch.ID)
 		}
-		if s.delivers(m) {
+		if s.delivers(m) || withBot && s.ownMessage(m) {
 			page.Messages = append(page.Messages, s.messageEvent(m))
 		}
 	}
 	return page, nil
+}
+
+// ownMessage reports whether m is a plain message or a reply the bot
+// sent.
+func (s *session) ownMessage(m *discordgo.Message) bool {
+	return m.Author != nil && m.Author.ID == s.self() &&
+		(m.Type == discordgo.MessageTypeDefault || m.Type == discordgo.MessageTypeReply)
+}
+
+// Fetch reads one message from ch. Discord applies an edit in place,
+// so the message reads as it does now.
+func (s *session) Fetch(ctx context.Context, ch airut.Channel, ref airut.MessageRef) (airut.MessageEvent, error) {
+	m, err := s.dg.ChannelMessage(ch.ID, ref.ID, discordgo.WithContext(ctx))
+	if err != nil {
+		return airut.MessageEvent{}, err
+	}
+	if m.Author == nil {
+		return airut.MessageEvent{}, errors.New("discord: the message has no author")
+	}
+	if m.GuildID == "" {
+		m.GuildID = s.guildOf(ch.ID)
+	}
+	return s.messageEvent(m), nil
+}
+
+// Direct reports whether ch is a one-to-one direct message, and with
+// whom. A guild channel and a group DM are not.
+func (s *session) Direct(ctx context.Context, ch airut.Channel) (airut.User, bool, error) {
+	c, err := s.dg.State.Channel(ch.ID)
+	if err != nil {
+		if c, err = s.dg.Channel(ch.ID, discordgo.WithContext(ctx)); err != nil {
+			return airut.User{}, false, err
+		}
+	}
+	if c.GuildID != "" || c.Type != discordgo.ChannelTypeDM || len(c.Recipients) != 1 || c.Recipients[0] == nil {
+		return airut.User{}, false, nil
+	}
+	return user(c.Recipients[0], nil), true, nil
 }
 
 // Member reports whether u is in ch: in its guild, for a guild channel,

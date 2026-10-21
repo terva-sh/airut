@@ -141,13 +141,20 @@ type Invocation struct {
 	Channel Channel
 	// Thread identifies the thread the invocation arrived in, if any.
 	Thread string
+	// Direct reports that the invocation arrived in a direct channel: a
+	// conversation private to the bot and the caller, as Conn.Direct
+	// checks one.
+	Direct bool
 	// Message is the message that triggered the invocation, if there was
 	// one.
 	Message MessageRef
 	// ReplyTo is the message the triggering message replies to, if it
 	// replies to one.
 	ReplyTo MessageRef
-	Respond Responder
+	// ReplyChain is what the triggering message replies to, nearest
+	// first, as far as the adapter resolves it.
+	ReplyChain []Quoted
+	Respond    Responder
 	// Native is the platform's own event, for the escape hatch.
 	Native any
 }

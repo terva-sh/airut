@@ -20,3 +20,28 @@ DELETE FROM sessions WHERE key = ?;
 
 -- name: DeleteIdleSessions :execrows
 DELETE FROM sessions WHERE last_active < ?;
+
+-- substr rather than LIKE, whose _ and % would match more than the
+-- prefix says.
+-- name: DeleteSessionsWithPrefix :execrows
+DELETE FROM sessions WHERE substr(key, 1, length(CAST(sqlc.arg(prefix) AS TEXT))) = sqlc.arg(prefix);
+
+-- A message is linked only to a session that exists, so a link written
+-- after its session was forgotten is never made.
+-- name: LinkMessage :execrows
+INSERT INTO links (platform, channel, message, session_id)
+SELECT ?, ?, ?, id FROM sessions WHERE key = ?
+ON CONFLICT (platform, channel, message) DO UPDATE SET session_id = excluded.session_id;
+
+-- name: LinkedSession :one
+SELECT s.key FROM links l JOIN sessions s ON s.id = l.session_id
+WHERE l.platform = ? AND l.channel = ? AND l.message = ?;
+
+-- A person follows only a session that exists, as a link does.
+-- name: FollowSession :execrows
+INSERT INTO follows (person, session_id, at)
+SELECT ?, id, ? FROM sessions WHERE key = ?
+ON CONFLICT (person) DO UPDATE SET session_id = excluded.session_id, at = excluded.at;
+
+-- name: FollowedSession :one
+SELECT s.key, f.at FROM follows f JOIN sessions s ON s.id = f.session_id WHERE f.person = ?;

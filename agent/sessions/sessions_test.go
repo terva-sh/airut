@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -170,6 +171,42 @@ func TestIdleSessionsExpire(t *testing.T) {
 	}
 }
 
+func TestForgetPrefix(t *testing.T) {
+	d := open(t, filepath.Join(t.TempDir(), "sessions.db"), Options{})
+	ctx := context.Background()
+	keys := []string{"p/user/a/", "p/user/a/channel/1", "p/user/a/channel/2", "p/user/ab/channel/1", "p/user/_/x", "p/user/a"}
+	for _, k := range keys {
+		if err := session(t, d, k).AppendMessage(text(provider.RoleUser, "hi")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// LIKE would read _ and % as wildcards; the prefix is matched as
+	// written.
+	if err := d.ForgetPrefix(ctx, "p/user/%"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ForgetPrefix(ctx, "p/user/_/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ForgetPrefix(ctx, "p/user/a/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ForgetPrefix(ctx, ""); err == nil {
+		t.Fatal("an empty prefix, which matches every session, was accepted")
+	}
+	var left []string
+	for _, k := range keys {
+		if tr, err := session(t, d, k).Reload(); err != nil {
+			t.Fatal(err)
+		} else if len(tr.Messages) > 0 {
+			left = append(left, k)
+		}
+	}
+	if want := []string{"p/user/ab/channel/1", "p/user/a"}; !slices.Equal(left, want) {
+		t.Fatalf("left %q, want %q", left, want)
+	}
+}
+
 func TestForget(t *testing.T) {
 	d := open(t, filepath.Join(t.TempDir(), "sessions.db"), Options{})
 	old := session(t, d, "k")
@@ -261,5 +298,102 @@ func TestPragmas(t *testing.T) {
 		if err := d.db.QueryRow("PRAGMA " + pragma).Scan(&got); err != nil || got.String != want {
 			t.Errorf("PRAGMA %s = %q (%v), want %q", pragma, got.String, err, want)
 		}
+	}
+}
+
+func TestLinks(t *testing.T) {
+	ctx := context.Background()
+	c := newClock()
+	d := open(t, filepath.Join(t.TempDir(), "sessions.db"), Options{Retention: time.Hour, Now: c.now})
+	m := Message{Platform: "matrix", Channel: "!room", ID: "$ev"}
+	if _, ok, err := d.Linked(ctx, m); ok || err != nil {
+		t.Fatalf("an unlinked message = %v, %v", ok, err)
+	}
+	// A link to a session that does not exist is not made.
+	if err := d.Link(ctx, m, "nobody"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := d.Linked(ctx, m); ok {
+		t.Fatal("a message was linked to a session that does not exist")
+	}
+	session(t, d, "a")
+	session(t, d, "b")
+	if err := d.Link(ctx, m, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if key, ok, err := d.Linked(ctx, m); key != "a" || !ok || err != nil {
+		t.Fatalf("Linked = %q, %v, %v", key, ok, err)
+	}
+	// The same message in another channel or platform is another message.
+	for _, other := range []Message{{"matrix", "!other", "$ev"}, {"discord", "!room", "$ev"}} {
+		if _, ok, _ := d.Linked(ctx, other); ok {
+			t.Errorf("%+v is linked", other)
+		}
+	}
+	// A link can be replaced, and goes with its session.
+	if err := d.Link(ctx, m, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if key, _, _ := d.Linked(ctx, m); key != "b" {
+		t.Fatalf("the replaced link names %q", key)
+	}
+	if err := d.Forget(ctx, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := d.Linked(ctx, m); ok {
+		t.Fatal("a link outlived its forgotten session")
+	}
+	// A recreated session of the same key is a new one, which an old
+	// link never names.
+	session(t, d, "b")
+	if _, ok, _ := d.Linked(ctx, m); ok {
+		t.Fatal("a link came back with a new session under the old key")
+	}
+	if err := d.Link(ctx, m, "a"); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(2 * time.Hour)
+	if _, err := d.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := d.Linked(ctx, m); ok {
+		t.Fatal("a link outlived its expired session")
+	}
+}
+
+func TestFollows(t *testing.T) {
+	ctx := context.Background()
+	c := newClock()
+	d := open(t, filepath.Join(t.TempDir(), "sessions.db"), Options{Now: c.now})
+	if _, _, ok, err := d.Followed(ctx, "u/c"); ok || err != nil {
+		t.Fatalf("Followed of nobody = %v, %v", ok, err)
+	}
+	if err := d.Follow(ctx, "u/c", "nothing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := d.Followed(ctx, "u/c"); ok {
+		t.Fatal("a person followed a session that does not exist")
+	}
+	session(t, d, "mine")
+	session(t, d, "shared")
+	if err := d.Follow(ctx, "u/c", "mine"); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(time.Minute)
+	if err := d.Follow(ctx, "u/c", "shared"); err != nil {
+		t.Fatal(err)
+	}
+	if key, at, ok, err := d.Followed(ctx, "u/c"); key != "shared" || !ok || err != nil || !at.Equal(c.now().Truncate(time.Millisecond)) {
+		t.Fatalf("Followed = %q, %v, %v, %v", key, at, ok, err)
+	}
+	if _, _, ok, _ := d.Followed(ctx, "v/c"); ok {
+		t.Fatal("another person follows the same")
+	}
+	// The record goes with its session.
+	if err := d.Forget(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := d.Followed(ctx, "u/c"); ok {
+		t.Fatal("a person follows a forgotten session")
 	}
 }

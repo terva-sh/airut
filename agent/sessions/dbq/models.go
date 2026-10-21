@@ -11,6 +11,19 @@ type Entry struct {
 	Body      []byte
 }
 
+type Follow struct {
+	Person    string
+	SessionID int64
+	At        int64
+}
+
+type Link struct {
+	Platform  string
+	Channel   string
+	Message   string
+	SessionID int64
+}
+
 type SchemaMigration struct {
 	Version   int64
 	Name      string
