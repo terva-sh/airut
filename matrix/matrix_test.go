@@ -47,9 +47,32 @@ func TestTrigger(t *testing.T) {
 		{"Baphomet: roll 2d6", "", "roll", "2d6", true},
 	}
 	for _, c := range cases {
-		name, rest, ok := trigger(c.text, c.prefix, bot, known)
+		name, rest, ok := trigger(c.text, c.prefix, bot, known, false)
 		if name != c.name || rest != c.rest || ok != c.ok {
 			t.Errorf("trigger(%q, %q) = %q, %q, %v; want %q, %q, %v", c.text, c.prefix, name, rest, ok, c.name, c.rest, c.ok)
+		}
+	}
+}
+
+// TestTriggerInADirectRoom reads every line as if it opened with a
+// mention: a registered command needs no prefix, and chat stays chat.
+func TestTriggerInADirectRoom(t *testing.T) {
+	cases := []struct {
+		text, prefix, name, rest string
+		ok                       bool
+	}{
+		{"roll 2d6", "!", "roll", "2d6", true},
+		{"!roll 2d6", "!", "roll", "2d6", true},
+		{"Baphomet: roll", "!", "roll", "", true},
+		{"!what is this?", "!", "what", "is this?", true},
+		{"roll 2d6", "", "roll", "2d6", true},
+		{"what is this?", "!", "", "", false},
+		{"rolling along", "!", "", "", false},
+	}
+	for _, c := range cases {
+		name, rest, ok := trigger(c.text, c.prefix, bot, known, true)
+		if name != c.name || rest != c.rest || ok != c.ok {
+			t.Errorf("in a direct room, trigger(%q, %q) = %q, %q, %v; want %q, %q, %v", c.text, c.prefix, name, rest, ok, c.name, c.rest, c.ok)
 		}
 	}
 }
@@ -136,19 +159,29 @@ func TestAddressed(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: not read as a message", c.name)
 		}
-		ev := in.messageEvent(alice, bot)
-		if ev.Mentioned != c.mentions || ev.Request != c.request {
-			t.Errorf("%s: Mentioned %v, Request %q; want %v, %q", c.name, ev.Mentioned, ev.Request, c.mentions, c.request)
+		ev := in.messageEvent(alice, bot, false)
+		if ev.Mentioned != c.mentions || ev.Request != c.request || ev.Direct {
+			t.Errorf("%s: Mentioned %v, Request %q, Direct %v; want %v, %q, false", c.name, ev.Mentioned, ev.Request, ev.Direct, c.mentions, c.request)
 		}
 		if ev.Text != in.text {
 			t.Errorf("%s: Text changed to %q", c.name, ev.Text)
+		}
+		// In a direct room everything addresses the bot, and an opening
+		// mention is still taken off.
+		ev = in.messageEvent(alice, bot, true)
+		want := c.request
+		if !c.mentions {
+			want = in.text
+		}
+		if !ev.Direct || !ev.Mentioned || ev.Request != want {
+			t.Errorf("%s in a direct room: Direct %v, Mentioned %v, Request %q; want true, true, %q", c.name, ev.Direct, ev.Mentioned, ev.Request, want)
 		}
 	}
 }
 
 func TestNoticesAreNeverCommands(t *testing.T) {
 	in, _ := readMessage(message(&event.MessageEventContent{MsgType: event.MsgNotice, Body: "!roll"}))
-	if _, _, ok := in.command("!", bot, known); ok {
+	if _, _, ok := in.command("!", bot, known, true); ok {
 		t.Error("a notice was read as a command")
 	}
 }
@@ -164,12 +197,12 @@ func TestInvocationAndEvent(t *testing.T) {
 		inv.Channel != (airut.Channel{Platform: airut.Matrix, ID: "!room:example.org"}) || inv.Native != evt || inv.Text != "+cat" {
 		t.Errorf("invocation %+v", inv)
 	}
-	ev := in.messageEvent(alice, bot)
+	ev := in.messageEvent(alice, bot, false)
 	if ev.Text != "!tags +cat" || ev.ReplyTo.ID != "$review" || ev.Thread != "$root" || ev.Sender != alice || !ev.Sent.IsZero() {
 		t.Errorf("event %+v", ev)
 	}
 	evt.Timestamp = 1792425600123
-	if ev = in.messageEvent(alice, bot); !ev.Sent.Equal(time.UnixMilli(1792425600123)) {
+	if ev = in.messageEvent(alice, bot, false); !ev.Sent.Equal(time.UnixMilli(1792425600123)) {
 		t.Errorf("an event stamped by the homeserver was sent at %v", ev.Sent)
 	}
 }

@@ -41,10 +41,12 @@ func (n names) stripMention(body string) (string, bool) {
 // rather than a call to a command named what. The prefix calls whatever
 // follows it, and the core answers a name it does not know. With an
 // empty prefix only a mention triggers, so that ordinary chat is never
-// read as a command.
-func trigger(text, prefix string, me names, known func(string) bool) (name, rest string, ok bool) {
+// read as a command. In a direct channel every message addresses the
+// bot, so a line reads as if it opened with a mention.
+func trigger(text, prefix string, me names, known func(string) bool, direct bool) (name, rest string, ok bool) {
 	text = strings.TrimSpace(text)
-	if r, mentioned := me.stripMention(text); mentioned {
+	r, mentioned := me.stripMention(text)
+	if mentioned || direct {
 		if prefix != "" {
 			if name, rest, ok := airut.SplitCommand(r, prefix); ok {
 				return name, rest, true
@@ -111,11 +113,11 @@ func readMessage(evt *event.Event) (inbound, bool) {
 // command reports the command the message calls, if it calls one.
 // Notices are never commands: bots send them, and answering one is how
 // two bots talk to each other forever.
-func (in inbound) command(prefix string, me names, known func(string) bool) (name, rest string, ok bool) {
+func (in inbound) command(prefix string, me names, known func(string) bool, direct bool) (name, rest string, ok bool) {
 	if in.content.MsgType == event.MsgNotice {
 		return "", "", false
 	}
-	return trigger(in.text, prefix, me, known)
+	return trigger(in.text, prefix, me, known, direct)
 }
 
 func (in inbound) invocation(sender airut.User, name, rest string) airut.Invocation {
@@ -133,14 +135,15 @@ func (in inbound) invocation(sender airut.User, name, rest string) airut.Invocat
 	}
 }
 
-func (in inbound) messageEvent(sender airut.User, me names) airut.MessageEvent {
-	request, mentioned := in.addressed(me)
+func (in inbound) messageEvent(sender airut.User, me names, direct bool) airut.MessageEvent {
+	request, mentioned := in.addressed(me, direct)
 	return airut.MessageEvent{
 		ID:        string(in.evt.ID),
 		Message:   airut.MessageRef{ID: string(in.evt.ID)},
 		Sender:    sender,
 		Channel:   channel(in.evt.RoomID),
 		Thread:    string(in.thread),
+		Direct:    direct,
 		Text:      in.text,
 		Mentioned: mentioned,
 		Request:   request,
@@ -165,12 +168,12 @@ func sent(evt *event.Event) time.Time {
 // m.mentions names the bot. Only leading space is skipped to find the
 // mention, so the rest of the text reaches the handler as it was sent.
 // A room mention alone does not address the bot, so "@room" never
-// starts a turn.
-func (in inbound) addressed(me names) (string, bool) {
+// starts a turn. In a direct channel every message addresses the bot.
+func (in inbound) addressed(me names, direct bool) (string, bool) {
 	if rest, ok := me.stripMention(strings.TrimLeftFunc(in.text, unicode.IsSpace)); ok {
 		return rest, true
 	}
-	if m := in.content.Mentions; m != nil && me.id != "" && m.Has(id.UserID(me.id)) {
+	if m := in.content.Mentions; direct || (m != nil && me.id != "" && m.Has(id.UserID(me.id))) {
 		return in.text, true
 	}
 	return "", false

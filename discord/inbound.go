@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -19,7 +20,49 @@ func (s *session) onMessage(_ *discordgo.Session, mc *discordgo.MessageCreate) {
 	ev := s.messageEvent(mc.Message)
 	r := s.channelResponder(mc.ChannelID, mc.GuildID, mc.Author.ID)
 	r.target = mc.ID
-	s.spawn(func() { s.h.Deliver(s.ctx, ev, r) })
+	s.spawn(func() {
+		// Off the gateway's goroutine: each link past the first is a
+		// request.
+		if ev.Mentioned {
+			ev.ReplyChain = s.chain(s.ctx, mc.Message)
+		}
+		s.h.Deliver(s.ctx, ev, r)
+	})
+}
+
+// chain resolves what m replies to, nearest first, to the session's
+// depth and within airut's caps. The gateway carries the first link;
+// each one past it is fetched, and one the bot cannot read ends the
+// chain.
+func (s *session) chain(ctx context.Context, m *discordgo.Message) []airut.Quoted {
+	var out []airut.Quoted
+	for room := true; room && len(out) < s.replyDepth; {
+		ref := m.MessageReference
+		if m.Type != discordgo.MessageTypeReply || ref == nil || ref.MessageID == "" {
+			break
+		}
+		channel := ref.ChannelID
+		if channel == "" {
+			channel = m.ChannelID
+		}
+		next := m.ReferencedMessage
+		if next == nil || next.ID != ref.MessageID {
+			var err error
+			if next, err = s.dg.ChannelMessage(channel, ref.MessageID, discordgo.WithContext(ctx)); err != nil {
+				s.log.Info("a reply chain ended at a message the bot could not read", "message", ref.MessageID, "error_kind", errKind(err))
+				break
+			}
+		}
+		if next.Author == nil {
+			break
+		}
+		if next.GuildID == "" {
+			next.GuildID = s.guildOf(channel)
+		}
+		out, room = airut.AddQuote(out, airut.Quote(s.messageEvent(next)))
+		m = next
+	}
+	return out
 }
 
 // delivers reports whether m is a message the bot's handlers see: a
@@ -38,8 +81,10 @@ func (s *session) messageEvent(m *discordgo.Message) airut.MessageEvent {
 		Message: airut.MessageRef{ID: m.ID},
 		Sender:  user(m.Author, m.Member),
 		Channel: s.channel(m.ChannelID),
+		Direct:  s.direct(m.ChannelID, m.GuildID),
 		Text:    m.Content,
 		Sent:    m.Timestamp,
+		FromBot: m.Author.ID == s.self(),
 		Native:  m,
 	}
 	if ch, err := s.dg.State.Channel(m.ChannelID); err == nil && ch.IsThread() {
@@ -56,6 +101,9 @@ func (s *session) messageEvent(m *discordgo.Message) airut.MessageEvent {
 			ev.Mentioned = true
 		}
 	}
+	// In a direct message everything addresses the bot, except what the
+	// bot says itself.
+	ev.Mentioned = (ev.Mentioned || ev.Direct) && !ev.FromBot
 	if ev.Mentioned {
 		ev.Request = request(m.Content, me)
 	}
@@ -90,6 +138,7 @@ func (s *session) onReaction(_ *discordgo.Session, ra *discordgo.MessageReaction
 		ID:      reactionID(ra.MessageID, ra.UserID, emoji),
 		Sender:  airut.User{Platform: airut.Discord, ID: ra.UserID},
 		Channel: s.channel(ra.ChannelID),
+		Direct:  s.direct(ra.ChannelID, ra.GuildID),
 		Target:  airut.MessageRef{ID: ra.MessageID},
 		Emoji:   emoji,
 		Native:  ra,
@@ -132,4 +181,18 @@ func (s *session) self() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.me
+}
+
+// direct reports whether a channel is a direct message: outside any
+// guild, and of the one-to-one kind when the state knows it. A bot
+// cannot be added to a group DM, so a guildless channel the state has
+// not seen is taken as one-to-one.
+func (s *session) direct(channel, guild string) bool {
+	if guild != "" {
+		return false
+	}
+	if ch, err := s.dg.State.Channel(channel); err == nil {
+		return ch.GuildID == "" && ch.Type == discordgo.ChannelTypeDM
+	}
+	return true
 }

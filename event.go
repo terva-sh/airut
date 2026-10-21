@@ -23,10 +23,16 @@ type MessageEvent struct {
 	Channel Channel
 	// Thread identifies the thread the message is in, if any.
 	Thread string
+	// Direct reports that the message arrived in a direct channel: a
+	// conversation private to the bot and the sender, as Conn.Direct
+	// checks one. The adapter checks it for each message, so it is false
+	// from the first message after a third person joins.
+	Direct bool
 	Text   string
 	// Mentioned reports that the message addresses the bot: it opens
 	// with a mention of the bot, by the rule the adapter uses for
-	// commands, or the platform marks the bot as mentioned in it. A
+	// commands, or the platform marks the bot as mentioned in it, or it
+	// arrived in a direct channel, where everything addresses the bot. A
 	// mention of everyone in the channel does not count.
 	Mentioned bool
 	// Request is what an addressed message asks of the bot: Text without
@@ -39,6 +45,15 @@ type MessageEvent struct {
 	// ReplyTo is the message this one replies to; its ID is empty when
 	// it replies to none.
 	ReplyTo MessageRef
+	// ReplyChain is the message ReplyTo names, then the one that replies
+	// to, and so on, nearest first. The adapter resolves it only for a
+	// message that addresses the bot, to the depth it is configured
+	// with, and stops at a message it cannot read. For any other message
+	// it is empty, and Conn.Fetch follows ReplyTo instead.
+	ReplyChain []Quoted
+	// FromBot reports that the bot sent the message. Only Conn.Fetch,
+	// and Conn.History with IncludeBot, return such a message.
+	FromBot bool
 	// Sent is when the platform says the message was sent. After
 	// downtime a handler receives what it missed, so a bot that answers
 	// chat can leave an old message unanswered. It is zero when the
@@ -58,6 +73,8 @@ type ReactionEvent struct {
 	Channel Channel
 	// Thread identifies the thread the reacted message is in, if any.
 	Thread string
+	// Direct reports that the reaction was added in a direct channel.
+	Direct bool
 	// Target is the message reacted to. Its ID is the platform's own and
 	// stays the same across restarts, so a bot can match a reaction to a
 	// message it posted long before.
@@ -102,12 +119,12 @@ func eventInvocation(ev Event, r Responder) (Invocation, string) {
 	switch e := ev.(type) {
 	case MessageEvent:
 		return Invocation{
-			ID: e.ID, Caller: e.Sender, Roles: e.Roles, Channel: e.Channel, Thread: e.Thread,
-			Message: e.Message, ReplyTo: e.ReplyTo, Respond: r, Native: e.Native,
+			ID: e.ID, Caller: e.Sender, Roles: e.Roles, Channel: e.Channel, Thread: e.Thread, Direct: e.Direct,
+			Message: e.Message, ReplyTo: e.ReplyTo, ReplyChain: e.ReplyChain, Respond: r, Native: e.Native,
 		}, "message"
 	case ReactionEvent:
 		return Invocation{
-			ID: e.ID, Caller: e.Sender, Roles: e.Roles, Channel: e.Channel, Thread: e.Thread,
+			ID: e.ID, Caller: e.Sender, Roles: e.Roles, Channel: e.Channel, Thread: e.Thread, Direct: e.Direct,
 			Message: e.Target, Respond: r, Native: e.Native,
 		}, "reaction"
 	}

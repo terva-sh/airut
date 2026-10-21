@@ -279,3 +279,48 @@ func TestConnReactionsSwap(t *testing.T) {
 		t.Errorf("%d events after the repeats and refusals, want the 3 swaps alone", n)
 	}
 }
+
+// TestDirectMessages delivers lines in a direct channel: a bare command
+// name runs the command, other chat reaches OnMessage as addressed, and
+// the Ctx reports the channel as direct.
+func TestDirectMessages(t *testing.T) {
+	b := airut.New(airut.Config{Prefix: "!"})
+	var direct []bool
+	b.Command("ping", "Answer pong", func(c *airut.Ctx) error {
+		direct = append(direct, c.Direct())
+		_, err := c.Reply("pong")
+		return err
+	})
+	var got []airut.MessageEvent
+	b.OnMessage(func(c *airut.Ctx, m airut.MessageEvent) error {
+		direct = append(direct, c.Direct())
+		got = append(got, m)
+		return nil
+	})
+	a := airuttest.Start(t, b)
+	for _, line := range []string{"ping", "!ping"} {
+		if evs := a.DirectMessage(line); len(evs) != 1 || evs[0].Text != "pong" {
+			t.Errorf("%q in a direct channel = %+v", line, evs)
+		}
+	}
+	a.DirectMessage("hello there")
+	a.Text("hello all")
+	if len(got) != 2 || !got[0].Direct || !got[0].Mentioned || got[0].Request != "hello there" || got[1].Direct || got[1].Mentioned {
+		t.Errorf("messages = %+v", got)
+	}
+	if fmt.Sprint(direct) != "[true true true false]" {
+		t.Errorf("Ctx.Direct reported %v", direct)
+	}
+
+	conn := a.Conn()
+	ch := airut.Channel{Platform: airuttest.Platform, ID: "dm-1"}
+	alice := airut.User{Platform: airuttest.Platform, ID: "alice"}
+	a.SetDirect("dm-1", alice)
+	if who, ok, err := conn.Direct(context.Background(), ch); !ok || err != nil || who != alice {
+		t.Errorf("Direct after SetDirect = %v, %v, %v", who, ok, err)
+	}
+	a.SetDirect("dm-1", airut.User{})
+	if _, ok, _ := conn.Direct(context.Background(), ch); ok {
+		t.Error("Direct still reports a channel SetDirect cleared")
+	}
+}

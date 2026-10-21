@@ -345,3 +345,46 @@ func TestConnReactions(t *testing.T) {
 		t.Errorf("%d requests left for refused refs: %v", n, x.f.sent()[before:])
 	}
 }
+
+func TestDirectMessages(t *testing.T) {
+	x := start(t, airut.New(airut.Config{}))
+	x.s.me = "bot"
+	dm := message("m1", "u1", "hello there")
+	dm.ChannelID, dm.GuildID, dm.Member = "d1", "", nil
+	if ev := x.s.messageEvent(dm); !ev.Direct || !ev.Mentioned || ev.Request != "hello there" {
+		t.Errorf("a direct message arrived with Direct %v, Mentioned %v, Request %q", ev.Direct, ev.Mentioned, ev.Request)
+	}
+	if ev := x.s.messageEvent(message("m2", "u1", "hello there")); ev.Direct || ev.Mentioned {
+		t.Errorf("a guild message arrived with Direct %v, Mentioned %v", ev.Direct, ev.Mentioned)
+	}
+	// A guildless channel the state knows as a group DM is not direct.
+	x.s.dg.State.ChannelAdd(&discordgo.Channel{ID: "g7", Type: discordgo.ChannelTypeGroupDM})
+	group := message("m3", "u1", "hi all")
+	group.ChannelID, group.GuildID = "g7", ""
+	if ev := x.s.messageEvent(group); ev.Direct || ev.Mentioned {
+		t.Errorf("a group DM arrived with Direct %v, Mentioned %v", ev.Direct, ev.Mentioned)
+	}
+
+	// A command run in a DM arrives as a direct invocation.
+	ic := interaction("roll", nil, nil)
+	if inv := x.s.invocation(ic, nil); inv.Direct {
+		t.Error("a command in a guild arrived as direct")
+	}
+	ic.GuildID, ic.ChannelID, ic.User, ic.Member = "", "d1", &discordgo.User{ID: "u1"}, nil
+	if inv := x.s.invocation(ic, nil); !inv.Direct || inv.Caller.ID != "u1" {
+		t.Errorf("a command in a DM arrived with Direct %v, caller %v", inv.Direct, inv.Caller)
+	}
+
+	x.f.on("GET", "/channels/d2", 200, `{"id": "d2", "type": 1, "recipients": [{"id": "u1", "username": "ada"}]}`)
+	x.f.on("GET", "/channels/c2", 200, `{"id": "c2", "guild_id": "g1", "type": 0}`)
+	x.f.on("GET", "/channels/g8", 200, `{"id": "g8", "type": 3, "recipients": [{"id": "u1"}, {"id": "u2"}]}`)
+	ctx := context.Background()
+	if who, ok, err := x.s.Direct(ctx, airut.Channel{ID: "d2"}); err != nil || !ok || who.ID != "u1" {
+		t.Errorf("Direct(a DM) = %v, %v, %v", who, ok, err)
+	}
+	for _, ch := range []string{"c2", "g8"} {
+		if _, ok, err := x.s.Direct(ctx, airut.Channel{ID: ch}); err != nil || ok {
+			t.Errorf("Direct(%s) = %v, %v", ch, ok, err)
+		}
+	}
+}
