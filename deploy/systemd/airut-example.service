@@ -1,0 +1,82 @@
+# A reference unit for airut's sample bot. deploy/README.md says how to
+# install it. Copy it rather than linking it, and adapt the copy to the
+# host: the paths, the user, and the credentials are facts about the
+# host, not about airut.
+#
+# Each secret is a systemd credential encrypted on the host with
+# systemd-creds, and decrypted only for this unit. The config file names
+# each one by its id, as token = { credential = "discord-token" }, and
+# never holds a value.
+
+[Unit]
+Description=airut sample bot
+Documentation=https://terva.sh/airut
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/lib/airut-example/airut-example -config /etc/airut-example/airut.toml
+# The bot finishes the invocations in flight when it is stopped.
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=10s
+
+# A static system user, from airut-example.sysusers, rather than
+# DynamicUser=, so the state directory keeps one owner and a restored
+# backup needs no chown.
+User=airut-example
+Group=airut-example
+# /var/lib/airut-example holds the Matrix crypto store, which cannot be
+# rebuilt, and the session database. Back it up.
+StateDirectory=airut-example
+StateDirectoryMode=0700
+ConfigurationDirectory=airut-example
+
+# One line per secret the config file names. The id before the colon is
+# the name the config uses; the file is the encrypted credential. Drop
+# the lines of a platform the bot does not serve: a credential that is
+# missing stops the unit from starting.
+LoadCredentialEncrypted=discord-token:/etc/credstore.encrypted/airut-example-discord-token
+LoadCredentialEncrypted=matrix-password:/etc/credstore.encrypted/airut-example-matrix-password
+LoadCredentialEncrypted=proxy-api-key:/etc/credstore.encrypted/airut-example-proxy-api-key
+# The recovery key can sign any device as the bot's, so keep it off the
+# host. Add it only for a start that has to re-sign the device, as after
+# the state directory was re-created, and remove it afterwards.
+#LoadCredentialEncrypted=matrix-recovery-key:/etc/credstore.encrypted/airut-example-matrix-recovery-key
+
+# Hardening. A static Go binary needs none of what these take away.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+PrivateUsers=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RemoveIPC=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+# Egress: the bot reaches its platforms and model providers. Discord's
+# addresses are not fixed, so a Discord bot cannot list them. A bot that
+# serves only Matrix and local models can: add IPAddressAllow= for the
+# homeserver and the providers, and IPAddressDeny=any.
+
+[Install]
+WantedBy=multi-user.target

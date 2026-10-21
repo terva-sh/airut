@@ -1,0 +1,3 @@
+# The sample bot's system user. Install as
+# /etc/sysusers.d/airut-example.conf, then run systemd-sysusers.
+u airut-example - "airut sample bot" /var/lib/airut-example
