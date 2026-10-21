@@ -60,22 +60,23 @@ token = { env = "AIRUT_TEST_TOKEN" }
 // TestExample loads docs/config.example.toml, which documents every key,
 // so the example and the loader cannot drift apart.
 func TestExample(t *testing.T) {
-	credentials(t, "proxy-api-key", "discord-token", "matrix-password")
+	credentials(t, "proxy-api-key", "discord-token", "matrix-password", "matrix-recovery-key")
 	c, err := Load("../docs/config.example.toml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	secret := NewSecret(sentinel)
 	want := &Config{
-		Bot: Bot{Prefix: "!"},
+		Bot: Bot{Prefix: "!", ReplyDepth: 3},
 		Providers: []Provider{
 			{ID: "local", BaseURL: "http://127.0.0.1:8000/v1", Models: []Model{{ID: "qwen3-32b", ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}}},
 			{ID: "proxy", BaseURL: "https://llm.example.net/v1", APIKey: secret, Models: []Model{{ID: "gpt-5.5"}}},
 		},
 		Agent: &Agent{
-			Model:  ModelRef{Provider: "local", Model: "qwen3-32b"},
-			Budget: Budget{MaxTurns: 8, MaxTokens: 200000},
-			Rate:   Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute},
+			Model:   ModelRef{Provider: "local", Model: "qwen3-32b"},
+			Budget:  Budget{MaxTurns: 8, MaxTokens: 200000},
+			Rate:    Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute},
+			History: History{MaxMessages: 200, MaxTokens: 60000, MaxAge: 168 * time.Hour, Compaction: "summarize", RoomMessages: 10, FollowWithin: 15 * time.Minute},
 			Access: map[string]Access{
 				"discord": {Users: []string{"123456789012345678"}, Roles: []string{"234567890123456789"}},
 				"matrix":  {Users: []string{"@owner:example.org"}, Rooms: []string{"!members:example.org"}},
@@ -84,7 +85,7 @@ func TestExample(t *testing.T) {
 		Store:   Store{Path: "/var/lib/airut-sample/sessions.db", Retention: 720 * time.Hour},
 		Discord: &Discord{Token: secret, Guilds: []string{"345678901234567890"}},
 		Matrix: &Matrix{Homeserver: "https://matrix.example.org", UserID: "@sample:example.org", Password: secret,
-			StateDir: "/var/lib/airut-sample/matrix", DeviceName: "airut sample"},
+			StateDir: "/var/lib/airut-sample/matrix", DeviceName: "airut sample", RecoveryKey: secret},
 		Metrics: Metrics{Listen: "127.0.0.1:9464", SummaryEvery: 15 * time.Minute},
 	}
 	if !reflect.DeepEqual(c, want) {
@@ -118,6 +119,9 @@ path = "sessions.db"
 	if c.Store.Retention != DefaultRetention || !filepath.IsAbs(c.Store.Path) || filepath.Base(c.Store.Path) != "sessions.db" {
 		t.Errorf("store = %+v", c.Store)
 	}
+	if c.Agent.History != (History{}) {
+		t.Errorf("history = %+v, want no bounds", c.Agent.History)
+	}
 	if len(c.Agent.Access) != 0 {
 		t.Errorf("access = %v, want none: nobody may start a turn", c.Agent.Access)
 	}
@@ -140,7 +144,7 @@ var mismatched = "%d %x"
 // TestSecretsNeverPrint covers every route by which a config reaches a
 // log: fmt verbs, JSON, text encoders, and slog.
 func TestSecretsNeverPrint(t *testing.T) {
-	credentials(t, "proxy-api-key", "discord-token", "matrix-password")
+	credentials(t, "proxy-api-key", "discord-token", "matrix-password", "matrix-recovery-key")
 	c, err := Load("../docs/config.example.toml")
 	if err != nil {
 		t.Fatal(err)
@@ -263,6 +267,9 @@ func TestProblems(t *testing.T) {
 		{"no platform", ``, []string{"(file)"}},
 		{"unknown keys", "colour = \"blue\"\n" + minimal + "[discord.extra]\nx = 1\n", []string{"colour", "discord.extra"}},
 		{"a wrong type", minimal + "[bot]\nprefix = 3\n", []string{"bot.prefix"}},
+		{"a deep reply chain", minimal + "[bot]\nreply_depth = 11\n", []string{"bot.reply_depth"}},
+		{"a plain recovery key", minimal + "[matrix]\nhomeserver = \"https://m.example.org\"\nuser_id = \"@b:example.org\"\nstate_dir = \"m\"\nrecovery_key = \"" + sentinel + "\"\n",
+			[]string{"matrix.recovery_key"}},
 		{"bad syntax", minimal + "[bot]\nprefix = \"" + sentinel + "\n", []string{"(file)"}},
 		{"bad providers", minimal + `
 [providers.Bad]
@@ -274,8 +281,10 @@ base_url = "https://user:` + sentinel + `@example.net"
 			"providers.Bad", "providers.Bad.base_url", "providers.Bad.models.1.context_window", "providers.Bad.models.1.id",
 			"providers.Bad.models.2.id", "providers.Bad.models.2.max_output", "providers.empty.base_url", "providers.empty.models",
 		}},
-		{"an incomplete agent", minimal + "[agent]\nrate = { per_user = 0, window = \"soon\" }\n", []string{
-			"agent.budget", "agent.model", "agent.rate.per_user", "agent.rate.window", "store.path",
+		{"an incomplete agent", minimal + "[agent]\nrate = { per_user = 0, window = \"soon\" }\n" +
+			"history = { max_messages = -1, max_tokens = -2, max_age = \"1d\", compaction = \"trim\", room_messages = 51, follow_within = \"-1m\" }\n", []string{
+			"agent.budget", "agent.history.compaction", "agent.history.follow_within", "agent.history.max_age", "agent.history.max_messages",
+			"agent.history.max_tokens", "agent.history.room_messages", "agent.model", "agent.rate.per_user", "agent.rate.window", "store.path",
 		}},
 		{"an agent naming what is not there", minimal + `
 [providers.local]

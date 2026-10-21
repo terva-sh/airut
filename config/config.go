@@ -59,6 +59,9 @@ type Metrics struct {
 type Bot struct {
 	// Prefix triggers a text command. Empty leaves the core's default.
 	Prefix string
+	// ReplyDepth is how far up a reply chain the adapters resolve. Zero
+	// leaves their default; -1 resolves none.
+	ReplyDepth int
 }
 
 // Provider is one OpenAI-compatible endpoint.
@@ -94,6 +97,10 @@ type Agent struct {
 	// Budget is the default for a turn that sets none.
 	Budget Budget
 	Rate   Rate
+	// History bounds what a turn resumes of a remembered conversation,
+	// for a turn that sets no bound of its own. The zero value bounds
+	// nothing.
+	History History
 	// Access lists who may start an agent turn, by platform. A platform
 	// with no entry allows nobody.
 	Access map[string]Access
@@ -103,6 +110,22 @@ type Agent struct {
 type Budget struct {
 	MaxTurns  int
 	MaxTokens int
+}
+
+// History bounds what an agent turn resumes. A zero field bounds
+// nothing; Compaction is "summarize", "drop", or empty for the agent's
+// default.
+type History struct {
+	MaxMessages int
+	MaxTokens   int
+	MaxAge      time.Duration
+	Compaction  string
+	// RoomMessages is how many of the channel's latest messages a turn
+	// sees as quoted chat, 0 for none.
+	RoomMessages int
+	// FollowWithin is how soon a person must speak again to go on with a
+	// Conversation; zero takes airut's default.
+	FollowWithin time.Duration
 }
 
 // Rate limits agent turns in a sliding window.
@@ -144,6 +167,10 @@ type Matrix struct {
 	Password   Secret
 	StateDir   string
 	DeviceName string
+	// RecoveryKey, if set, is the account's cross-signing recovery key.
+	// With it the adapter signs its own device at start when the device
+	// is not signed yet, as after the state directory was re-created.
+	RecoveryKey Secret
 }
 
 // Defaults for keys a file may leave out.
@@ -171,7 +198,8 @@ type fileConfig struct {
 }
 
 type fileBot struct {
-	Prefix string `toml:"prefix"`
+	Prefix     string `toml:"prefix"`
+	ReplyDepth *int   `toml:"reply_depth"`
 }
 
 type fileProvider struct {
@@ -188,10 +216,20 @@ type fileModel struct {
 }
 
 type fileAgent struct {
-	Model  string      `toml:"model"`
-	Budget *fileBudget `toml:"budget"`
-	Rate   *fileRate   `toml:"rate"`
-	Access fileAccess  `toml:"access"`
+	Model   string       `toml:"model"`
+	Budget  *fileBudget  `toml:"budget"`
+	Rate    *fileRate    `toml:"rate"`
+	History *fileHistory `toml:"history"`
+	Access  fileAccess   `toml:"access"`
+}
+
+type fileHistory struct {
+	MaxMessages  int    `toml:"max_messages"`
+	MaxTokens    int    `toml:"max_tokens"`
+	MaxAge       string `toml:"max_age"`
+	Compaction   string `toml:"compaction"`
+	RoomMessages int    `toml:"room_messages"`
+	FollowWithin string `toml:"follow_within"`
 }
 
 type fileBudget struct {
@@ -237,11 +275,12 @@ type fileMetrics struct {
 }
 
 type fileMatrix struct {
-	Homeserver string `toml:"homeserver"`
-	UserID     string `toml:"user_id"`
-	Password   any    `toml:"password"`
-	StateDir   string `toml:"state_dir"`
-	DeviceName string `toml:"device_name"`
+	Homeserver  string `toml:"homeserver"`
+	UserID      string `toml:"user_id"`
+	Password    any    `toml:"password"`
+	StateDir    string `toml:"state_dir"`
+	DeviceName  string `toml:"device_name"`
+	RecoveryKey any    `toml:"recovery_key"`
 }
 
 // Load reads and checks the config file at path, and reads the secrets
@@ -281,6 +320,13 @@ func parse(path string, src []byte, app reflect.Value) (*Config, error) {
 	return c, nil
 }
 
+// maxReplyDepth bounds bot.reply_depth: each link is a request.
+const maxReplyDepth = 10
+
+// maxRoomMessages bounds agent.history.room_messages, as
+// airut.MaxRoomMessages bounds a turn's.
+const maxRoomMessages = 50
+
 var (
 	providerIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 	snowflakeRE  = regexp.MustCompile(`^[0-9]{1,20}$`)
@@ -290,6 +336,16 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 	c := &Config{Bot: Bot{Prefix: f.Bot.Prefix}}
 	if strings.ContainsAny(f.Bot.Prefix, " \t\r\n") {
 		p.add("bot.prefix", "a prefix cannot contain spaces")
+	}
+	if d := f.Bot.ReplyDepth; d != nil {
+		switch {
+		case *d < 0 || *d > maxReplyDepth:
+			p.add("bot.reply_depth", fmt.Sprintf("must be 0 to %d", maxReplyDepth))
+		case *d == 0:
+			c.Bot.ReplyDepth = -1
+		default:
+			c.Bot.ReplyDepth = *d
+		}
 	}
 
 	if m := f.Metrics; m != nil {
@@ -428,6 +484,30 @@ func buildAgent(p *problems, f *fileAgent, providers []Provider) *Agent {
 		}
 	}
 
+	if h := f.History; h != nil {
+		a.History = History{MaxMessages: h.MaxMessages, MaxTokens: h.MaxTokens, Compaction: h.Compaction, RoomMessages: h.RoomMessages}
+		if h.RoomMessages < 0 || h.RoomMessages > maxRoomMessages {
+			p.add("agent.history.room_messages", fmt.Sprintf("must be 0 to %d", maxRoomMessages))
+		}
+		if h.MaxMessages < 0 {
+			p.add("agent.history.max_messages", "must not be negative")
+		}
+		if h.MaxTokens < 0 {
+			p.add("agent.history.max_tokens", "must not be negative")
+		}
+		if h.MaxAge != "" {
+			a.History.MaxAge = duration(p, "agent.history.max_age", h.MaxAge)
+		}
+		if h.FollowWithin != "" {
+			a.History.FollowWithin = duration(p, "agent.history.follow_within", h.FollowWithin)
+		}
+		switch h.Compaction {
+		case "", "summarize", "drop":
+		default:
+			p.add("agent.history.compaction", `must be "summarize" or "drop"`)
+		}
+	}
+
 	if d := f.Access.Discord; d != nil {
 		for i, u := range d.Users {
 			if !snowflakeRE.MatchString(u) {
@@ -484,6 +564,9 @@ func buildMatrix(p *problems, f *fileMatrix, dir string) *Matrix {
 	}
 	if f.Password != nil {
 		m.Password = resolveSecret(p, "matrix.password", f.Password, dir)
+	}
+	if f.RecoveryKey != nil {
+		m.RecoveryKey = resolveSecret(p, "matrix.recovery_key", f.RecoveryKey, dir)
 	}
 	if m.StateDir == "" {
 		p.add("matrix.state_dir", "required: the directory that keeps the Matrix session and crypto store")

@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"terva.sh/airut"
 	"terva.sh/airut/airuttest"
 	"terva.sh/airut/config"
+	"terva.sh/airut/matrix"
 )
 
 // threes is a die that always lands on 3.
@@ -126,13 +131,54 @@ func TestInvitesComeOnlyFromNamedUsers(t *testing.T) {
 		"discord": {Users: []string{"@stranger:example.org"}},
 	}}}
 	accept := inviters(cfg)
-	if !accept("!r:example.org", "@owner:example.org") {
-		t.Error("refused an invite from a named user")
+	for _, direct := range []bool{false, true} {
+		if !accept(matrix.Invite{Room: "!r:example.org", Inviter: "@owner:example.org", Direct: direct}) {
+			t.Errorf("refused an invite from a named user, direct %v", direct)
+		}
+		if accept(matrix.Invite{Room: "!r:example.org", Inviter: "@stranger:example.org", Direct: direct}) {
+			t.Errorf("accepted an invite from a user named only for Discord, direct %v", direct)
+		}
 	}
-	if accept("!r:example.org", "@stranger:example.org") {
-		t.Error("accepted an invite from a user named only for Discord")
-	}
-	if inviters(&config.Config{})("!r:example.org", "@owner:example.org") {
+	if inviters(&config.Config{})(matrix.Invite{Room: "!r:example.org", Inviter: "@owner:example.org"}) {
 		t.Error("accepted an invite with no [agent] table")
+	}
+}
+
+// TestReadKeyStopsWithItsContext reads a key from a pipe, and gives up on
+// one that never comes when the context is cancelled.
+func TestReadKeyStopsWithItsContext(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := readKey(ctx, r, io.Discard, "")
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("a cancelled read = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read went on after its context was cancelled")
+	}
+
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	go func() {
+		_, _ = io.WriteString(w2, "  EsTc abcd  \n")
+		w2.Close()
+	}()
+	if key, err := readKey(context.Background(), r2, io.Discard, ""); key != "EsTc abcd" || err != nil {
+		t.Errorf("readKey = %q, %v", key, err)
 	}
 }

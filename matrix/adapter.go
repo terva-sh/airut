@@ -44,18 +44,36 @@ type Options struct {
 	// AcceptInvite decides whether the bot joins a room it is invited to.
 	// When it is nil, the bot joins none, so nobody can pull it into a
 	// room it was not meant for.
-	AcceptInvite func(room, inviter string) bool
+	AcceptInvite func(Invite) bool
 	// MaxCommandAge is how old a command may be and still be answered.
 	// Zero means DefaultMaxCommandAge.
 	MaxCommandAge time.Duration
+	// ReplyDepth is how far up a reply chain the adapter resolves for a
+	// command or a message that addresses the bot. Zero means
+	// airut.DefaultReplyDepth, and a negative value resolves none.
+	ReplyDepth int
 	// Logger receives the adapter's logs. Nil means the Host's.
 	Logger *slog.Logger
+}
+
+// Invite is an invitation to a room, for Options.AcceptInvite.
+type Invite struct {
+	Room, Inviter string
+	// Direct reports that the invite says it opens a direct chat, as a
+	// client marks one. It is the inviter's claim only. Once the bot has
+	// joined, an event's Direct reports whether the room is in fact
+	// private to the bot and the inviter. The bot records a direct room
+	// it joins in its m.direct, as clients do.
+	Direct bool
 }
 
 // Adapter is an airut.Adapter for Matrix.
 type Adapter struct {
 	cfg  config.Matrix
 	opts Options
+
+	mu     sync.Mutex
+	client *rihma.Client // the running Run's, or nil
 }
 
 // New returns an adapter for the account cfg describes.
@@ -83,36 +101,19 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 		log = h.Logger()
 	}
 	log = log.With("platform", string(airut.Matrix))
-	user := id.UserID(a.cfg.UserID)
-	local, _, err := user.Parse()
-	if err != nil || a.cfg.Homeserver == "" || a.cfg.StateDir == "" {
-		return errors.New("matrix: the configuration needs a homeserver, a user id, and a state directory")
-	}
-	if err := os.MkdirAll(a.cfg.StateDir, 0o700); err != nil {
-		return fmt.Errorf("matrix: %w", err)
-	}
-	ro := rihma.Options{
-		Homeserver: a.cfg.Homeserver,
-		StateDir:   filepath.Join(a.cfg.StateDir, "rihma"),
-		Sessions:   rihma.FileSessionStore{Path: filepath.Join(a.cfg.StateDir, "session.json")},
-		DeviceName: a.cfg.DeviceName,
-		Logger:     zerologTo(log),
-	}
-	if !a.cfg.Password.IsZero() {
-		ro.Login = &mautrix.ReqLogin{
-			Type:       mautrix.AuthTypePassword,
-			Identifier: mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: local},
-			Password:   a.cfg.Password.Value(),
-		}
-	}
-	c, err := rihma.Open(ctx, ro)
+	c, err := open(ctx, &a.cfg, log)
 	if err != nil {
-		return fmt.Errorf("matrix: opening the client: %w", err)
+		return err
 	}
-	if c.UserID != user {
-		c.Close()
-		return fmt.Errorf("matrix: the stored session is for another account than %s", user)
-	}
+	checkCrossSigning(ctx, c, a.cfg.RecoveryKey, log)
+	a.mu.Lock()
+	a.client = c
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.client = nil
+		a.mu.Unlock()
+	}()
 	s := newSession(ctx, c, h, log, a.opts)
 	if dn, err := c.GetOwnDisplayName(ctx); err == nil {
 		s.me.display = dn.DisplayName
@@ -125,6 +126,42 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 		return nil
 	}
 	return fmt.Errorf("matrix: sync stopped: %w", err)
+}
+
+// open opens the account cfg describes, from its state directory, or by
+// logging in when none is stored yet.
+func open(ctx context.Context, cfg *config.Matrix, log *slog.Logger) (*rihma.Client, error) {
+	user := id.UserID(cfg.UserID)
+	local, _, err := user.Parse()
+	if err != nil || cfg.Homeserver == "" || cfg.StateDir == "" {
+		return nil, errors.New("matrix: the configuration needs a homeserver, a user id, and a state directory")
+	}
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("matrix: %w", err)
+	}
+	ro := rihma.Options{
+		Homeserver: cfg.Homeserver,
+		StateDir:   filepath.Join(cfg.StateDir, "rihma"),
+		Sessions:   rihma.FileSessionStore{Path: filepath.Join(cfg.StateDir, "session.json")},
+		DeviceName: cfg.DeviceName,
+		Logger:     zerologTo(log),
+	}
+	if !cfg.Password.IsZero() {
+		ro.Login = &mautrix.ReqLogin{
+			Type:       mautrix.AuthTypePassword,
+			Identifier: mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: local},
+			Password:   cfg.Password.Value(),
+		}
+	}
+	c, err := rihma.Open(ctx, ro)
+	if err != nil {
+		return nil, fmt.Errorf("matrix: opening the client: %w", err)
+	}
+	if c.UserID != user {
+		c.Close()
+		return nil, fmt.Errorf("matrix: the stored session is for another account than %s", user)
+	}
+	return c, nil
 }
 
 // session is one Run's connection. It is also the Conn the adapter
@@ -147,6 +184,10 @@ type session struct {
 	files   *lru[string, *event.MessageEventContent]
 	threads *lru[id.EventID, id.EventID]
 	rooms   *lru[id.EventID, id.RoomID]
+	// replyDepth is how far up a reply chain the adapter resolves.
+	replyDepth int
+	// bundles are the bundles waiting for replies.
+	bundles bundles
 
 	mu      sync.Mutex
 	stopped bool
@@ -155,7 +196,19 @@ type session struct {
 
 	dmMu sync.Mutex
 	dms  map[id.UserID]id.RoomID
+
+	// listed holds the rooms the account's m.direct names, read when a
+	// private-looking room is first checked and again once the copy is
+	// directReload old, so a room another client adds or removes is seen
+	// within that time.
+	listedMu   sync.Mutex
+	listed     map[id.RoomID]bool
+	listedLoad time.Time
 }
+
+// directReload is how old the cached m.direct may be before a check of a
+// private-looking room reads it again. A test shortens it.
+var directReload = time.Minute
 
 // The sizes of the session's caches.
 const (
@@ -173,6 +226,10 @@ func newSession(ctx context.Context, c *rihma.Client, h airut.Host, log *slog.Lo
 		threads: newLRU[id.EventID, id.EventID](keptThreads),
 		rooms:   newLRU[id.EventID, id.RoomID](keptSent),
 		dms:     map[id.UserID]id.RoomID{},
+	}
+	s.replyDepth = airut.DefaultReplyDepth
+	if o.ReplyDepth != 0 {
+		s.replyDepth = max(o.ReplyDepth, 0)
 	}
 	s.commands = map[string]bool{}
 	for _, spec := range h.Specs() {
@@ -234,22 +291,32 @@ func (s *session) onMessage(ctx context.Context, evt *event.Event) {
 		return
 	}
 	in, ok := s.parse(evt)
-	if !ok {
+	if !ok || in.reply != "" && s.answerBundle(ctx, evt, in) {
 		return
 	}
 	resp := s.responder(evt.RoomID, in.thread, evt.ID, evt.Sender)
-	if name, rest, ok := in.command(s.h.Prefix(), s.me, s.known); ok {
+	direct := s.isDirect(ctx, evt.RoomID, evt.Sender)
+	if name, rest, ok := in.command(s.h.Prefix(), s.me, s.known, direct); ok {
 		if age := time.Since(time.UnixMilli(evt.Timestamp)); age > s.opts.MaxCommandAge {
 			s.log.Info("dropped a stale command", "event", string(evt.ID), "age", age.Round(time.Second).String())
 			return
 		}
 		inv := in.invocation(s.user(ctx, evt.RoomID, evt.Sender), name, rest)
-		inv.Respond = resp
-		s.spawn(func() { s.h.Dispatch(s.ctx, inv) })
+		inv.Direct, inv.Respond = direct, resp
+		s.spawn(func() {
+			inv.ReplyChain = s.chain(s.ctx, evt.RoomID, in)
+			s.h.Dispatch(s.ctx, inv)
+		})
 		return
 	}
-	ev := in.messageEvent(s.user(ctx, evt.RoomID, evt.Sender), s.me)
-	s.spawn(func() { s.h.Deliver(s.ctx, ev, resp) })
+	ev := in.messageEvent(s.user(ctx, evt.RoomID, evt.Sender), s.me, direct)
+	s.spawn(func() {
+		// Off the sync loop: each link is a request.
+		if ev.Mentioned {
+			ev.ReplyChain = s.chain(s.ctx, evt.RoomID, in)
+		}
+		s.h.Deliver(s.ctx, ev, resp)
+	})
 }
 
 func (s *session) onReaction(ctx context.Context, evt *event.Event) {
@@ -266,6 +333,7 @@ func (s *session) onReaction(ctx context.Context, evt *event.Event) {
 		Sender:  s.user(ctx, evt.RoomID, evt.Sender),
 		Channel: channel(evt.RoomID),
 		Thread:  string(thread),
+		Direct:  s.isDirect(ctx, evt.RoomID, evt.Sender),
 		Target:  airut.MessageRef{ID: string(rel.EventID)},
 		Emoji:   normalizeEmoji(rel.Key),
 		Native:  evt,
@@ -279,13 +347,22 @@ func (s *session) onMember(_ context.Context, evt *event.Event) {
 		return
 	}
 	room, inviter := evt.RoomID, evt.Sender
-	if s.opts.AcceptInvite == nil || !s.opts.AcceptInvite(string(room), string(inviter)) {
-		s.log.Info("ignored an invite", "room", string(room))
+	inv := Invite{Room: string(room), Inviter: string(inviter), Direct: evt.Content.AsMember().IsDirect}
+	if s.opts.AcceptInvite == nil || !s.opts.AcceptInvite(inv) {
+		s.log.Info("ignored an invite", "room", string(room), "direct", inv.Direct)
 		return
 	}
 	s.spawn(func() {
 		if _, err := s.c.JoinRoomByID(s.ctx, room); err != nil {
 			s.log.Warn("could not join a room it was invited to", "room", string(room), "error_kind", errKind(err))
+			return
+		}
+		if inv.Direct {
+			s.dmMu.Lock()
+			defer s.dmMu.Unlock()
+			if err := s.recordDirect(s.ctx, inviter, room); err != nil {
+				s.log.Warn("could not record a direct room", "room", string(room), "error_kind", errKind(err))
+			}
 		}
 	})
 }

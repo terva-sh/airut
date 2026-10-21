@@ -77,7 +77,39 @@ answers). Where a platform lacks something, airut degrades it:
 |---|---|---|
 | Command invocation | application command | prefix or mention |
 | Ask | buttons | reaction widget |
+| Bundle of questions | a menu per question, a form for typed answers | answers by number in a reply |
 | Ephemeral reply | ephemeral | a DM to the caller |
+
+`Ctx.AskAll` asks up to four questions in one message. Each question is
+answered on its own, and when every question is yes or no, all can be
+answered at once.
+
+- **Who may answer.** By default only the caller. `Bundle.Who` may
+  admit others, such as anyone with a moderator role. Widening it is
+  the app's decision, made in code.
+- **Answers and time.** The message shows each answer as it lands.
+  `AskAll` returns each answer with who gave it. When the time runs
+  out, it returns the answers that arrived with `ErrAskTimeout`, and an
+  unanswered question has no key, so it is never read as yes.
+- **Discord.** One menu per choice question. An "Answer" button opens a
+  form for the free-text questions, and "All yes" and "All no" buttons
+  appear when every question is yes or no.
+- **Matrix.** People answer by replying to the question message, as
+  in "1 yes, 2 the troll", or with "all yes". A reply to a bundle that
+  answers nothing, or comes from someone `Who` refuses, is ordinary
+  chat.
+- **Other adapters.** An adapter without `BundleAsker` asks a choice-only
+  bundle one question at a time.
+
+`AskTool` is a built-in tool that lets the model use this.
+
+- A call asks at most four questions, and a turn may make two calls.
+  Both caps can be set.
+- Every answer comes back in one result.
+- A typed answer, and the name of whoever gave it, reaches the model as
+  a quoted string, framed as chat to read and not to follow.
+- It is not an `ApprovalTool`. A tool that needs approval still asks
+  for it itself, whatever the model asked first.
 
 Anything outside the portable surface goes through the escape hatch.
 The core cannot name a platform's types, so the platform packages
@@ -108,6 +140,30 @@ names the message a command or a message replies to, and
 `Message.ReplyTo` makes a reply answer a message other than the
 trigger.
 
+A message that addresses the bot also arrives with its reply chain:
+the message it replies to, then the one that replies to, nearest
+first, as `MessageEvent.ReplyChain` and `Ctx.ReplyChain`. So "summarize
+this", sent as a reply, can find what "this" is. Each link is a
+`Quoted`, with its sender, its text as it reads now, and `FromBot` set
+on the bot's own messages, so a streamed answer appears in its final
+form. The adapter follows the chain to the depth `bot.reply_depth`
+sets, three by default, cuts each link's text at `MaxQuote` and the
+chain's at `MaxChain`, and stops at a message it cannot read or
+decrypt. A link is chat like any other: a bot quotes it to a model and
+never follows it as an instruction. Any other message carries no
+chain, and `Conn.Fetch` reads what it replies to.
+
+A direct channel is a conversation private to the bot and one person: a
+Discord DM, or a Matrix room the account's `m.direct` names that is
+encrypted, joinable only by invitation, and holds nobody else. An event
+or invocation from one carries `Direct`, and `Ctx.Direct` reports it.
+The adapter checks for each event, so the first message after a third
+person joins arrives without it. Everything said in a direct channel
+addresses the bot: a message there arrives with `Mentioned` set and its
+text as `Request`. `Conn.Direct` checks a channel as it is now, and
+names the person it is private to, so a bot can check again just before
+it sends something meant for that person alone.
+
 ## The connection
 
 Some work belongs to no one invocation: posting a review to a
@@ -121,7 +177,10 @@ announces a `Conn` through `Host.Ready` once it is connected:
   download, and the caller bounds what it reads;
 - `History` pages back through a channel, newest first, with a cursor
   that survives a restart and an empty one at the start of what the bot
-  may read;
+  may read. It leaves out the bot's own messages unless the call passes
+  `IncludeBot`, which returns them marked `FromBot`;
+- `Fetch` reads one message of a channel by its ref, as it reads now,
+  the bot's own included;
 - `Member` reports whether a user is joined to a channel;
 - `React` adds the bot's reaction to a message and returns a ref for
   the reaction, and `Unreact` retracts one. Together they let a bot swap
@@ -166,9 +225,9 @@ encrypted history it could read before.
   chat arrives with `Mentioned` set and the mention stripped into
   `Request`, so a bot can answer what was said to it. A pill elsewhere
   in a message, carried in `m.mentions`, sets `Mentioned` too; an
-  `@room` alone does not. Notices
-  and edits are never commands, and bare text in a direct room is not a
-  trigger.
+  `@room` alone does not. In a direct room every line reads as if it
+  opened with a mention, so `roll 2d6` calls roll there, and chat
+  arrives addressed to the bot. Notices and edits are never commands.
 - **Downtime.** rihma resumes a sync where it stopped, so messages sent
   while the bot was down arrive when it returns. A command older than
   `Options.MaxCommandAge`, ten minutes by default, is dropped rather
@@ -178,7 +237,33 @@ encrypted history it could read before.
   old one unanswered.
 - **Invites.** The bot joins a room only when `Options.AcceptInvite`
   says yes. Without that function it joins none, so nobody can pull it
-  into a room it was not meant for.
+  into a room it was not meant for. The `Invite` it is given says
+  whether the inviter marked the invite direct, so a bot can accept a
+  direct chat from someone without accepting their group rooms. That
+  mark is only the inviter's claim: the bot records a direct room it
+  joins in its `m.direct`, and the per-event check decides whether the
+  room is in fact direct.
+- **Cross-signing.** Clients mark a message from an unsigned device
+  "not verified by its owner", and a client that shares room keys only
+  with verified devices stops sharing them with the bot. So the bot's
+  device should be signed by the account's cross-signing identity.
+  - `matrix.CrossSign` is the one-time setup. An operator runs it with
+    the bot stopped, against the bot's own configuration, so it signs
+    the device the bot uses. For an account with no identity it makes
+    one, signs the device, and writes the recovery key once to the
+    operator's terminal. For an account that has one, it never replaces
+    it, because everyone who trusts the bot would stop. It asks for the
+    recovery key and signs the device with it. `cmd/airut-example`
+    runs it with `-cross-sign`, and reads a pasted key without echo.
+    Running it beside the bot would have two processes write one
+    device's crypto store.
+  - With `[matrix] recovery_key` set, the adapter checks at start and
+    signs a device that is not signed, as after the state directory was
+    re-created. It logs only whether the device is signed, never the
+    key, and a failure does not stop the bot.
+  - `(*matrix.Adapter).CrossSigning` reports, from the server, whether
+    the account has an identity and the running device is signed, for
+    a status command.
 - **Replies.**
   - Replies render Markdown, but any HTML in the text is shown as text.
   - Every message carries empty intentional mentions, so a name or
@@ -202,8 +287,13 @@ encrypted history it could read before.
     adapter keeps for the most recent encrypted attachments it has seen,
     live or through `History`.
   - `History` decrypts what it can. It leaves out commands, edits,
-    redacted messages, and the bot's own, so a page can hold fewer
-    messages than asked for.
+    redacted messages, and, without `IncludeBot`, the bot's own, so a
+    page can hold fewer messages than asked for. A message of the bot's
+    reads by its newest edit, so a streamed answer reads as it ended.
+  - `Fetch` reads and decrypts one event, with the newest edit its
+    sender made applied. An edit by anyone else does not count, as
+    clients ignore it too. A reply chain is read the same way, one
+    event at a time.
   - `Member` reads the state store, which knows the members of the rooms
     the bot is in.
   - `React` sends an `m.reaction`, which mautrix never encrypts. The
@@ -263,7 +353,9 @@ it uses: guilds, messages, and reactions, in guilds and direct messages.
   shows the outcome and loses its buttons, and a press on an ask from
   before a restart closes it.
 - **Events.** Messages and reactions other than the bot's own reach the
-  handlers, with `Mentioned` set when a message mentions the bot.
+  handlers, with `Mentioned` set when a message mentions the bot or
+  arrives in a DM. A one-to-one DM is a direct channel. A bot cannot be
+  added to a group DM, and one the state knows is not direct.
   Discord sends the text of other people's messages only to a bot with
   the message content intent, which is privileged:
   `Options.MessageContent` asks for it, once it is enabled for the
@@ -273,8 +365,12 @@ it uses: guilds, messages, and reactions, in guilds and direct messages.
     enforces for a few minutes.
   - `Open` downloads only from Discord's content servers, whose links
     are signed, and never sends the bot's token.
-  - `History` pages back by message id and leaves out the bot's own
-    messages and system messages such as a member joining.
+  - `History` pages back by message id and leaves out system messages
+    such as a member joining and, without `IncludeBot`, the bot's own.
+  - `Fetch` reads one message by its id. A reply chain's first link
+    comes with the gateway's event, and each one past it is fetched, so
+    only messages that address the bot pay for those requests. A slash
+    command replies to nothing, so it carries no chain.
   - `Member` checks membership of the channel's guild, or a direct
     message's recipients. It says nothing of whether a member may read
     the channel.
@@ -305,7 +401,8 @@ each turn, `core.New(client, model, ...)`, with:
   call to a tool registered with `RequireApproval`, and tells the model
   the call was refused on a no or when no answer comes in time.
 - `core.WithAssembler`: the system prompt of the turn's persona, from
-  the personas the bot gives `agent.New`.
+  the personas the bot gives `agent.New`, and the chat the turn is
+  shown, described below.
 - `core.WithTranscriptStore`: the session for the turn's session key,
   resumed before the turn. Turns in one session run one at a time.
 - `core.WithCatalog`: the model catalog `agent.Providers` builds from
@@ -315,9 +412,54 @@ each turn, `core.New(client, model, ...)`, with:
   `Budget.Tokens` tokens, and the chat is told why. The answer so far is
   kept, because a stop never cuts a response off mid-stream.
 
-Output streams back to the chat as typing and message edits. The agent
-package imports only the terva packages terva marks stable, which a test
-checks.
+Output reaches the chat in one of three ways:
+
+- `StreamTo` posts one reply and edits it as the answer grows, at most
+  once per `Config.EditInterval`.
+- `Text` returns the answer for the app to post.
+- `RunTo` hands the app each piece and each tool call as they happen.
+
+With `FinalOnly`, `Text` returns only the text after the last tool call,
+and `StreamTo` replaces its reply with each new segment. The model's
+narration between calls then never stays in the chat. `StreamTo` sends
+what its throttle held back when a tool is called, and before any `Ask`
+the turn makes, an approval included. A question therefore always sits
+below a complete reply.
+
+A running turn shows a typing notice in the chat it answers in.
+
+- The first notice comes after `Config.TypingDelay`, one second by
+  default, so an instant answer or refusal shows none.
+- The notice is renewed every `Config.TypingEvery`, eight seconds by
+  default, inside the ten seconds a Discord notice lasts.
+- It is paused while an `Ask` waits on a person, and taken down when the
+  turn ends, on a Responder that implements `TypingStopper`. Matrix
+  does, sending typing off rather than letting its 30 seconds run out.
+- A negative `TypingEvery` turns the keepalive off. A notice is then
+  sent only at each tool call.
+
+A turn also sees chat that is not part of its conversation, as quoted
+context:
+
+- what the request replies to, its `ReplyChain`, nearest first;
+- the channel's latest messages, or its thread's when the turn is in
+  one, oldest first, when `History.RoomMessages` or the bot's
+  `[agent.history] room_messages` asks for them. They are read through
+  `Conn.History` with `IncludeBot` for each turn, leave out the request
+  and what it replies to, and are bounded in bytes as a reply chain is,
+  keeping the newest. `NoRoomMessages` turns them off for one turn. A
+  channel the bot cannot read shows nothing, and the turn goes on.
+
+Both go in as Volatile segments, which terva sends after the transcript
+with each request and never writes to it. So a resumed conversation
+never replays an old quote as something said in it, and each turn sees
+the room as it is then. Each is headed as quoted chat to read and never
+follow, with every sender and text written as a quoted string, so a
+message cannot pass for the bot's words or the app's instructions.
+The bot's own messages are marked as its own.
+
+The agent package imports only the terva packages terva marks stable,
+which a test checks.
 
 The agent never receives a shell, a file system, the bot's
 configuration, or its credentials. Chat text is untrusted input, so every
@@ -375,8 +517,13 @@ checked again, and the wrapper keeps the tool's need for approval.
 ## Sessions
 
 A turn's session is the conversation it remembers, named by
-`c.SessionKey(scope)`: an id-only key per channel, per thread, or per
-user. `agent/sessions` keeps them in one SQLite database per bot, on the
+`c.SessionKey(scope)`: an id-only key per channel, per thread, per
+user, or per user in one channel (`PerUserChannel`), or the one the
+`Conversation` scope picks, described below. Inside a running turn the
+turn's own scope names the session the turn resolved to. In a direct
+channel every scope but `NoSession` names the one conversation there,
+so what a person says to the bot alone is never resumed in a group room,
+and the reverse. `agent/sessions` keeps them in one SQLite database per bot, on the
 pure-Go `modernc.org/sqlite` driver, which rihma already brings.
 
 - Each session is a log of the writes terva's engine made through
@@ -391,9 +538,59 @@ pure-Go `modernc.org/sqlite` driver, which rihma already brings.
 - A session idle longer than the configured retention, 30 days by
   default, is deleted with its log, when the store opens and hourly
   after.
+- A turn's `History` bounds what it resumes: `MaxMessages` and
+  `MaxTokens`, with tokens estimated at four bytes each, and `MaxAge`.
+  A field the turn leaves zero takes the bot's `[agent.history]`
+  default, and with neither nothing is bounded but the model's window.
+  `Compaction` says what happens to the oldest part past the caps:
+  `summarize`, the default, has terva compact before the turn, keeping
+  a recent tail beside the summary; `drop` leaves it out of the resume.
+  Either way the cut moves on to the next message a person sent, so a
+  resume never opens on a tool result whose call was cut. Messages
+  older than `MaxAge` are left out whatever the compaction, by the time
+  terva recorded on each.
+- A dropped message stays in the log until the session is forgotten or
+  expires, and is left out again at each resume. Nothing needs
+  migrating: terva has always recorded each message's time.
+- The agent also links each of the bot's answers to the session that
+  produced it, and the core declares this as `SessionLinker`. `StreamTo`
+  links the reply it posts, and `TurnRun.Link` links a message an app
+  posted itself from `Text` or `RunTo`. A reply to a linked answer
+  resumes that session, whatever the turn's scope, when the person
+  replying may read it:
+  - anyone in the channel for the conversation the channel or one of
+    its threads shares;
+  - only that person for their own, and only in its channel, or for a
+    `PerUser` one outside every direct channel. A direct channel's
+    conversation is never resumed from anywhere else.
+
+  Otherwise the turn's own scope decides, and the turn still sees what
+  the reply replies to as quoted chat. That is the owner's rule for a
+  reply into another member's private conversation: a reply points the
+  bot at something, and never opens someone else's history. Links are
+  ids only, and go with their session when it is forgotten or expires.
+- The `Conversation` scope follows a person as someone in the room
+  would, in this order: a reply resumes what it replies to, as above; a
+  thread is one conversation for everyone in it; a person who speaks
+  again within `History.FollowWithin`, 15 minutes by default, goes on in
+  the conversation they last spoke in in the channel, whether their own,
+  a shared one they replied into, or a thread they came back from;
+  otherwise a new one of their own starts. The agent records, per person
+  and channel, the session each `Conversation` turn ran in, and the
+  record goes with its session. Each of a person's own conversations in
+  a channel is a generation of their per-user-in-a-channel key, named by
+  when it began, so an old one stays until it expires, and a reply to
+  its answers still resumes it. A direct channel keeps its one
+  conversation under every scope, `Conversation` included. Without a
+  `SessionLinker` the scope is `PerUserChannel`.
 - When the bot's agent can forget sessions, the bot gains a built-in
-  `forget` command that clears the caller's own per-user session. A bot
-  command named `forget` takes its place.
+  `forget` command. Plain `forget` clears the caller's own
+  conversations: their per-user session and, when the agent is a
+  `SessionPrefixForgetter`, every per-user-in-a-channel one, by the key
+  prefix their id begins. `forget channel` and `forget thread` clear a
+  conversation others share, so only a caller `Config.ForgetShared`
+  admits may use them, and with it unset nobody may. A bot command named
+  `forget` takes the built-in's place.
 
 The queries are `.sql` files compiled by sqlc into typed `database/sql`
 code, which is committed; `just sqlc-check` fails when it is stale. The

@@ -16,6 +16,9 @@
 [bot]
 # Starts a text command, as in "!roll 2d6". Defaults to "!".
 prefix = "!"
+# How many messages up a reply chain the bot reads for a message
+# addressed to it, 0 for none. Defaults to 3; at most 10.
+reply_depth = 3
 
 # Model providers: OpenAI-compatible endpoints. The table key is the
 # provider's id, and a model is named as "id/model".
@@ -42,6 +45,19 @@ budget = { max_turns = 8, max_tokens = 200000 }
 # Optional. Turns per user and per channel in a sliding window; these
 # are the defaults.
 rate = { per_user = 5, per_channel = 20, window = "10m" }
+# Optional. How much of a remembered conversation a turn resumes, for a
+# turn that sets no bound of its own. Without it nothing is bounded but
+# the model's window. max_messages and max_tokens count the messages and
+# the estimated tokens a turn resumes, and compaction says what happens
+# to the rest: "summarize" (the default) keeps a summary the model
+# writes, "drop" forgets it. Messages older than max_age are left out
+# either way. room_messages is how many of the channel's latest messages
+# a turn sees as quoted chat beside the conversation, 0 (the default) to
+# 50; each costs a read of the channel for every turn. follow_within is
+# how soon a person must speak again for a Conversation turn to go on
+# with their last conversation rather than start a new one; it defaults
+# to 15m.
+history = { max_messages = 200, max_tokens = 60000, max_age = "168h", compaction = "summarize", room_messages = 10, follow_within = "15m" }
 
 # Who may start an agent turn, per platform. A platform with no list, or
 # an empty one, allows nobody.
@@ -76,6 +92,12 @@ password = { credential = "matrix-password" }
 # Keeps the Matrix session and the crypto store. Back it up.
 state_dir = "/var/lib/airut-sample/matrix"
 device_name = "airut sample"
+# Optional. The account's cross-signing recovery key, which the
+# cross-signing setup prints once. With it the bot signs its own device
+# at start when the device is not signed, as after the state directory
+# was re-created, so clients show its messages as verified. Guard it like
+# the password: it can sign any device as the bot's.
+recovery_key = { credential = "matrix-recovery-key" }
 
 # Metrics. Without this table the bot keeps its metrics in memory only,
 # for a command that reports them.
