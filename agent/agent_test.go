@@ -566,3 +566,43 @@ func TestRestrictedToolsThroughTheEngine(t *testing.T) {
 		}
 	}
 }
+
+// TestAskToolIsNoApproval has the model ask, through the ask tool,
+// whether it may run a tool that needs approval, and get a yes. The
+// gate still puts its own question, and a no to that one stops the tool.
+func TestAskToolIsNoApproval(t *testing.T) {
+	e := newEnv(t, nil, nil, airut.Config{})
+	e.bot.Command("risky", "Roll, with approval", func(cx *airut.Ctx, a rollArgs) error {
+		e.mu.Lock()
+		e.ran = append(e.ran, a.Dice)
+		e.mu.Unlock()
+		return nil
+	}).AsTool().RequireApproval()
+	tools := append(e.bot.Tools("risky"), airut.AskTool(airut.AskToolOptions{}))
+	e.ask(airut.Turn{Prompt: "roll", Tools: tools})
+	e.model.play(
+		call("c1", "ask", `{"questions":[{"key":"ok","text":"May I roll the risky dice?","choices":["yes","no"]}]}`),
+		call("c2", "risky", `{"dice":"1d20"}`),
+		say("done"),
+	)
+	a := airuttest.Start(t, e.bot)
+	a.OnAskAll(func(b airut.Bundle) []airuttest.Answer {
+		return []airuttest.Answer{{By: airut.User{Platform: airuttest.Platform, ID: "user-1"}, Key: "ok", Text: "yes"}}
+	})
+	var asked []string
+	a.OnAsk(func(q airut.Ask) (string, error) {
+		asked = append(asked, q.Question)
+		return "no", nil
+	})
+	a.Text("!ask")
+	if len(asked) != 1 || !strings.Contains(asked[0], "risky") {
+		t.Fatalf("the gate asked %q; a yes to the model's own question must not stand in for it", asked)
+	}
+	if got := e.rolls(); len(got) != 0 {
+		t.Fatalf("the tool ran %v after the gate's question was answered no", got)
+	}
+	reqs := e.model.requests()
+	if got := toolResults(reqs[len(reqs)-1]); !strings.Contains(got["c1"], `ok: yes, chosen by "user-1"`) || !strings.Contains(got["c2"], "declined") {
+		t.Fatalf("the model read %q", got)
+	}
+}
