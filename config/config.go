@@ -146,6 +146,11 @@ type Judge struct {
 	CachePrompt bool
 	// Timeout bounds a call; zero takes the judge's default.
 	Timeout time.Duration
+	// MaxInputTokens caps each call's whole request, estimated at
+	// BytesPerToken bytes a token; zero caps nothing, and zero
+	// BytesPerToken takes the judge's default.
+	MaxInputTokens int
+	BytesPerToken  float64
 	// Rate caps the judgements per channel; zero caps nothing.
 	Rate JudgeRate
 }
@@ -285,12 +290,14 @@ type fileMemory struct {
 }
 
 type fileJudge struct {
-	Model       string `toml:"model"`
-	Concurrency int    `toml:"concurrency"`
-	Output      string `toml:"output"`
-	Slots       int    `toml:"slots"`
-	CachePrompt bool   `toml:"cache_prompt"`
-	Timeout     string `toml:"timeout"`
+	Model       string  `toml:"model"`
+	Concurrency int     `toml:"concurrency"`
+	Output      string  `toml:"output"`
+	Slots       int     `toml:"slots"`
+	CachePrompt bool    `toml:"cache_prompt"`
+	Timeout     string  `toml:"timeout"`
+	MaxInput    int     `toml:"max_input_tokens"`
+	BytesPerTok float64 `toml:"bytes_per_token"`
 	Rate        *struct {
 		PerChannel int    `toml:"per_channel"`
 		Window     string `toml:"window"`
@@ -533,7 +540,14 @@ func modelRef(p *problems, key, raw string, providers []Provider) ModelRef {
 
 func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
 	j := &Judge{Model: modelRef(p, "agent.judge.model", f.Model, providers),
-		Concurrency: f.Concurrency, Output: f.Output, Slots: f.Slots, CachePrompt: f.CachePrompt}
+		Concurrency: f.Concurrency, Output: f.Output, Slots: f.Slots, CachePrompt: f.CachePrompt,
+		MaxInputTokens: f.MaxInput, BytesPerToken: f.BytesPerTok}
+	if f.MaxInput < 0 {
+		p.add("agent.judge.max_input_tokens", "must not be negative")
+	}
+	if f.BytesPerTok < 0 {
+		p.add("agent.judge.bytes_per_token", "must not be negative")
+	}
 	if f.Concurrency < 0 {
 		p.add("agent.judge.concurrency", "must not be negative")
 	}

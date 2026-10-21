@@ -2,6 +2,7 @@ package airut
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -72,7 +73,43 @@ func TestChimeRechecksAfterStayingOutWaits(t *testing.T) {
 		t.Error("the handler ran on a yes the room overtook")
 	default:
 	}
-	if s, _ := b.metrics.Get("airut_chime_total", "persona", "", "outcome", "stale"); s.Value != 1 {
+	if s, _ := b.metrics.Get("airut_chime_total", "persona", "", "outcome", "stale", "engaged", "false"); s.Value != 1 {
 		t.Errorf("stale counted %v times", s.Value)
+	}
+}
+
+// A follow-up turn checks the sender's access at its start as well, since
+// what a check reads, such as a room's members, can change after Chime
+// asked the gate.
+func TestFollowUpTurnsCheckTheSendersAccess(t *testing.T) {
+	g := newGate(Gate{Access: map[Platform]Access{"test": {Users: []string{"alice"}}}})
+	k := &chime{}
+	c := &Ctx{ctx: context.Background(), chime: k, followUp: true,
+		inv: Invocation{Caller: User{Platform: "test", ID: "bob"}, Channel: Channel{Platform: "test", ID: "c"}}}
+	var rf *Refusal
+	if err := g.check(c); !errors.As(err, &rf) || rf.Reason != RefusedAccess {
+		t.Errorf("bob's follow-up: %v", err)
+	}
+	c.inv.Caller.ID = "alice"
+	if err := g.check(c); err != nil {
+		t.Errorf("alice's follow-up: %v", err)
+	}
+}
+
+// The bot's messages with no text, such as files, are never remembered
+// as senders, since they never join the window that forgets them.
+func TestChimeForgetsNothingItNeverRemembered(t *testing.T) {
+	b := New(Config{Judge: judgeFunc(func(*Ctx, Judgement) (Verdict, error) { return Verdict{Decision: No}, nil })})
+	ch := Channel{Platform: "test", ID: "c"}
+	b.Chime(ChimeOptions{Channels: []Channel{ch}, MaxPerHour: 1, Handler: func(*Ctx, Chimed) error { return nil }})
+	k := b.chimes[roomKey(ch)]
+	c := &Ctx{ctx: context.Background(), bot: b, inv: Invocation{Channel: ch}}
+	for i := range 100 {
+		k.said(c, MessageRef{ID: "file-" + string(rune('a'+i%26)) + string(rune('a'+i/26))}, "")
+	}
+	k.said(c, MessageRef{ID: "text"}, "hello")
+	room := k.rooms[roomKey(ch)]
+	if len(room.senders) != 1 || room.senders["text"] != chimeBot {
+		t.Errorf("the room remembers %d senders: %v", len(room.senders), room.senders)
 	}
 }

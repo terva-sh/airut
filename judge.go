@@ -37,6 +37,10 @@ type Judgement struct {
 	// one with the same key replaces it, and it abstains with
 	// ErrSuperseded. Empty means the channel.
 	Key string
+	// InputTokens caps the whole request this judgement makes, its
+	// instructions, chat, and reply together, below the judge's own cap. A
+	// JudgeLimit honours it. Zero leaves the judge's.
+	InputTokens int
 }
 
 // Verdict is a judge's answer.
@@ -56,6 +60,20 @@ type Verdict struct {
 // abstention.
 type Judge interface {
 	Judge(c *Ctx, j Judgement) (Verdict, error)
+}
+
+// JudgeLimit is a Judge that caps the request a judgement makes, such as
+// to fit a model server's context slot. Chime asks it before each
+// judgement, and drops the oldest half of its context until the
+// judgement fits, so the prompt's opening changes only on a drop. The
+// judge still enforces the cap on whatever it is given.
+type JudgeLimit interface {
+	Judge
+	// InputTokens is the judge's own cap, in tokens, or zero for none.
+	InputTokens() int
+	// Fits reports whether j's whole request stays within the smaller of
+	// InputTokens and j.InputTokens.
+	Fits(j Judgement) bool
 }
 
 // JudgeRate caps the judgements one channel may ask for in any Window.

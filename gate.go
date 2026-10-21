@@ -98,10 +98,20 @@ func errRefusedAccess() *Refusal {
 // membership check that fails refuses the turn unless another channel
 // admits the caller; allows logs it.
 //
-// A turn a Chime handler starts is the channel's, since nobody asked
-// for it: the channel must be listed in Access.Channels, and the turn
-// takes one of PerChannel's turns and none of the sender's.
+// A turn a Chime handler starts in a cold channel is the channel's,
+// since nobody asked for it: the channel must be listed in
+// Access.Channels, and the turn takes one of PerChannel's turns and none
+// of the sender's. One it starts as a follow-up is the sender's, as a
+// mention's is, and takes none of PerChannel's.
 func (g *gate) check(c *Ctx) error {
+	if c.followUp {
+		if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
+			return errRefusedAccess()
+		}
+		mine := g.limits()
+		mine.PerChannel = 0
+		return g.rate.take(mine, c.inv)
+	}
 	if c.chime != nil {
 		ch := c.inv.Channel
 		if !slices.Contains(g.cfg.Access[ch.Platform].Channels, ch.ID) {
@@ -115,6 +125,21 @@ func (g *gate) check(c *Ctx) error {
 		return errRefusedAccess()
 	}
 	return g.rate.take(g.limits(), c.inv)
+}
+
+// admits reports why a follow-up turn for c would be refused now,
+// without counting one: RefusedAccess, RefusedRate, or "" when it would
+// start.
+func (g *gate) admits(c *Ctx) string {
+	if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
+		return RefusedAccess
+	}
+	cfg := g.limits()
+	user := string(c.inv.Caller.Platform) + "/user/" + c.inv.Caller.ID
+	if g.rate.wait(user, cfg.PerUser, cfg.Window) > 0 {
+		return RefusedRate
+	}
+	return ""
 }
 
 // budget fills the zero fields of b from the gate's default.
@@ -273,6 +298,27 @@ func (l *limiter) atCap(key string, max int, window time.Duration) bool {
 	defer l.mu.Unlock()
 	_, full := l.full(key, max, l.now(), window)
 	return full
+}
+
+// wait is how long until key has fewer than max starts inside window,
+// or zero when it has already.
+func (l *limiter) wait(key string, max int, window time.Duration) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	d, _ := l.full(key, max, l.now(), window)
+	return d
+}
+
+// left is how many more starts key may have inside window.
+func (l *limiter) left(key string, max int, window time.Duration) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.full(key, max, l.now(), window)
+	// A cap lowered below what the window already holds leaves none.
+	if n := max - len(l.seen[key]); n > 0 {
+		return n
+	}
+	return 0
 }
 
 // full drops key's starts that left the window and reports whether

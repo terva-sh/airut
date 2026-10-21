@@ -98,9 +98,12 @@ type Bot struct {
 	onReaction []eventHandler
 	onReady    []func(context.Context, Conn)
 	// conns are the connections adapters announced, by platform.
-	conns    map[Platform]Conn
-	gate     *gate
-	judged   *limiter // judgements per channel, under Config.JudgeRate
+	conns  map[Platform]Conn
+	gate   *gate
+	judged *limiter // judgements per channel, under Config.JudgeRate
+	// chimes are the Chime listeners, by the roomKey of each of their
+	// channels. Chime fills it before Run, so it is only read after.
+	chimes   map[string]*chime
 	running  bool
 	inflight sync.WaitGroup
 	metrics  *Metrics

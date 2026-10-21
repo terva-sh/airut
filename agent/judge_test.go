@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -173,6 +174,9 @@ func TestJudgeAsksTheServer(t *testing.T) {
 			if v, _ := jb.bot.Metrics().Get("airut_judge_tokens_total", "persona", "chime"); v.Value != 50 {
 				t.Errorf("airut_judge_tokens_total = %v", v.Value)
 			}
+			if v, _ := jb.bot.Metrics().Get("airut_judge_request_seconds", "model", "small", "outcome", "ok"); v.Count != 1 {
+				t.Errorf("airut_judge_request_seconds counted %d calls", v.Count)
+			}
 		})
 	}
 }
@@ -265,6 +269,14 @@ func TestJudgeFailuresAbstain(t *testing.T) {
 	logMu.Unlock()
 	if !strings.Contains(logs, "error_kind=status_500") || strings.Contains(logs, "secret") {
 		t.Errorf("the logs:\n%s", logs)
+	}
+	// Each call is timed by how it ended; a reply that is no verdict is
+	// still a call that succeeded.
+	m := jb.bot.Metrics()
+	for _, o := range []string{"ok", "status_500", "timeout"} {
+		if v, _ := m.Get("airut_judge_request_seconds", "model", "small", "outcome", o); v.Count != 1 {
+			t.Errorf("airut_judge_request_seconds{outcome=%s} counted %d calls", o, v.Count)
+		}
 	}
 	// A persona the judge was not given abstains without a call.
 	n := len(s.requests())
@@ -397,6 +409,9 @@ func TestNewJudgeChecksItsOptions(t *testing.T) {
 		{BaseURL: "http://x", Model: ""},
 		{BaseURL: "http://x", Model: "m", Output: "xml"},
 		{BaseURL: "http://x", Model: "m", Concurrency: -1},
+		{BaseURL: "http://x", Model: "m", MaxInputTokens: -1},
+		{BaseURL: "http://x", Model: "m", BytesPerToken: -1},
+		{BaseURL: "http://x", Model: "m", MaxInputTokens: 256},
 	} {
 		if _, err := NewJudge(o); err == nil {
 			t.Errorf("NewJudge(%+v) accepted it", o)
@@ -417,3 +432,116 @@ func slogTo(write func([]byte)) *slog.Logger {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestJudgeKeepsWithinItsInputCap(t *testing.T) {
+	personas := map[string]string{"p": "Decide."}
+	base := func(o JudgeOptions) *Judge {
+		t.Helper()
+		o.BaseURL, o.Model, o.Personas, o.BytesPerToken = "http://x", "m", personas, 1
+		if o.MaxTokens == 0 {
+			o.MaxTokens = 10
+		}
+		g, err := NewJudge(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	var context []airut.Quoted
+	for i := range 10 {
+		context = append(context, airut.Quoted{Ref: airut.MessageRef{ID: strconv.Itoa(i)}, Text: strconv.Itoa(i) + strings.Repeat("x", 99)})
+	}
+	j := airut.Judgement{Persona: "p", Prompt: "Speak?", Context: context, Batch: judgeBatch}
+	bare := j
+	bare.Context = nil
+	uncapped := base(JudgeOptions{})
+	room := uncapped.estimate(judgePrompt("Decide.", bare)) + 350
+	if !uncapped.Fits(j) || uncapped.InputTokens() != 0 {
+		t.Error("an uncapped judge refused a judgement")
+	}
+	// The reply's tokens are reserved, and bytes count at 3 a token by
+	// default.
+	wide := base(JudgeOptions{MaxTokens: 200})
+	if d := wide.estimate(judgePrompt("Decide.", bare)) - uncapped.estimate(judgePrompt("Decide.", bare)); d != 190 {
+		t.Errorf("200 reply tokens instead of 10 estimate %d more", d)
+	}
+	if g, _ := NewJudge(JudgeOptions{BaseURL: "http://x", Model: "m"}); g.o.BytesPerToken != 3 {
+		t.Errorf("BytesPerToken defaults to %v", g.o.BytesPerToken)
+	}
+
+	// Over the cap the oldest context goes first, and what is left fits.
+	g := base(JudgeOptions{MaxInputTokens: room})
+	if g.InputTokens() != room || g.Fits(j) {
+		t.Fatalf("InputTokens %d, and the full judgement fits", g.InputTokens())
+	}
+	// A persona the judge lacks abstains without a call, so it fits.
+	if unknown := j; func() bool { unknown.Persona = "other"; return !g.Fits(unknown) }() {
+		t.Error("a judgement for a persona the judge lacks does not fit")
+	}
+	fit, _ := g.fit("Decide.", j)
+	if len(fit.Context) == 0 || len(fit.Context) >= 10 || fit.Context[len(fit.Context)-1].Ref.ID != "9" || !g.Fits(fit) {
+		t.Errorf("fit kept %d messages, ending %v", len(fit.Context), fit.Context)
+	}
+	if len(j.Context) != 10 {
+		t.Error("fit changed the caller's context")
+	}
+
+	// A judgement's own cap, when lower, is the one kept.
+	low := j
+	low.InputTokens = room - 200
+	if got, _ := g.fit("Decide.", low); len(got.Context) >= len(fit.Context) {
+		t.Errorf("InputTokens %d kept %d messages, as many as the judge's cap", low.InputTokens, len(got.Context))
+	}
+
+	// A batch over the cap alone is cut, the longest quote first, until
+	// the request fits, and the context dropped.
+	uneven := bare
+	uneven.Batch = []airut.Quoted{{Ref: airut.MessageRef{ID: "long"}, Text: strings.Repeat("y", 300)}, {Ref: airut.MessageRef{ID: "short"}, Text: "ok"}}
+	unevenAll := uneven
+	unevenAll.Context = context
+	need := uncapped.estimate(judgePrompt("Decide.", uneven))
+	tight := base(JudgeOptions{MaxInputTokens: need - 50})
+	cut, ok := tight.fit("Decide.", unevenAll)
+	if !ok || len(cut.Context) != 0 || !strings.HasSuffix(cut.Batch[0].Text, "…") || cut.Batch[1].Text != "ok" || !tight.Fits(cut) {
+		t.Errorf("the cut judgement: %+v, %v", cut, ok)
+	}
+	if uneven.Batch[0].Text != strings.Repeat("y", 300) {
+		t.Error("fit changed the caller's batch")
+	}
+
+	// A request whose instructions alone are over the cap is not made.
+	empty := uneven
+	empty.Batch = []airut.Quoted{{Text: ""}, {Text: ""}}
+	tiny := base(JudgeOptions{MaxInputTokens: uncapped.estimate(judgePrompt("Decide.", empty)) - 1})
+	if _, ok := tiny.fit("Decide.", uneven); ok {
+		t.Error("a judgement over the cap with no chat fits")
+	}
+	s0, url0 := newJudgeServer(t)
+	g0, _ := NewJudge(JudgeOptions{BaseURL: url0, Model: "m", Personas: personas, MaxTokens: 10, BytesPerToken: 1,
+		MaxInputTokens: uncapped.estimate(judgePrompt("Decide.", empty)) - 1})
+	jb0 := newJudgeBot(t, g0, uneven)
+	jb0.a.Text("!judge")
+	if !errors.Is(jb0.errs[0], ErrJudgementTooLarge) || jb0.got[0].Decision != airut.Abstain || len(s0.requests()) != 0 {
+		t.Errorf("a judgement too large for the cap: %+v, %v, after %d calls", jb0.got[0], jb0.errs[0], len(s0.requests()))
+	}
+
+	// The call sends what fits, and logs the server's count beside the
+	// estimate, never the chat.
+	s, url := newJudgeServer(t)
+	var judgeLogs strings.Builder
+	var logMu sync.Mutex
+	g2, _ := NewJudge(JudgeOptions{BaseURL: url, Model: "m", Personas: personas, MaxTokens: 10, BytesPerToken: 1, MaxInputTokens: room,
+		Logger: slogTo(func(p []byte) { logMu.Lock(); defer logMu.Unlock(); judgeLogs.Write(p) })})
+	jb := newJudgeBot(t, g2, j)
+	jb.a.Text("!judge")
+	user := s.requests()[0]["messages"].([]any)[1].(map[string]any)["content"].(string)
+	if strings.Contains(user, "0xxx") || !strings.Contains(user, "9xxx") {
+		t.Errorf("the request kept the oldest context or dropped the newest:\n%s", user)
+	}
+	logMu.Lock()
+	logs := judgeLogs.String()
+	logMu.Unlock()
+	if !strings.Contains(logs, "prompt_tokens=40") || !strings.Contains(logs, "estimated_tokens=") || !strings.Contains(logs, "outcome=ok") || strings.Contains(logs, "xxx") {
+		t.Errorf("the log:\n%s", logs)
+	}
+}

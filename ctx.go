@@ -23,9 +23,11 @@ type Ctx struct {
 	capture *capture
 	// turn is set while an agent turn started from this invocation runs.
 	turn *turnState
-	// chime is set in a Chime handler: its agent turns are the channel's,
-	// and its replies are remembered to count a miss.
-	chime *chime
+	// chime is set in a Chime handler: its replies are remembered to
+	// count a miss, and its agent turns are the channel's unless followUp
+	// is set, when they are the sender's.
+	chime    *chime
+	followUp bool
 	// chimed is set in a tool an agent turn of a Chime handler calls,
 	// which nobody asked for either.
 	chimed bool
@@ -134,6 +136,9 @@ func (c *Ctx) Send(m Message) (MessageRef, error) {
 	if err == nil && c.chime != nil {
 		c.chime.sentBy(c.inv.Channel.Platform, ref)
 	}
+	if k := c.bot.chimes[roomKey(c.inv.Channel)]; err == nil && k != nil && !m.Private {
+		k.said(c, ref, m.Text)
+	}
 	return ref, err
 }
 
@@ -143,7 +148,11 @@ func (c *Ctx) Edit(ref MessageRef, text string) error {
 		c.capture.edit(ref, text)
 		return nil
 	}
-	return c.resp.Edit(c.ctx, ref, Message{Text: text})
+	err := c.resp.Edit(c.ctx, ref, Message{Text: text})
+	if k := c.bot.chimes[roomKey(c.inv.Channel)]; err == nil && k != nil {
+		k.edited(c, ref, text)
+	}
+	return err
 }
 
 // React adds an emoji reaction to a message.

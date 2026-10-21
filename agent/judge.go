@@ -9,7 +9,9 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +41,7 @@ const (
 const (
 	defaultJudgeTimeout   = 30 * time.Second
 	defaultJudgeMaxTokens = 256
+	defaultBytesPerToken  = 3
 	maxReason             = 200
 )
 
@@ -71,12 +74,26 @@ type JudgeOptions struct {
 	Timeout time.Duration
 	// MaxTokens caps the reply. Zero means 256.
 	MaxTokens int
+	// MaxInputTokens caps each call's whole request, its instructions,
+	// chat, and reserved reply together, so it fits a model server's
+	// context slot. The judge has no tokenizer, so it estimates one token
+	// per BytesPerToken bytes, 3 by default, which overestimates English
+	// on common tokenizers. Over the cap it drops the oldest context, then
+	// cuts the batch's longest quote until the request fits, and abstains
+	// with ErrJudgementTooLarge, without a call, when it cannot. Zero caps
+	// nothing.
+	MaxInputTokens int
+	BytesPerToken  float64
 	// HTTP is the client for BaseURL. Nil means one with no timeout of
 	// its own, as Timeout bounds every call.
 	HTTP *http.Client
 	// Logger receives counts and kinds, never text. Nil discards them.
 	Logger *slog.Logger
 }
+
+// ErrJudgementTooLarge is the error of a judgement whose request would
+// not fit the judge's input cap even with its chat cut to nothing.
+var ErrJudgementTooLarge = errors.New("agent: the judgement does not fit the judge's input cap")
 
 // Judge decides airut's judgements on a small model, with one call and
 // no tools each. It implements airut.Judge.
@@ -85,7 +102,76 @@ type Judge struct {
 	queue *queue
 }
 
-var _ airut.Judge = (*Judge)(nil)
+var _ airut.JudgeLimit = (*Judge)(nil)
+
+// InputTokens is the judge's cap on a call's whole request, or zero.
+func (g *Judge) InputTokens() int { return g.o.MaxInputTokens }
+
+// Fits reports whether j's request stays within the judge's cap and
+// j.InputTokens, by the judge's estimate. A persona the judge does not
+// have fits, since the judgement abstains without a call.
+func (g *Judge) Fits(j airut.Judgement) bool {
+	persona, ok := g.o.Personas[j.Persona]
+	if !ok {
+		return true
+	}
+	limit := g.limit(j)
+	return limit == 0 || g.estimate(judgePrompt(persona, j)) <= limit
+}
+
+// limit is the smaller cap of the judge's and j's, or zero for none.
+func (g *Judge) limit(j airut.Judgement) int {
+	switch {
+	case g.o.MaxInputTokens == 0:
+		return j.InputTokens
+	case j.InputTokens == 0:
+		return g.o.MaxInputTokens
+	}
+	return min(g.o.MaxInputTokens, j.InputTokens)
+}
+
+// estimate is the tokens a request takes by the judge's estimate, the
+// reserved reply and a little for the chat template included.
+func (g *Judge) estimate(system, user string) int {
+	const template = 64
+	return int(math.Ceil(float64(len(system)+len(user))/g.o.BytesPerToken)) + template + g.o.MaxTokens
+}
+
+// fit drops j's oldest context, then cuts the longest of its batch's
+// quotes, until it fits the cap. It reports false when the request does
+// not fit even with every quote cut to nothing, as when the
+// instructions alone are over the cap.
+func (g *Judge) fit(persona string, j airut.Judgement) (airut.Judgement, bool) {
+	limit := g.limit(j)
+	if limit == 0 {
+		return j, true
+	}
+	for len(j.Context) > 0 && g.estimate(judgePrompt(persona, j)) > limit {
+		j.Context = j.Context[1:]
+	}
+	j.Batch = slices.Clone(j.Batch)
+	for over := g.estimate(judgePrompt(persona, j)) - limit; over > 0; over = g.estimate(judgePrompt(persona, j)) - limit {
+		i := -1
+		for k, q := range j.Batch {
+			if q.Text != "" && (i < 0 || len(q.Text) > len(j.Batch[i].Text)) {
+				i = k
+			}
+		}
+		if i < 0 {
+			return j, false
+		}
+		// What is over, in bytes, and enough for the mark and its quoting,
+		// so each pass shortens the request.
+		cut := int(math.Ceil(float64(over)*g.o.BytesPerToken)) + 8
+		q := &j.Batch[i]
+		if n := len(q.Text) - cut; n > 0 {
+			q.Text = strings.ToValidUTF8(q.Text[:n], "") + "…"
+		} else {
+			q.Text = ""
+		}
+	}
+	return j, true
+}
 
 // NewJudge returns a Judge. It makes no network request.
 func NewJudge(o JudgeOptions) (*Judge, error) {
@@ -94,7 +180,7 @@ func NewJudge(o JudgeOptions) (*Judge, error) {
 		return nil, errors.New("agent: a judge needs a BaseURL or a Client")
 	case o.Model == "":
 		return nil, errors.New("agent: a judge needs a Model")
-	case o.Concurrency < 0, o.Slots < 0, o.Timeout < 0, o.MaxTokens < 0:
+	case o.Concurrency < 0, o.Slots < 0, o.Timeout < 0, o.MaxTokens < 0, o.MaxInputTokens < 0, o.BytesPerToken < 0:
 		return nil, errors.New("agent: a judge's limits cannot be negative")
 	}
 	switch o.Output {
@@ -112,6 +198,12 @@ func NewJudge(o JudgeOptions) (*Judge, error) {
 	}
 	if o.MaxTokens == 0 {
 		o.MaxTokens = defaultJudgeMaxTokens
+	}
+	if o.BytesPerToken == 0 {
+		o.BytesPerToken = defaultBytesPerToken
+	}
+	if o.MaxInputTokens > 0 && o.MaxInputTokens <= o.MaxTokens {
+		return nil, errors.New("agent: a judge's MaxInputTokens must leave room beyond MaxTokens")
 	}
 	if o.HTTP == nil {
 		o.HTTP = &http.Client{}
@@ -136,7 +228,7 @@ func OpenJudge(c *config.Config, personas map[string]string, log *slog.Logger) (
 			return NewJudge(JudgeOptions{
 				BaseURL: p.BaseURL, APIKey: p.APIKey.Value(), Model: j.Model.Model, Personas: personas,
 				Concurrency: j.Concurrency, Output: j.Output, Slots: j.Slots, CachePrompt: j.CachePrompt,
-				Timeout: j.Timeout, Logger: log,
+				Timeout: j.Timeout, MaxInputTokens: j.MaxInputTokens, BytesPerToken: j.BytesPerToken, Logger: log,
 			})
 		}
 	}
@@ -149,6 +241,12 @@ func (g *Judge) Judge(c *airut.Ctx, j airut.Judgement) (airut.Verdict, error) {
 	if !ok {
 		return airut.Verdict{}, fmt.Errorf("agent: no judge persona %q", j.Persona)
 	}
+	j, fits := g.fit(persona, j)
+	if !fits {
+		// Sent anyway, it would overflow the server's slot.
+		g.o.Logger.Info("judge call skipped", "invocation", c.ID(), "persona", j.Persona, "error_kind", "too_large")
+		return airut.Verdict{}, ErrJudgementTooLarge
+	}
 	ctx, cancel := context.WithTimeout(c.Context(), g.o.Timeout)
 	defer cancel()
 	release, err := g.queue.acquire(ctx, j.Key)
@@ -159,12 +257,25 @@ func (g *Judge) Judge(c *airut.Ctx, j airut.Judgement) (airut.Verdict, error) {
 	system, user := judgePrompt(persona, j)
 	var reply string
 	var usage provider.Usage
+	called := time.Now()
 	if g.o.BaseURL != "" {
 		reply, usage, err = g.chat(ctx, system, user, j)
 	} else {
 		reply, usage, err = g.stream(ctx, system, user)
 	}
+	took, result := time.Since(called), "ok"
+	if err != nil {
+		result = judgeErrKind(err)
+	}
+	// The call alone, without the wait for a free slot that
+	// airut_judge_seconds includes.
+	c.Metrics().Observe("airut_judge_request_seconds", took, "model", g.o.Model, "outcome", result)
 	c.Metrics().Add("airut_judge_tokens_total", float64(usage.InputTokens+usage.OutputTokens), "persona", j.Persona)
+	// The estimate beside the server's own count shows how close the cap
+	// runs; both are counts, never text.
+	g.o.Logger.Debug("judge request", "invocation", c.ID(), "persona", j.Persona, "context", len(j.Context),
+		"prompt_tokens", usage.InputTokens, "estimated_tokens", g.estimate(system, user), "limit", g.limit(j),
+		"ms", took.Milliseconds(), "outcome", result)
 	if err != nil {
 		g.o.Logger.Info("judge call failed", "invocation", c.ID(), "error_kind", judgeErrKind(err))
 		return airut.Verdict{}, err

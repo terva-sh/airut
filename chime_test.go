@@ -100,8 +100,14 @@ type chimed struct {
 // before the run is reported.
 func startChime(t *testing.T, cfg airut.Config, o airut.ChimeOptions) (*airuttest.Adapter, *scripted, chan chimed, *airut.Bot, *lockedBuffer) {
 	t.Helper()
+	return startChimeWith(t, cfg, o, func(j *scripted) airut.Judge { return j })
+}
+
+// startChimeWith is startChime with the scripted judge wrapped.
+func startChimeWith(t *testing.T, cfg airut.Config, o airut.ChimeOptions, wrap func(*scripted) airut.Judge) (*airuttest.Adapter, *scripted, chan chimed, *airut.Bot, *lockedBuffer) {
+	t.Helper()
 	j := newScripted()
-	cfg.Judge = j
+	cfg.Judge = wrap(j)
 	b, logs := newBot(cfg)
 	ran := make(chan chimed, 16)
 	h := o.Handler
@@ -149,9 +155,15 @@ func noRun(t *testing.T, ran chan chimed) {
 	}
 }
 
+// outcome is how often the round outcome o has been counted, engaged
+// or not.
 func outcome(b *airut.Bot, o string) float64 {
-	s, _ := b.Metrics().Get("airut_chime_total", "persona", "chime", "outcome", o)
-	return s.Value
+	n := 0.0
+	for _, e := range []string{"false", "true"} {
+		s, _ := b.Metrics().Get("airut_chime_total", "persona", "chime", "outcome", o, "engaged", e)
+		n += s.Value
+	}
+	return n
 }
 
 // waitOutcome waits until the round outcome o has been counted n times.
@@ -249,7 +261,8 @@ func TestChimeJudgesOnlyWhatItShould(t *testing.T) {
 	a.Mention("and that?", airuttest.As(alice))
 	a.Text("and this", airuttest.As(bob))
 	got := j.next(t)
-	if !slices.Equal(quoted(got.Context), []string{airuttest.BotName + ": what is this?"}) ||
+	// The command's reply is the bot's, and read as such.
+	if !slices.Equal(quoted(got.Context), []string{"rolled 1d6 x1", airuttest.BotName + ": what is this?"}) || !got.Context[0].FromBot ||
 		!slices.Equal(quoted(got.Batch), []string{airuttest.BotName + ": and that?", "and this"}) {
 		t.Fatalf("batch %q after %q", quoted(got.Batch), quoted(got.Context))
 	}
@@ -346,23 +359,66 @@ func TestChimeStaysOut(t *testing.T) {
 	waitRan(t, ran)
 }
 
-func TestChimeKeepsToMaxPerHourAndCooldown(t *testing.T) {
-	a, j, ran, b, _ := startChime(t, airut.Config{}, airut.ChimeOptions{MaxPerHour: 1})
+func TestChimeDefersWhatItCannotJudgeYet(t *testing.T) {
+	// A message that arrives while the handler runs is judged after it,
+	// with the earlier batch as context.
+	entered, release := make(chan struct{}), make(chan struct{})
+	a, j, ran, _, _ := startChime(t, airut.Config{}, airut.ChimeOptions{Handler: func(*airut.Ctx, airut.Chimed) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}})
 	a.Text("one", airuttest.As(alice))
 	j.answers <- yes(j.next(t).Batch[0])
+	<-entered
+	a.Text("two", airuttest.As(bob))
+	j.none(t, 150*time.Millisecond)
+	close(release)
 	waitRan(t, ran)
-	// At its cap the channel is not judged at all.
-	a.Text("two", airuttest.As(alice))
-	waitOutcome(t, b, "limited", 1)
-	j.none(t, 100*time.Millisecond)
+	got := j.next(t)
+	if !slices.Equal(quoted(got.Batch), []string{"two"}) || !slices.Equal(quoted(got.Context), []string{"one"}) {
+		t.Errorf("batch %q after %q", quoted(got.Batch), quoted(got.Context))
+	}
+	j.answers <- no()
 
-	a, j, ran, b, _ = startChime(t, airut.Config{}, airut.ChimeOptions{Cooldown: time.Hour})
+	// Messages in the gap after an interruption wait, and are judged
+	// together when it ends.
+	a, j, ran, b, _ := startChime(t, airut.Config{}, airut.ChimeOptions{Cooldown: 400 * time.Millisecond})
+	a.Text("one", airuttest.As(alice))
+	j.answers <- yes(j.next(t).Batch[0])
+	waitRan(t, ran)
+	start := time.Now()
+	a.Text("two", airuttest.As(alice))
+	a.Text("three", airuttest.As(bob))
+	waitOutcome(t, b, "deferred", 1)
+	got = j.next(t)
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Errorf("judged %v into the gap", d)
+	}
+	if !slices.Equal(quoted(got.Batch), []string{"two", "three"}) {
+		t.Errorf("the deferred batch is %q", quoted(got.Batch))
+	}
+	j.answers <- no()
+
+	// At MaxPerHour messages wait for the hour, and age out by MaxAge
+	// meanwhile, without a judgement.
+	a, j, ran, b, _ = startChime(t, airut.Config{}, airut.ChimeOptions{MaxPerHour: 1, MaxAge: 300 * time.Millisecond})
 	a.Text("one", airuttest.As(alice))
 	j.answers <- yes(j.next(t).Batch[0])
 	waitRan(t, ran)
 	a.Text("two", airuttest.As(alice))
-	waitOutcome(t, b, "cooldown", 1)
+	waitOutcome(t, b, "deferred", 1)
+	if st, ok := b.ChimeState(general); !ok || st.InterruptionsLeft != 0 || st.Pending != 1 || st.QuietUntil.IsZero() {
+		t.Errorf("state while deferred: %+v, %v", st, ok)
+	}
+	waitOutcome(t, b, "aged_out", 1)
 	j.none(t, 100*time.Millisecond)
+	if st, _ := b.ChimeState(general); st.Pending != 0 {
+		t.Errorf("%d messages still pending after aging out", st.Pending)
+	}
+	if _, ok := b.ChimeState(airut.Channel{Platform: "test", ID: "channel-9"}); ok {
+		t.Error("a channel without a listener has a state")
+	}
 }
 
 func TestChimeTurnsAreTheChannels(t *testing.T) {
@@ -479,6 +535,11 @@ func TestChimeChecksItsOptions(t *testing.T) {
 		{"no MaxPerHour", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.MaxPerHour = 0 }},
 		{"too much context", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.ContextMessages = airut.MaxRoomMessages + 1 }},
 		{"a negative duration", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.Cooldown = -time.Second }},
+		{"a negative EngagedFor", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.EngagedFor = -time.Second }},
+		{"a negative ContextAge", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.ContextAge = -time.Second }},
+		{"a negative ContextBytes", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.ContextBytes = -1 }},
+		{"too long a BotQuote", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.BotQuote = airut.MaxQuote + 1 }},
+		{"a negative BotQuote", airut.Config{Judge: judge}, func(o *airut.ChimeOptions) { o.BotQuote = -1 }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			o := ok
@@ -491,5 +552,14 @@ func TestChimeChecksItsOptions(t *testing.T) {
 			airut.New(c.cfg).Chime(o)
 		})
 	}
-	airut.New(airut.Config{Judge: judge}).Chime(ok)
+	b := airut.New(airut.Config{Judge: judge})
+	b.Chime(ok)
+	// A second listener on the same channel would judge every message
+	// twice.
+	defer func() {
+		if recover() == nil {
+			t.Error("a second listener on one channel did not panic")
+		}
+	}()
+	b.Chime(ok)
 }
