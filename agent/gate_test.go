@@ -69,3 +69,28 @@ func TestGateWithoutAgent(t *testing.T) {
 		t.Fatalf("a file with no [agent] gave %+v, want the zero Gate, which refuses every turn", g)
 	}
 }
+
+func TestJudgeRate(t *testing.T) {
+	c := load(t, `
+[providers.local]
+base_url = "https://models.example.com/v1"
+models = [{ id = "m" }, { id = "small" }]
+
+[agent]
+model = "local/m"
+budget = { max_turns = 8, max_tokens = 200000 }
+
+[agent.judge]
+model = "local/small"
+rate = { per_channel = 60, window = "1h" }
+
+[store]
+path = "/var/lib/example/sessions.db"
+`)
+	if r := JudgeRate(c); r != (airut.JudgeRate{PerChannel: 60, Window: time.Hour}) {
+		t.Errorf("JudgeRate = %+v", r)
+	}
+	if r := JudgeRate(load(t, "")); r != (airut.JudgeRate{}) {
+		t.Errorf("a file with no [agent.judge] gave %+v, want no cap", r)
+	}
+}

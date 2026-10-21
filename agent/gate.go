@@ -30,3 +30,13 @@ func Gate(c *config.Config) airut.Gate {
 	}
 	return g
 }
+
+// JudgeRate turns [agent.judge] rate into the core's JudgeRate. A file
+// with no [agent.judge] table, or no rate in it, caps nothing.
+func JudgeRate(c *config.Config) airut.JudgeRate {
+	if c.Agent == nil || c.Agent.Judge == nil {
+		return airut.JudgeRate{}
+	}
+	r := c.Agent.Judge.Rate
+	return airut.JudgeRate{PerChannel: r.PerChannel, Window: r.Window}
+}
