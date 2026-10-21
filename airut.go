@@ -31,6 +31,15 @@ type Config struct {
 	// EditInterval is the least time between the edits that stream an
 	// agent's answer into a message. It defaults to one second.
 	EditInterval time.Duration
+	// TypingDelay is how long an agent turn runs before it shows a
+	// typing notice, so a turn that answers at once shows none. It
+	// defaults to one second; a negative value shows the notice at once.
+	TypingDelay time.Duration
+	// TypingEvery is how often a running turn renews its typing notice.
+	// It defaults to eight seconds, inside the ten a Discord notice
+	// lasts. A negative value turns the keepalive off, and the notice is
+	// then sent only when the agent calls a tool.
+	TypingEvery time.Duration
 	// MetricsAddr, if set, is the address Run serves the bot's metrics
 	// on, at /metrics in the Prometheus text format, as ":9464" or
 	// "127.0.0.1:9464". Run fails before it starts an adapter if it
@@ -39,6 +48,10 @@ type Config struct {
 	// SummaryEvery, if positive, is how often Run logs a summary of the
 	// metrics that changed since the last one. It is off by default.
 	SummaryEvery time.Duration
+	// ForgetShared decides who may make the agent forget a channel's or
+	// a thread's conversation with the built-in forget command, which
+	// clears it for everyone in it. Nil lets nobody.
+	ForgetShared func(*Ctx) bool
 }
 
 // Bot holds a set of commands and serves them through adapters.
@@ -73,6 +86,12 @@ func New(cfg Config) *Bot {
 	}
 	if cfg.EditInterval <= 0 {
 		cfg.EditInterval = time.Second
+	}
+	if cfg.TypingDelay == 0 {
+		cfg.TypingDelay = defaultTypingDelay
+	}
+	if cfg.TypingEvery == 0 {
+		cfg.TypingEvery = defaultTypingEvery
 	}
 	return &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics()}
 }

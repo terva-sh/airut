@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -137,6 +138,13 @@ func (r *responder) Ask(ctx context.Context, a airut.Ask) (string, error) {
 
 func (r *responder) Typing(ctx context.Context) error {
 	_, err := r.s.c.UserTyping(ctx, r.room, true, 30*time.Second)
+	return err
+}
+
+// StopTyping takes the notice down, which on Matrix would otherwise
+// stay for the rest of its 30 seconds.
+func (r *responder) StopTyping(ctx context.Context) error {
+	_, err := r.s.c.UserTyping(ctx, r.room, false, 0)
 	return err
 }
 
@@ -409,12 +417,65 @@ func (s *session) direct(ctx context.Context, u id.UserID) (id.RoomID, error) {
 	if err != nil {
 		return "", err
 	}
-	direct[u] = append(direct[u], resp.RoomID)
-	if err := s.c.SetAccountData(ctx, event.AccountDataDirectChats.Type, direct); err != nil {
+	if err := s.recordDirect(ctx, u, resp.RoomID); err != nil {
 		s.log.Warn("could not record a direct room", "room", string(resp.RoomID), "error_kind", errKind(err))
 	}
 	s.dms[u] = resp.RoomID
 	return resp.RoomID, nil
+}
+
+// recordDirect adds room to the account's m.direct as a direct chat with
+// u, and to the cached list. The caller holds dmMu, so two writers never
+// overwrite each other's read of m.direct.
+func (s *session) recordDirect(ctx context.Context, u id.UserID, room id.RoomID) error {
+	direct := event.DirectChatsEventContent{}
+	if err := s.c.GetAccountData(ctx, event.AccountDataDirectChats.Type, &direct); err != nil && !errors.Is(err, mautrix.MNotFound) {
+		return err
+	}
+	if !slices.Contains(direct[u], room) {
+		direct[u] = append(direct[u], room)
+		if err := s.c.SetAccountData(ctx, event.AccountDataDirectChats.Type, direct); err != nil {
+			return err
+		}
+	}
+	s.listedMu.Lock()
+	if s.listed == nil {
+		s.listed = map[id.RoomID]bool{}
+	}
+	s.listed[room] = true
+	s.listedMu.Unlock()
+	return nil
+}
+
+// isDirect reports whether room is a direct channel with u: private to
+// the bot and u as privateRoom checks it now, from the state store, and
+// named in the account's m.direct, from a copy at most directReload old.
+// A room that is not private never causes a read of m.direct.
+func (s *session) isDirect(ctx context.Context, room id.RoomID, u id.UserID) bool {
+	if u == s.c.UserID || !s.privateRoom(ctx, room, u) {
+		return false
+	}
+	s.listedMu.Lock()
+	defer s.listedMu.Unlock()
+	if s.listedLoad.IsZero() || time.Since(s.listedLoad) >= directReload {
+		s.listedLoad = time.Now()
+		direct := event.DirectChatsEventContent{}
+		err := s.c.GetAccountData(ctx, event.AccountDataDirectChats.Type, &direct)
+		switch {
+		case err == nil || errors.Is(err, mautrix.MNotFound):
+			s.listed = map[id.RoomID]bool{}
+			for _, rooms := range direct {
+				for _, r := range rooms {
+					s.listed[r] = true
+				}
+			}
+		default:
+			// Keep the last copy rather than drop every direct room for
+			// one failed read.
+			s.log.Warn("could not read the direct rooms", "error_kind", errKind(err))
+		}
+	}
+	return s.listed[room]
 }
 
 // privateRoom reports whether room is fit for a private reply to u, as
