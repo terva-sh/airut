@@ -50,6 +50,10 @@ type Param struct {
 	// Rest marks a string that takes the remainder of a text invocation
 	// verbatim. Only the last parameter can be one.
 	Rest bool
+	// Named marks an optional parameter a text invocation sets only by
+	// name, as name=value or as --name for a boolean, so words never bind
+	// to it by position. It lets options come before a rest parameter.
+	Named bool
 	// Choices restricts a string to these values.
 	Choices []string
 	// Min and Max bound a number's value or a string's length.
@@ -165,6 +169,8 @@ func deriveParams(t reflect.Type) ([]field, error) {
 				f.Required = false
 			case "rest":
 				f.Rest = true
+			case "named":
+				f.Named = true
 			default:
 				return nil, fmt.Errorf("%s: unknown airut tag option %q", where, fl)
 			}
@@ -177,6 +183,9 @@ func deriveParams(t reflect.Type) ([]field, error) {
 		}
 		if f.Rest && k != KindString {
 			return nil, fmt.Errorf("%s: only a string can take the rest of the line", where)
+		}
+		if f.Named && (f.Required || f.Rest) {
+			return nil, fmt.Errorf("%s: a named parameter must be optional, and cannot take the rest of the line", where)
 		}
 		if f.Required && optionalSeen {
 			return nil, fmt.Errorf("%s: a required parameter cannot follow an optional one", where)
@@ -272,8 +281,13 @@ func usage(prefix string, s Spec) string {
 	b.WriteString(prefix + s.Name)
 	for _, p := range s.Params {
 		name := p.Name
-		if p.Rest {
+		switch {
+		case p.Rest:
 			name += "..."
+		case p.Named && p.Kind == KindBoolean:
+			name = "--" + name
+		case p.Named:
+			name += "=..."
 		}
 		if p.Required {
 			b.WriteString(" <" + name + ">")

@@ -95,6 +95,28 @@ func TestParseText(t *testing.T) {
 	}
 }
 
+func TestNamedParams(t *testing.T) {
+	type args struct {
+		Loud  bool   `airut:",optional,named" desc:"l"`
+		Voice string `airut:",optional,named" desc:"v"`
+		Text  string `airut:",optional,rest" desc:"t"`
+	}
+	fs := textFields(t, args{})
+	for line, want := range map[string]map[string]any{
+		"true words":                {"text": "true words"},
+		"--loud voice=low hi there": {"loud": "true", "voice": "low", "text": "hi there"},
+		"voice=low --loud":          {"loud": "true", "voice": "low"},
+	} {
+		got, err := parseText(line, fs)
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("parseText(%q) = %v, %v; want %v", line, got, err, want)
+		}
+	}
+	if got := usage("!", Spec{Name: "say", Params: []Param{fs[0].Param, fs[1].Param, fs[2].Param}}); got != "!say [--loud] [voice=...] [text...]" {
+		t.Errorf("usage %q", got)
+	}
+}
+
 func TestRestOnly(t *testing.T) {
 	type question struct {
 		Text string `airut:",rest" desc:"q"`

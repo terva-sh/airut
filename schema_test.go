@@ -172,6 +172,16 @@ func TestRegistrationPanics(t *testing.T) {
 			return nil
 		}, "only a string can take the rest"},
 		{"ok", "d", func(*Ctx, struct {
+			A string `airut:",named" desc:"a"`
+		}) error {
+			return nil
+		}, "a named parameter must be optional"},
+		{"ok", "d", func(*Ctx, struct {
+			A string `airut:",optional,named,rest" desc:"a"`
+		}) error {
+			return nil
+		}, "a named parameter must be optional, and cannot take the rest"},
+		{"ok", "d", func(*Ctx, struct {
 			A string `airut:"x" desc:"a"`
 			B string `airut:"x" desc:"b"`
 		}) error {

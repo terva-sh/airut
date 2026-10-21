@@ -53,7 +53,8 @@ func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\
 
 // parseText binds the words of a text invocation to parameters, as
 // strings. Required and optional parameters bind positionally in order,
-// any parameter binds as name=value, a boolean binds as --name, and a
+// apart from named ones, which never do; any parameter binds as
+// name=value, a boolean binds as --name, and a
 // rest parameter takes the remainder of the line verbatim. The line is
 // read a token at a time, so the text a rest parameter takes is never
 // parsed: an unmatched quote in it is just a character.
@@ -102,7 +103,7 @@ func parseText(line string, params []field) (map[string]any, error) {
 		if i >= len(line) {
 			return out, nil
 		}
-		for pos < len(params) && out[params[pos].Name] != nil {
+		for pos < len(params) && (out[params[pos].Name] != nil || params[pos].Named) {
 			pos++
 		}
 		t, next, err := scanToken(line, i)
