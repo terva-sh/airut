@@ -228,12 +228,14 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	if !ok && t.Persona != "" {
 		return fmt.Errorf("agent: no persona %q", t.Persona)
 	}
+	began := time.Now()
+	tm := &timing{c: c, log: a.log, provider: a.model.Provider, model: a.model.Model}
 	tools := make(core.Registry, len(t.Tools))
 	for _, tl := range t.Tools {
 		if _, dup := tools[tl.Name()]; dup {
 			return fmt.Errorf("agent: the turn names tool %q twice", tl.Name())
 		}
-		tools[tl.Name()] = &tool{c: c, t: tl}
+		tools[tl.Name()] = &tool{c: c, t: tl, tm: tm}
 	}
 
 	ctx := c.Context()
@@ -289,15 +291,25 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		switch e := e.(type) {
 		case core.EvTurnStart:
 			steps = e.Step
+			tm.begin(e.Step)
 		case core.EvTextDelta:
+			tm.first()
 			out.Text(e.Delta)
+		case core.EvToolUseStart:
+			tm.first()
+		case core.EvUsage:
+			tm.usage(e.Usage)
+		case core.EvTurnEnd:
+			tm.end(e.Stop)
 		case core.EvToolCall:
 			out.ToolCall(e.Name)
 		}
 	})
 	stop := stopKind(err, budget.stopped)
+	modelTime, toolTime := tm.totals()
 	a.log.Info("agent turn finished", "invocation", c.ID(), "platform", string(c.Platform()),
-		"requests", budget.allowed(steps), "tokens", budget.used(), "stop", stop)
+		"requests", budget.allowed(steps), "tokens", budget.used(), "stop", stop,
+		"ms", time.Since(began).Milliseconds(), "model_ms", modelTime.Milliseconds(), "tool_ms", toolTime.Milliseconds())
 	m, command := c.Metrics(), c.MetricCommand()
 	m.Add("airut_agent_requests_total", float64(budget.allowed(steps)), "command", command)
 	m.Add("airut_agent_tokens_total", float64(budget.used()), "command", command)
@@ -359,10 +371,88 @@ func (b *budget) allowed(steps int) int {
 	return steps
 }
 
+// timing times a turn's model requests and tool calls, for the log and
+// the metrics. Each request, a retry of a step included, runs from the
+// step's start or the last attempt's end to its own end, so a retry's
+// time holds its backoff.
+type timing struct {
+	c               *airut.Ctx
+	log             *slog.Logger
+	provider, model string
+
+	mu         sync.Mutex
+	step       int
+	start, tok time.Time
+	used       provider.Usage
+	modelTotal time.Duration
+	toolTotal  time.Duration
+}
+
+func (t *timing) begin(step int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.step, t.start, t.tok, t.used = step, time.Now(), time.Time{}, provider.Usage{}
+}
+
+// first marks the request's first text or tool-use delta.
+func (t *timing) first() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.tok.IsZero() {
+		t.tok = time.Now()
+	}
+}
+
+func (t *timing) usage(u provider.Usage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.used = u
+}
+
+// end logs and counts the request that just ended, and starts the next
+// attempt's clock, in case the step is retried.
+func (t *timing) end(stop provider.StopReason) {
+	t.mu.Lock()
+	now := time.Now()
+	d, first, used, step := now.Sub(t.start), time.Duration(-1), t.used, t.step
+	if !t.tok.IsZero() {
+		first = t.tok.Sub(t.start)
+	}
+	t.modelTotal += d
+	t.start, t.tok, t.used = now, time.Time{}, provider.Usage{}
+	t.mu.Unlock()
+	m := t.c.Metrics()
+	m.Observe("airut_agent_request_seconds", d, "provider", t.provider, "model", t.model)
+	attrs := []any{"invocation", t.c.ID(), "step", step, "provider", t.provider, "model", t.model,
+		"ms", d.Milliseconds(), "input_tokens", used.InputTokens, "output_tokens", used.OutputTokens, "stop", string(stop)}
+	if first >= 0 {
+		m.Observe("airut_agent_first_token_seconds", first, "provider", t.provider, "model", t.model)
+		attrs = append(attrs, "first_token_ms", first.Milliseconds())
+	}
+	t.log.Info("agent request", attrs...)
+}
+
+// tool logs and counts one tool call.
+func (t *timing) tool(name string, d time.Duration, outcome string) {
+	t.mu.Lock()
+	t.toolTotal += d
+	step := t.step
+	t.mu.Unlock()
+	t.c.Metrics().Observe("airut_agent_tool_seconds", d, "tool", name)
+	t.log.Info("agent tool", "invocation", t.c.ID(), "step", step, "tool", name, "ms", d.Milliseconds(), "outcome", outcome)
+}
+
+func (t *timing) totals() (model, tools time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.modelTotal, t.toolTotal
+}
+
 // tool adapts an airut.Tool to terva's.
 type tool struct {
-	c *airut.Ctx
-	t airut.Tool
+	c  *airut.Ctx
+	t  airut.Tool
+	tm *timing
 }
 
 func (x *tool) Name() string            { return x.t.Name() }
@@ -373,8 +463,11 @@ func (x *tool) Schema() json.RawMessage { return x.t.Schema() }
 // failure is only text meant for people, as the chat would show it: an
 // error's own text can hold what neither should see.
 func (x *tool) Execute(ctx context.Context, args json.RawMessage, _ func(string)) (core.ToolResult, error) {
+	start, outcome := time.Now(), "ok"
+	defer func() { x.tm.tool(x.t.Name(), time.Since(start), outcome) }()
 	text, err := x.t.Call(x.c, args)
 	if err != nil {
+		outcome = "error"
 		// Only when the turn itself has ended does the engine record the
 		// call as aborted. A tool's own timeout is a failure like any
 		// other, which the model can read and recover from.

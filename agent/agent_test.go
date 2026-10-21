@@ -25,6 +25,9 @@ type reply struct {
 	content []provider.Content
 	stop    provider.StopReason
 	tokens  int
+	// delay holds the reply back after its first event, and gap between
+	// its text deltas.
+	delay, gap time.Duration
 }
 
 func say(text string) reply {
@@ -61,8 +64,12 @@ func (f *fake) Stream(ctx context.Context, req provider.Request) (<-chan provide
 	go func() {
 		defer close(ch)
 		ch <- provider.EventStart{Model: req.Model, Provider: "fake"}
-		for _, c := range r.content {
+		time.Sleep(r.delay)
+		for i, c := range r.content {
 			if t, ok := c.(provider.TextBlock); ok {
+				if i > 0 {
+					time.Sleep(r.gap)
+				}
 				ch <- provider.EventTextDelta{Delta: t.Text}
 			}
 		}
@@ -135,6 +142,9 @@ func newEnv(t *testing.T, db *sessions.DB, personas map[string]string, cfg airut
 		}
 		if a.Dice == "bad" {
 			return airut.Errorf("No such dice.")
+		}
+		if a.Dice == "wait" {
+			time.Sleep(30 * time.Millisecond)
 		}
 		if a.Dice == "slow" {
 			// A timeout of the tool's own, while the turn goes on.

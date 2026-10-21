@@ -79,6 +79,13 @@ slots = 2
 cache_prompt = true
 # Bounds a call, waiting included. Defaults to 30s.
 timeout = "20s"
+# Caps each call's whole request, instructions, chat, and reserved reply
+# together, so it fits the server's per-slot context. With no tokenizer,
+# the judge counts one token per bytes_per_token bytes, 3 by default,
+# which overestimates English. Over the cap it drops the oldest context
+# first. 0 caps nothing.
+max_input_tokens = 8000
+# bytes_per_token = 3
 # Judgements per channel in a sliding window, apart from the turn rate,
 # which a judgement never uses. Without it nothing caps them.
 rate = { per_channel = 60, window = "1h" }
@@ -113,7 +120,7 @@ rooms = ["!members:example.org"]
 
 # Where agent sessions persist. Required with [agent].
 [store]
-path = "/var/lib/airut-sample/sessions.db"
+path = "/var/lib/airut-example/sessions.db"
 # Sessions idle longer than this are deleted. Defaults to 720h, 30 days.
 retention = "720h"
 
@@ -129,14 +136,16 @@ user_id = "@sample:example.org"
 # Logs in when no session is stored yet; optional once one is.
 password = { credential = "matrix-password" }
 # Keeps the Matrix session and the crypto store. Back it up.
-state_dir = "/var/lib/airut-sample/matrix"
+state_dir = "/var/lib/airut-example/matrix"
 device_name = "airut sample"
-# Optional. The account's cross-signing recovery key, which the
-# cross-signing setup prints once. With it the bot signs its own device
-# at start when the device is not signed, as after the state directory
-# was re-created, so clients show its messages as verified. Guard it like
-# the password: it can sign any device as the bot's.
-recovery_key = { credential = "matrix-recovery-key" }
+# Optional, and best left out. The account's cross-signing recovery key,
+# which the cross-signing setup prints once. With it the bot signs its
+# own device at start when the device is not signed, as after the state
+# directory was re-created, so clients show its messages as verified.
+# Without it, -cross-sign does the same and asks for the key, so the key
+# never rests on the host. Guard it like the password: it can sign any
+# device as the bot's.
+# recovery_key = { credential = "matrix-recovery-key" }
 
 # Metrics. Without this table the bot keeps its metrics in memory only,
 # for a command that reports them.

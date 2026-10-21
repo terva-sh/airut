@@ -434,6 +434,20 @@ below a complete reply.
 
 A running turn shows a typing notice in the chat it answers in.
 
+The agent times each turn, so an operator can see where its time went,
+in the model or in the app's own tools. Each line carries ids, counts,
+and kinds, never text:
+
+- **Each model request** logs "agent request" at Info: the step, the
+  provider and model, `ms`, `first_token_ms` to its first text or
+  tool-call delta, its input and output tokens, and its stop. A retried
+  step logs each attempt, timed from the last one's end, so a retry's
+  time holds its backoff.
+- **Each tool call** logs "agent tool" with the step, the tool's name,
+  `ms`, and `ok` or `error`.
+- **The turn** adds `ms`, `model_ms`, and `tool_ms` to "agent turn
+  finished", the sums of the two above.
+
 - The first notice comes after `Config.TypingDelay`, one second by
   default, so an instant answer or refusal shows none.
 - The notice is renewed every `Config.TypingEvery`, eight seconds by
@@ -485,12 +499,13 @@ trigger it. So before a turn reaches the agent, the core checks
   fails is logged by kind, and refuses unless another channel admits. A platform with no list allows
   nobody, and the zero `Gate` refuses every turn. In the configuration
   file, Matrix names its channels as `rooms`, by room id. A turn a
-  `Chime` handler starts is the channel's: the channel itself must be
-  listed in `Channels`.
+  `Chime` handler starts as an interruption is the channel's: the
+  channel itself must be listed in `Channels`. One it starts as a
+  follow-up needs the sender's own access, as a mention does.
 - **Rate limit:** at most `PerUser` turns per caller and `PerChannel`
   per channel in a sliding `Window`. The counts are held in memory, and a
-  refused turn counts against neither. A `Chime` turn counts against
-  `PerChannel` only.
+  refused turn counts against neither. A `Chime` interruption counts
+  against `PerChannel` only, and a follow-up against `PerUser` only.
 - **Budget:** each zero field of the turn's `Budget` takes the gate's
   default. The agent stops the turn at the budget it receives.
 
@@ -574,6 +589,17 @@ OpenAI-compatible goes through a terva client, without them.
   slot with `id_slot`, so that prefix is found cached.
 - **Accounting.** `airut_judge_tokens_total` counts the tokens each call
   reports, by persona. A judgement has no session to book them against.
+- **Input cap.** `MaxInputTokens` caps a call's whole request, the
+  instructions, the chat, and the reserved reply together, so it fits a
+  llama.cpp slot's context. The judge has no tokenizer, so it counts a
+  token per `BytesPerToken` bytes, 3 by default, which overestimates
+  English. Over the cap it drops the oldest context, then cuts the
+  batch's longest quote until the request fits. A request that would
+  not fit with every quote cut to nothing is not made, and abstains with
+  `ErrJudgementTooLarge`. A `Judgement.InputTokens` below the cap lowers it for
+  that judgement. The judge is a `JudgeLimit`, so a caller can ask
+  whether a judgement fits before making it, and each call logs the
+  server's `prompt_tokens` beside the estimate.
 
 `agent.OpenJudge` builds the judge from `[agent.judge]`, on its
 provider's base URL and key, and `agent.JudgeRate` builds the core's
@@ -588,44 +614,79 @@ of a busy room, so it gathers them:
 - **Settling.** In each of its `Channels`, the first new message opens
   a batch. Each later one extends it by `Settle`, up to `MaxWait` after
   the first, and the batch is judged once. One judgement runs per
-  channel at a time. Messages that arrive meanwhile wait for the next.
-- **What is judged.** The bot's own messages and commands never reach
-  the judge, and neither does a message older than `MaxAge` when it
-  arrives, as after downtime. A message that addresses the bot, and one
-  in a direct channel, are the bot's own handlers' to answer. The first
-  is read as part of the batch but can never be chosen, and the second
-  is not read at all.
+  channel at a time. Messages that arrive meanwhile, or while the
+  handler runs, wait for the next, which reads the bot's answer as
+  context. No batch is dropped unjudged: a message is judged, or ages
+  out by `MaxAge`.
+- **What is judged.** Commands never reach the judge, and neither does a
+  message older than `MaxAge` when it arrives, as after downtime. A
+  message that addresses the bot, and one in a direct channel, are the
+  bot's own handlers' to answer. The first is read as part of the batch
+  but can never be chosen, and the second is not read at all.
+- **The bot's own messages.** Whatever the bot sends in the channel
+  through a `Ctx`, such as a Chime answer, a mention turn's reply, or a
+  command's, joins the context marked `FromBot` and cut to `BotQuote`
+  bytes, with its latest edit. That is how the judge tells a follow-up
+  to the bot from chatter. What an app sends through a `Conn` directly,
+  such as a work queue's posts, is neither read nor engages the room.
 - **Context.** The judge reads the channel's earlier messages before the
   batch. The window keeps its start while it grows to twice
   `ContextMessages`, then drops to `ContextMessages` in one step. A
   sliding window would change the prompt's first message on every
   judgement, and the model server could reuse almost none of its cache.
-  The window lives in memory, so a restart starts it empty, and the
-  bot's own replies are never delivered, so they are not in it.
+  `ContextAge` and `ContextBytes` bound it the same way: past either, it
+  drops to half. With a judge that is a `JudgeLimit`, a judgement that
+  would not fit drops the oldest half of the window until it does, and
+  `ContextTokens` lowers the judge's cap. The window lives in memory, so
+  a restart starts it empty.
+- **Cold and engaged.** A channel is cold until the bot speaks in it.
+  Its answers are interruptions: `MaxPerHour` caps them, and `Cooldown`
+  is the gap after each. Messages that arrive while a channel is at its
+  cap or in its gap are deferred and judged together when it ends. A
+  channel the bot spoke in is engaged for `EngagedFor`, restarted by
+  each of its sends. People talking among themselves do not extend it.
+  An engaged channel is judged with `FollowUpPersona` and
+  `FollowUpPrompt`, with no gap and no cap.
 - **A yes that came too late.** Before `Handler` runs, a yes is
   dropped when a message that arrived after the batch closed replies to
-  the target, or comes from someone else and replies to nothing. Either
-  may already be the answer. A second judgement would cost one every
-  time the room is busy, which is when judgements are scarcest, so the
-  rule is this cheap one.
-- **Limits.** `MaxPerHour` caps the handler's runs in a channel, and a
-  channel at its cap is not judged. Nothing in a channel is judged
-  while the handler runs, nor for `Cooldown` after. `StayOut` drops
-  a yes about a message that replies to another person, and does not
-  judge such a message at all when the listener saw the message replied
-  to. Otherwise it fetches that message, and one it cannot read counts
-  as a person's.
+  the target, or comes from someone else, the bot included, and replies
+  to nothing. Either may already be the answer. A second judgement
+  would cost one every time the room is busy, which is when judgements
+  are scarcest, so the rule is this cheap one. `StayOut` drops a yes
+  about a message that replies to another person, and does not judge
+  such a message at all when the listener saw the message replied to.
+  Otherwise it fetches that message, and one it cannot read counts as a
+  person's. A reply to the bot is no exchange between other people.
 - **Whose turn.** The handler's `Ctx` stands on the chosen message, so a
-  reply answers it. An agent turn it starts is the channel's, because
-  nobody asked for it. The channel must be in the gate's
-  `Access.Channels`, and the turn takes one of `PerChannel`'s turns and
-  none of the sender's `PerUser`. The sender needs no access of their
-  own.
+  reply answers it, and `Chimed.FollowUp` says which kind it is. An
+  interruption's agent turn is the channel's, because nobody asked for
+  it: the channel must be in the gate's `Access.Channels`, and the turn
+  takes one of `PerChannel`'s turns and none of the sender's. A
+  follow-up's is the sender's, as a mention's is: it needs their access
+  and takes one of their `PerUser` turns, none of `PerChannel`'s. So
+  interruptions, follow-ups, and the room's mentions and commands draw
+  on three separate limits, and `Config.JudgeRate` stays as a safety
+  limit for the model server.
+- **Hooks.** `OnPicked` runs on a yes, just before the handler, so an app
+  can react to the message it is answering. `OnLimited` runs when a
+  message in an engaged channel cannot be answered because the judge's
+  rate or the sender's `PerUser` stopped it, which Chime asks the gate
+  about before the handler runs. A cold channel calls neither on a
+  limit, since an unasked bot stays silent.
+- **Settings and state.** With `Settings` set to a prefix, the listener
+  declares `PREFIX.cooldown`, `PREFIX.max_per_hour`,
+  `PREFIX.engaged_for`, `PREFIX.max_age`, and, with a capped
+  `JudgeLimit`, `PREFIX.context_tokens`, read at use time. The
+  configured `MaxPerHour` and the judge's cap are ceilings chat cannot
+  raise. `Bot.ChimeState` reports when a channel goes cold, when its gap
+  ends, how many interruptions are left this hour, and what is pending.
+  A channel belongs to one listener, so its state has one answer.
 - **Misses.** A reaction among `Misses` on a reply the handler sent
   counts once in `airut_chime_misses_total`. `airut_chime_total` counts
-  each batch the judge was asked about, or would have been, by outcome:
+  each batch by outcome and by whether the channel was engaged:
   `spoke`, `failed`, `declined`, `stale`, `stayed_out`, `not_judged`,
-  `limited`, or `cooldown`.
+  `deferred`, `aged_out`, `limited`, or `refused`. A yes is logged as
+  `picked`.
 
 ## Sessions
 
@@ -884,9 +945,13 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_agent_requests_total` | `command` | model requests |
 | `airut_agent_tokens_total` | `command` | tokens the provider reported |
 | `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `budget`, or `error` |
+| `airut_agent_request_seconds` | `provider`, `model` | how long each model request took |
+| `airut_agent_first_token_seconds` | `provider`, `model` | how long a request took to its first delta |
+| `airut_agent_tool_seconds` | `tool` | how long each tool call took |
 | `airut_judge_total` | `persona`, `decision` | judgements, by decision, abstentions included |
-| `airut_judge_seconds` | `persona` | how long a judgement took |
-| `airut_chime_total` | `persona`, `outcome` | Chime batches, by how each ended |
+| `airut_judge_seconds` | `persona` | how long a judgement took, waiting for the judge included |
+| `airut_judge_request_seconds` | `model`, `outcome` | how long the judge's call to its model took, by `ok` or the error's kind |
+| `airut_chime_total` | `persona`, `outcome`, `engaged` | Chime batches, by how each ended |
 | `airut_chime_misses_total` | `persona` | Chime replies marked as a miss |
 | `airut_memory_writes_total` | `scope`, `source`, `status` | memories saved, by how they were saved |
 | `airut_memory_consents_total` | `answer` | answers to a pending memory's question |
