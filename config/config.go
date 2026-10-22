@@ -71,35 +71,12 @@ type Bot struct {
 	ReplyDepth int
 }
 
-// Provider is one OpenAI-compatible endpoint.
-type Provider struct {
-	// ID names the provider; models are referred to as ID/model.
-	ID      string
-	BaseURL string
-	// APIKey is zero for a keyless endpoint, such as a local server.
-	APIKey Secret
-	Models []Model
-}
-
-// Model is one model a provider serves.
-type Model struct {
-	ID            string
-	ContextWindow int
-	MaxOutput     int
-	Reasoning     bool
-}
-
-// ModelRef names a model by its provider.
-type ModelRef struct {
-	Provider string
-	Model    string
-}
-
-func (r ModelRef) String() string { return r.Provider + "/" + r.Model }
-
 // Agent is how agent turns run and who may start them.
 type Agent struct {
-	// Model is the default model.
+	// Models is the chain of models a turn tries, in order, from the
+	// file's model or models.
+	Models Chain
+	// Model is the first entry of Models.
 	Model ModelRef
 	// Budget is the default for a turn that sets none.
 	Budget Budget
@@ -134,9 +111,17 @@ type Memory struct {
 // Judge configures the judge: one tool-free call for each judgement, on
 // a model of its own.
 type Judge struct {
+	// Models is the chain of models a judgement tries, in order. Each
+	// entry carries its own Output, Slots, CachePrompt, Timeout, and
+	// MaxInputTokens.
+	Models Chain
+	// Model is the first entry of Models.
 	Model ModelRef
 	// Concurrency caps the judge calls in flight; zero means one.
 	Concurrency int
+	// Output, Slots, CachePrompt, Timeout, and MaxInputTokens are the
+	// first entry's, for a caller that runs the judge on one model.
+	//
 	// Output is how the reply is constrained: "response_format",
 	// "json_schema", "grammar", or "none"; empty means response_format.
 	Output string
@@ -259,21 +244,10 @@ type fileBot struct {
 	ReplyDepth *int   `toml:"reply_depth"`
 }
 
-type fileProvider struct {
-	BaseURL string      `toml:"base_url"`
-	APIKey  any         `toml:"api_key"`
-	Models  []fileModel `toml:"models"`
-}
-
-type fileModel struct {
-	ID            string `toml:"id"`
-	ContextWindow int    `toml:"context_window"`
-	MaxOutput     int    `toml:"max_output"`
-	Reasoning     bool   `toml:"reasoning"`
-}
-
 type fileAgent struct {
-	Model   string       `toml:"model"`
+	Model string `toml:"model"`
+	// Models holds strings and tables, which buildChain reads.
+	Models  any          `toml:"models"`
 	Budget  *fileBudget  `toml:"budget"`
 	Rate    *fileRate    `toml:"rate"`
 	History *fileHistory `toml:"history"`
@@ -291,12 +265,13 @@ type fileMemory struct {
 
 type fileJudge struct {
 	Model       string  `toml:"model"`
+	Models      any     `toml:"models"`
 	Concurrency int     `toml:"concurrency"`
-	Output      string  `toml:"output"`
-	Slots       int     `toml:"slots"`
-	CachePrompt bool    `toml:"cache_prompt"`
-	Timeout     string  `toml:"timeout"`
-	MaxInput    int     `toml:"max_input_tokens"`
+	Output      *string `toml:"output"`
+	Slots       *int    `toml:"slots"`
+	CachePrompt *bool   `toml:"cache_prompt"`
+	Timeout     *string `toml:"timeout"`
+	MaxInput    *int    `toml:"max_input_tokens"`
 	BytesPerTok float64 `toml:"bytes_per_token"`
 	Rate        *struct {
 		PerChannel int    `toml:"per_channel"`
@@ -483,66 +458,9 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 	return c
 }
 
-func buildProvider(p *problems, id string, f fileProvider, dir string) Provider {
-	key := "providers." + id
-	pr := Provider{ID: id, BaseURL: f.BaseURL}
-	if !providerIDRE.MatchString(id) {
-		p.addf(key, "a provider id is lowercase letters, digits, - and _, starting with a letter or digit")
-	}
-	checkURL(p, key+".base_url", f.BaseURL)
-	if f.APIKey != nil {
-		pr.APIKey = resolveSecret(p, key+".api_key", f.APIKey, dir)
-	}
-	if len(f.Models) == 0 {
-		p.add(key+".models", "a provider needs at least one model")
-	}
-	seen := map[string]bool{}
-	for i, m := range f.Models {
-		mkey := fmt.Sprintf("%s.models.%d", key, i)
-		switch {
-		case m.ID == "":
-			p.add(mkey+".id", "required")
-		case seen[m.ID]:
-			p.add(mkey+".id", "repeats an earlier model's id")
-		}
-		seen[m.ID] = true
-		if m.ContextWindow < 0 {
-			p.add(mkey+".context_window", "cannot be negative")
-		}
-		if m.MaxOutput < 0 {
-			p.add(mkey+".max_output", "cannot be negative")
-		}
-		pr.Models = append(pr.Models, Model(m))
-	}
-	return pr
-}
-
-// modelRef reads a model named as "provider/model" at key, and checks
-// that its provider is configured and lists it.
-func modelRef(p *problems, key, raw string, providers []Provider) ModelRef {
-	provider, model, ok := strings.Cut(raw, "/")
-	switch {
-	case raw == "":
-		p.add(key, `required: a model, as "provider/model"`)
-		return ModelRef{}
-	case !ok || provider == "" || model == "":
-		p.add(key, `a model is named as "provider/model"`)
-		return ModelRef{}
-	}
-	i := slices.IndexFunc(providers, func(pr Provider) bool { return pr.ID == provider })
-	if i < 0 {
-		p.add(key, "names a provider that is not configured")
-	} else if !slices.ContainsFunc(providers[i].Models, func(m Model) bool { return m.ID == model }) {
-		p.add(key, "names a model its provider does not list")
-	}
-	return ModelRef{Provider: provider, Model: model}
-}
-
 func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
-	j := &Judge{Model: modelRef(p, "agent.judge.model", f.Model, providers),
-		Concurrency: f.Concurrency, Output: f.Output, Slots: f.Slots, CachePrompt: f.CachePrompt,
-		MaxInputTokens: f.MaxInput, BytesPerToken: f.BytesPerTok}
-	if f.MaxInput < 0 {
+	j := &Judge{Concurrency: f.Concurrency, BytesPerToken: f.BytesPerTok}
+	if f.MaxInput != nil && *f.MaxInput < 0 {
 		p.add("agent.judge.max_input_tokens", "must not be negative")
 	}
 	if f.BytesPerTok < 0 {
@@ -551,16 +469,17 @@ func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
 	if f.Concurrency < 0 {
 		p.add("agent.judge.concurrency", "must not be negative")
 	}
-	if f.Slots < 0 {
-		p.add("agent.judge.slots", "must not be negative")
-	}
-	switch f.Output {
-	case "", "response_format", "json_schema", "grammar", "none":
-	default:
-		p.add("agent.judge.output", `must be "response_format", "json_schema", "grammar", or "none"`)
-	}
-	if f.Timeout != "" {
-		j.Timeout = duration(p, "agent.judge.timeout", f.Timeout)
+	// The table's output, slots, cache_prompt, and timeout override
+	// every entry's model, as they set the one model's before chains.
+	site := useSite{key: "agent.judge", judge: true, maxInput: f.MaxInput,
+		caps: fileCaps{Output: f.Output, Slots: f.Slots, CachePrompt: f.CachePrompt, Timeout: f.Timeout}}
+	checkCaps(p, site.key, site.caps)
+	j.Models = buildChain(p, site, f.Model, f.Models, providers)
+	if len(j.Models) > 0 {
+		first := j.Models[0]
+		j.Model = first.Ref()
+		j.Output, j.Slots, j.CachePrompt, j.Timeout = first.Output, first.Slots, first.CachePrompt, first.Timeout
+		j.MaxInputTokens = first.MaxInputTokens
 	}
 	if r := f.Rate; r != nil {
 		j.Rate.PerChannel = r.PerChannel
@@ -579,7 +498,10 @@ func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
 func buildAgent(p *problems, f *fileAgent, providers []Provider) *Agent {
 	a := &Agent{Access: map[string]Access{}}
 
-	a.Model = modelRef(p, "agent.model", f.Model, providers)
+	a.Models = buildChain(p, useSite{key: "agent"}, f.Model, f.Models, providers)
+	if len(a.Models) > 0 {
+		a.Model = a.Models[0].Ref()
+	}
 	if f.Judge != nil {
 		a.Judge = buildJudge(p, f.Judge, providers)
 	}

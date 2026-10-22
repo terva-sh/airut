@@ -66,13 +66,22 @@ func TestExample(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret := NewSecret(sentinel)
+	zero := 0.0
+	judgeCaps := Capabilities{ContextWindow: 8192, MaxOutput: 8192, Output: "json_schema", Slots: 2, CachePrompt: true, Temperature: &zero}
+	judgeCapsAt20s := judgeCaps
+	judgeCapsAt20s.Timeout = 20 * time.Second
 	want := &Config{
 		Bot: Bot{Prefix: "!", ReplyDepth: 3},
 		Providers: []Provider{
-			{ID: "local", BaseURL: "http://127.0.0.1:8000/v1", Models: []Model{{ID: "qwen3-32b", ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}}},
-			{ID: "proxy", BaseURL: "https://llm.example.net/v1", APIKey: secret, Models: []Model{{ID: "gpt-5.5"}}},
+			{ID: "local", BaseURL: "http://127.0.0.1:8080/v1", Kind: KindLlamaSwap, Load: LoadWhenIdle, Models: []Model{
+				{ID: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}},
+				{ID: "qwen3-judge", Served: "Qwen3-32B-Q4_K_M", Base: "qwen3-32b", Capabilities: judgeCaps},
+			}},
+			{ID: "proxy", Kind: KindOpenAI, BaseURL: "https://llm.example.net/v1", APIKey: secret, Models: []Model{
+				{ID: "gpt-5.5", Served: "gpt-5.5", Capabilities: Capabilities{ContextWindow: 128000, Output: "response_format"}}}},
 		},
 		Agent: &Agent{
+			Models:  Chain{{Provider: "local", Model: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}}},
 			Model:   ModelRef{Provider: "local", Model: "qwen3-32b"},
 			Budget:  Budget{MaxTurns: 8, MaxTokens: 200000},
 			Rate:    Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute},
@@ -81,7 +90,13 @@ func TestExample(t *testing.T) {
 				"discord": {Users: []string{"123456789012345678"}, Roles: []string{"234567890123456789"}},
 				"matrix":  {Users: []string{"@owner:example.org"}, Rooms: []string{"!members:example.org"}},
 			},
-			Judge: &Judge{Model: ModelRef{Provider: "local", Model: "qwen3-32b"}, Concurrency: 2, Output: "json_schema",
+			Judge: &Judge{
+				Models: Chain{
+					{Provider: "local", Model: "qwen3-judge", Served: "Qwen3-32B-Q4_K_M", Capabilities: judgeCapsAt20s, MaxInputTokens: 8000},
+					{Provider: "proxy", Model: "gpt-5.5", Served: "gpt-5.5", MaxInputTokens: 16000,
+						Capabilities: Capabilities{ContextWindow: 128000, Output: "response_format", Timeout: 40 * time.Second}},
+				},
+				Model: ModelRef{Provider: "local", Model: "qwen3-judge"}, Concurrency: 2, Output: "json_schema",
 				Slots: 2, CachePrompt: true, Timeout: 20 * time.Second, MaxInputTokens: 8000, Rate: JudgeRate{PerChannel: 60, Window: time.Hour}},
 			Memory: Memory{ModelWrites: map[string]string{"user": "ask", "channel": "auto", "bot": "off"},
 				MaxUser: 20, MaxChannel: 50, MaxBot: 50},
@@ -98,6 +113,9 @@ func TestExample(t *testing.T) {
 	}
 	if c.Agent.Model.String() != "local/qwen3-32b" {
 		t.Errorf("ModelRef.String = %q", c.Agent.Model)
+	}
+	if got := c.Providers[0].RunningURL(); got != "http://127.0.0.1:8080/running" {
+		t.Errorf("RunningURL = %q", got)
 	}
 }
 

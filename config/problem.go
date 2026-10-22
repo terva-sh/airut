@@ -103,8 +103,10 @@ func decodeError(file string, err error) error {
 // expects names the kind of value key takes, following toml tags through
 // fileConfig. A segment naming no field, such as a provider id or an
 // index, is skipped.
-func expects(key string) string {
-	t := reflect.TypeFor[fileConfig]()
+func expects(key string) string { return expectsIn(reflect.TypeFor[fileConfig](), key) }
+
+// expectsIn is expects from t, the type key is relative to.
+func expectsIn(t reflect.Type, key string) string {
 	for _, seg := range strings.Split(key, ".") {
 		for t.Kind() == reflect.Map || t.Kind() == reflect.Slice || t.Kind() == reflect.Pointer {
 			t = t.Elem()
@@ -128,6 +130,8 @@ func expects(key string) string {
 		return "a whole number"
 	case t.Kind() == reflect.Bool:
 		return "true or false"
+	case t.Kind() == reflect.Float64:
+		return "a number"
 	case t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.String:
 		return "a list of strings"
 	case t.Kind() == reflect.Slice:
@@ -138,11 +142,20 @@ func expects(key string) string {
 	return ""
 }
 
+// fieldByTag finds the field tagged name in t, or in a struct t embeds,
+// as go-toml does.
 func fieldByTag(t reflect.Type, name string) (reflect.StructField, bool) {
 	for i := range t.NumField() {
-		tag, _, _ := strings.Cut(t.Field(i).Tag.Get("toml"), ",")
+		f := t.Field(i)
+		if f.Anonymous && f.Type.Kind() == reflect.Struct && f.Tag.Get("toml") == "" {
+			if inner, ok := fieldByTag(f.Type, name); ok {
+				return inner, true
+			}
+			continue
+		}
+		tag, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
 		if tag == name {
-			return t.Field(i), true
+			return f, true
 		}
 	}
 	return reflect.StructField{}, false

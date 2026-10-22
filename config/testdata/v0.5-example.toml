@@ -1,0 +1,179 @@
+# An airut bot's configuration, showing every key config.Load reads.
+#
+# Secrets are never written here. A key that holds one takes a reference
+# to where the deployment put it, as exactly one of:
+#
+#   { env = "NAME" }         an environment variable
+#   { credential = "NAME" }  a systemd credential: $CREDENTIALS_DIRECTORY/NAME,
+#                            from LoadCredential= or SetCredentialEncrypted=
+#   { file = "PATH" }        a file; a relative path is relative to this file
+#
+# A file or credential has one line ending (LF or CRLF) trimmed. A
+# plain string where a secret belongs is refused.
+#
+# Relative paths elsewhere are relative to this file too.
+
+[bot]
+# Starts a text command, as in "!roll 2d6". Defaults to "!".
+prefix = "!"
+# How many messages up a reply chain the bot reads for a message
+# addressed to it, 0 for none. Defaults to 3; at most 10.
+reply_depth = 3
+
+# Model providers: OpenAI-compatible endpoints. The table key is the
+# provider's id, and a model is named as "id/model".
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+# A keyless local server leaves out api_key.
+models = [
+  # context_window and max_output are in tokens; 0 or absent leaves
+  # them unknown. reasoning marks a model that thinks before answering.
+  { id = "qwen3-32b", context_window = 32768, max_output = 8192, reasoning = true },
+]
+
+[providers.proxy]
+base_url = "https://llm.example.net/v1"
+api_key = { credential = "proxy-api-key" }
+models = [{ id = "gpt-5.5" }]
+
+# Agent turns. Without this table the bot runs plain commands only.
+[agent]
+# The model a turn uses when it names none.
+model = "local/qwen3-32b"
+# Required. Caps a turn that sets no budget of its own.
+budget = { max_turns = 8, max_tokens = 200000 }
+# Optional. Turns per user and per channel in a sliding window; these
+# are the defaults.
+rate = { per_user = 5, per_channel = 20, window = "10m" }
+# Optional. How much of a remembered conversation a turn resumes, for a
+# turn that sets no bound of its own. Without it nothing is bounded but
+# the model's window. max_messages and max_tokens count the messages and
+# the estimated tokens a turn resumes, and compaction says what happens
+# to the rest: "summarize" (the default) keeps a summary the model
+# writes, "drop" forgets it. Messages older than max_age are left out
+# either way. room_messages is how many of the channel's latest messages
+# a turn sees as quoted chat beside the conversation, 0 (the default) to
+# 50; each costs a read of the channel for every turn. follow_within is
+# how soon a person must speak again for a Conversation turn to go on
+# with their last conversation rather than start a new one; it defaults
+# to 15m.
+history = { max_messages = 200, max_tokens = 60000, max_age = "168h", compaction = "summarize", room_messages = 10, follow_within = "15m" }
+
+# Optional. The judge: one call with no tools for each judgement a bot
+# asks for, such as whether to speak up in a conversation, on a model of
+# its own. Without this table every judgement abstains.
+[agent.judge]
+model = "local/qwen3-32b"
+# Judge calls in flight across the bot; more wait, and a room's waiting
+# call is replaced by its newer one. Set it to the server's parallel
+# slots. Defaults to 1.
+concurrency = 2
+# How the reply is held to the verdict's JSON: "response_format" (the
+# default, OpenAI's and llama-server's), "json_schema" or "grammar"
+# (llama.cpp's own fields), or "none".
+output = "json_schema"
+# llama.cpp only: pin each room to one of this many slots, and ask the
+# server to keep the prompt cached, so a room's next judgement reuses
+# it. 0 and false leave both to the server.
+slots = 2
+cache_prompt = true
+# Bounds a call, waiting included. Defaults to 30s.
+timeout = "20s"
+# Caps each call's whole request, instructions, chat, and reserved reply
+# together, so it fits the server's per-slot context. With no tokenizer,
+# the judge counts one token per bytes_per_token bytes, 3 by default,
+# which overestimates English. Over the cap it drops the oldest context
+# first. 0 caps nothing.
+max_input_tokens = 8000
+# bytes_per_token = 3
+# Judgements per channel in a sliding window, apart from the turn rate,
+# which a judgement never uses. Without it nothing caps them.
+rate = { per_channel = 60, window = "1h" }
+
+# Optional. Long-term memory, which the built-in remember, memories, and
+# unremember commands and the remember tool write.
+[agent.memory]
+# What happens when the model asks to remember something, per scope:
+# "off", "ask" (the person it is talking to is asked first), or "auto".
+# A memory about someone else always waits for that person's consent,
+# and one for the whole bot for an approver's. Defaults: ask, auto, off.
+model_writes = { user = "ask", channel = "auto", bot = "off" }
+# Active memories kept per person, per channel, and for the bot; past
+# these the least recently used is archived, and recalled when a request
+# mentions it. Defaults: 20, 50, 50.
+max_user = 20
+max_channel = 50
+max_bot = 50
+
+# Who may start an agent turn, per platform. A platform with no list, or
+# an empty one, allows nobody.
+[agent.access.discord]
+users = ["123456789012345678"]
+roles = ["234567890123456789"]
+
+[agent.access.matrix]
+# Matrix has no roles. The members of each room in rooms may start a
+# turn too, as the room's member list says when they ask. Name a room by
+# its id, never an alias, which can be pointed at another room.
+users = ["@owner:example.org"]
+rooms = ["!members:example.org"]
+
+# Where agent sessions persist. Required with [agent].
+[store]
+path = "/var/lib/airut-example/sessions.db"
+# Sessions idle longer than this are deleted. Defaults to 720h, 30 days.
+retention = "720h"
+
+# Each platform the bot serves has a table; leave out the others.
+[discord]
+token = { credential = "discord-token" }
+# Register commands in these guilds; empty or absent registers globally.
+guilds = ["345678901234567890"]
+
+[matrix]
+homeserver = "https://matrix.example.org"
+user_id = "@sample:example.org"
+# Logs in when no session is stored yet; optional once one is.
+password = { credential = "matrix-password" }
+# Keeps the Matrix session and the crypto store. Back it up.
+state_dir = "/var/lib/airut-example/matrix"
+device_name = "airut sample"
+# Optional, and best left out. The account's cross-signing recovery key,
+# which the cross-signing setup prints once. With it the bot signs its
+# own device at start when the device is not signed, as after the state
+# directory was re-created, so clients show its messages as verified.
+# Without it, -cross-sign does the same and asks for the key, so the key
+# never rests on the host. Guard it like the password: it can sign any
+# device as the bot's.
+# recovery_key = { credential = "matrix-recovery-key" }
+
+# Metrics. Without this table the bot keeps its metrics in memory only,
+# for a command that reports them.
+[metrics]
+# Serves /metrics in the Prometheus text format. Bind it to an address
+# only the scraper reaches: the metrics name commands and platforms,
+# never message text, but nothing guards the endpoint.
+listen = "127.0.0.1:9464"
+# Logs a summary of the metrics that changed since the last one.
+summary_every = "15m"
+
+# Runtime settings: the config layer of the settings the bot declares in
+# code. A value here replaces the setting's default, and an override set
+# from chat with `set NAME VALUE` replaces this, until `unset NAME` drops
+# it. The bot refuses to start on a name it does not declare, or on a
+# value outside the setting's bounds. A value is a whole number, true or
+# false, or a string, which is how a duration ("10m") or one of a fixed
+# set of values is written. A nested table's keys join with dots, so
+# [settings.roll] max_dice = 10 names the same setting. Secrets never go
+# here, because a setting's value is shown in chat.
+#
+# The Gate's limits are settings too, named agent.per_user,
+# agent.per_channel, agent.window, agent.max_turns, and agent.max_tokens.
+# They are set by [agent] rate and budget, never here, and those values
+# cap them: from chat they can be tightened, not loosened.
+#
+# Who may change a setting is the bot's to say. The sample bot reads its
+# owners from its own [app] table, as owners = { matrix = ["@you:example.org"] },
+# which only programs that read one accept.
+[settings]
+roll.max_dice = 10
