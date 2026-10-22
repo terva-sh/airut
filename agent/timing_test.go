@@ -99,8 +99,8 @@ func TestTurnsTimeTheirRequestsAndTools(t *testing.T) {
 		labels []string
 		want   uint64
 	}{
-		{"airut_agent_request_seconds", []string{"provider", "fake", "model", "m"}, 3},
-		{"airut_agent_first_token_seconds", []string{"provider", "fake", "model", "m"}, 1},
+		{"airut_agent_request_seconds", []string{"provider", "fake", "model", "m", "served", "m"}, 3},
+		{"airut_agent_first_token_seconds", []string{"provider", "fake", "model", "m", "served", "m"}, 1},
 		{"airut_agent_tool_seconds", []string{"tool", "roll"}, 2},
 	} {
 		if s, _ := m.Get(c.name, c.labels...); s.Kind != airut.Timing || s.Count != c.want {

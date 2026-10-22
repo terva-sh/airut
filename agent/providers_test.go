@@ -141,3 +141,71 @@ token = { env = "AIRUT_TEST_KEY" }
 		t.Errorf("the agent's history = %+v, want %+v", a.history, want)
 	}
 }
+
+// TestServedModels checks that a model's served id, not the alias the
+// file names it by, is what the catalog lists and what a request
+// carries, and that the agent's catalog describes the model as the
+// agent's first entry does.
+func TestServedModels(t *testing.T) {
+	t.Setenv("AIRUT_TEST_KEY", "token")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "airut.toml")
+	src := `
+[providers.local]
+base_url = "http://127.0.0.1:1/v1"
+models = [
+  { id = "fast", model = "Real-Model-Q4", context_window = 32768, max_output = 4096 },
+  { id = "small", base = "fast", context_window = 8192 },
+]
+
+[agent]
+model = "local/small"
+budget = { max_turns = 4, max_tokens = 1000 }
+
+[agent.judge]
+models = ["local/small", "local/fast"]
+
+[store]
+path = "sessions.db"
+
+[discord]
+token = { env = "AIRUT_TEST_KEY" }
+`
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, catalog := Providers(cfg)
+	if m, err := catalog.FindModel("local", "Real-Model-Q4"); err != nil || m.ContextWindow != 32768 {
+		t.Errorf("FindModel(served) = %+v, %v; want the first entry that serves it", m, err)
+	}
+	if _, err := catalog.FindModel("local", "fast"); err == nil {
+		t.Error("the catalog lists an alias")
+	}
+
+	a, err := Open(context.Background(), cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if len(a.chain) != 1 || a.chain[0].Served != "Real-Model-Q4" || a.chain[0].Model != "small" {
+		t.Errorf("the agent's chain = %+v, want the alias serving its root's id", a.chain)
+	}
+	if m, err := a.catalog.FindModel("local", "Real-Model-Q4"); err != nil || m.ContextWindow != 8192 || m.MaxOutput != 4096 {
+		t.Errorf("the agent's catalog = %+v, %v; want the variant's window", m, err)
+	}
+
+	j, err := OpenJudge(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.o.Model != "Real-Model-Q4" || j.o.MaxInputTokens != 8192 {
+		t.Errorf("the judge runs %q capped at %d, want the served id capped at the variant's window", j.o.Model, j.o.MaxInputTokens)
+	}
+	if len(j.models) != 2 || j.models[0].Alias != "small" || j.models[1].Alias != "fast" || j.models[1].MaxInputTokens != 32768 {
+		t.Errorf("the judge's chain = %+v", j.models)
+	}
+}

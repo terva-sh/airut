@@ -12,21 +12,37 @@ import (
 // provider's id, and a model catalog holding every model c lists. Each
 // client reads model metadata (output limits, reasoning) through that
 // catalog. It makes no network request.
+//
+// The catalog lists a model by its served id, the id a request carries.
+// Where variants serve one model, the first listed describes it.
 func Providers(c *config.Config) (map[string]provider.Client, *provider.Registry) {
 	reg := provider.NewRegistry()
 	clients := make(map[string]provider.Client, len(c.Providers))
 	for _, p := range c.Providers {
+		seen := map[string]bool{}
 		for _, m := range p.Models {
-			reg.RegisterExtraModel(provider.Model{
-				Provider:      p.ID,
-				ID:            m.ID,
-				DisplayName:   m.ID,
-				ContextWindow: m.ContextWindow,
-				MaxOutput:     m.MaxOutput,
-				Reasoning:     m.Reasoning,
-			})
+			served := m.Served
+			if served == "" {
+				served = m.ID
+			}
+			if !seen[served] {
+				seen[served] = true
+				reg.RegisterExtraModel(catalogModel(p.ID, served, m.Capabilities))
+			}
 		}
 		clients[p.ID] = provider.WithCatalog(provider.NewOpenAICompatibleAs(p.ID, p.APIKey.Value(), p.BaseURL), reg)
 	}
 	return clients, reg
+}
+
+// catalogModel describes a served model to terva.
+func catalogModel(providerID, served string, c config.Capabilities) provider.Model {
+	return provider.Model{
+		Provider:      providerID,
+		ID:            served,
+		DisplayName:   served,
+		ContextWindow: c.ContextWindow,
+		MaxOutput:     c.MaxOutput,
+		Reasoning:     c.Reasoning,
+	}
 }

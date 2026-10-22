@@ -1,0 +1,415 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"terva.sh/terva/packages/provider"
+
+	"terva.sh/airut"
+	"terva.sh/airut/config"
+)
+
+// The defaults of HealthOptions.
+const (
+	// DefaultBreakerFailures is how many failures in a row open a
+	// served model's breaker.
+	DefaultBreakerFailures = 3
+	// DefaultBreakerCoolOff is how long an open breaker skips its model
+	// before it lets one request through to try it again.
+	DefaultBreakerCoolOff = 30 * time.Second
+	// DefaultNotLoadedFor is how long a llama-swap answer that made a
+	// model unavailable is kept. An answer that made it available is
+	// never kept.
+	DefaultNotLoadedFor = 30 * time.Second
+	// DefaultRunningTimeout bounds one request to a llama-swap
+	// provider's /running.
+	DefaultRunningTimeout = 3 * time.Second
+)
+
+// ErrNoModel is the error of a turn or judgement that found no model of
+// its chain it could use: each was unavailable, or its breaker open.
+var ErrNoModel = errors.New("agent: no model of the chain is available")
+
+// HealthOptions configure NewHealth.
+type HealthOptions struct {
+	// Providers are the configured providers. A llama-swap provider's
+	// models are available as its /running list and load policy say. A
+	// provider not listed here, or of any other kind, is always
+	// available.
+	Providers []config.Provider
+	// HTTP is the client for /running. Nil means one that gives up after
+	// DefaultRunningTimeout.
+	HTTP *http.Client
+	// Failures and CoolOff tune the breakers, and NotLoadedFor the
+	// llama-swap cache. Zero takes the Default constants.
+	Failures     int
+	CoolOff      time.Duration
+	NotLoadedFor time.Duration
+	// Now is the clock, for tests. Nil means time.Now.
+	Now func() time.Time
+	// Logger receives each availability decision at Debug, by provider,
+	// served model, and kind, and each breaker that opens at Info. Nil
+	// discards them.
+	Logger *slog.Logger
+}
+
+// Health is what airut knows of each served model's health: whether its
+// provider says it can serve it now, and a circuit breaker that skips it
+// after failures in a row. Both key on the provider and the served id,
+// never the alias, so a failure seen through one variant holds for every
+// variant of the model. An Agent and a Judge may share one, so that a
+// failure one sees the other skips. It is safe for concurrent use.
+type Health struct {
+	providers    map[string]config.Provider
+	http         *http.Client
+	failures     int
+	coolOff      time.Duration
+	notLoadedFor time.Duration
+	now          func() time.Time
+	log          *slog.Logger
+
+	mu sync.Mutex
+	// absent is each llama-swap provider's last answer that made a model
+	// unavailable, by provider id.
+	absent   map[string]runningAnswer
+	breakers map[servedModel]*breaker
+}
+
+type servedModel struct{ provider, served string }
+
+// runningAnswer is one answer from /running: the models it listed, or
+// that it could not be read.
+type runningAnswer struct {
+	at          time.Time
+	running     []string
+	unreachable bool
+}
+
+// breaker is one served model's circuit breaker. It is closed while
+// openedAt is zero, open until the cool-off has passed, and half-open
+// after, when one request, the probe, may try the model.
+type breaker struct {
+	fails    int
+	openedAt time.Time
+	probing  bool
+}
+
+// NewHealth returns a Health. It makes no network request.
+func NewHealth(o HealthOptions) *Health {
+	h := &Health{
+		providers: map[string]config.Provider{}, http: o.HTTP,
+		failures: o.Failures, coolOff: o.CoolOff, notLoadedFor: o.NotLoadedFor,
+		now: o.Now, log: o.Logger,
+		absent: map[string]runningAnswer{}, breakers: map[servedModel]*breaker{},
+	}
+	for _, p := range o.Providers {
+		h.providers[p.ID] = p
+	}
+	if h.http == nil {
+		h.http = &http.Client{Timeout: DefaultRunningTimeout}
+	}
+	if h.failures <= 0 {
+		h.failures = DefaultBreakerFailures
+	}
+	if h.coolOff <= 0 {
+		h.coolOff = DefaultBreakerCoolOff
+	}
+	if h.notLoadedFor <= 0 {
+		h.notLoadedFor = DefaultNotLoadedFor
+	}
+	if h.now == nil {
+		h.now = time.Now
+	}
+	if h.log == nil {
+		h.log = slog.New(slog.DiscardHandler)
+	}
+	return h
+}
+
+// The reasons a chain passes over an entry, as airut_model_fallthrough_total
+// counts them. Each failure class is also an errClass.
+const (
+	reasonUnavailable = "unavailable"
+	reasonBreakerOpen = "breaker_open"
+	reasonTooLarge    = "too_large"
+)
+
+// The classes of a failed model request. The first five say the model
+// could not answer now, so a chain falls through to its next entry and
+// the breaker counts the failure. The rest stop the chain.
+const (
+	classConnect    = "connect"
+	class5xx        = "5xx"
+	class429        = "429"
+	classTimeout    = "timeout"
+	classNotFound   = "not_found"
+	classBadRequest = "bad_request"
+	classCanceled   = "canceled"
+	classOther      = "other"
+)
+
+// fallsThrough reports whether a failure of class moves a chain on.
+func fallsThrough(class string) bool {
+	switch class {
+	case classConnect, class5xx, class429, classTimeout, classNotFound:
+		return true
+	}
+	return false
+}
+
+// usable reports why the entry for served on providerID cannot take a
+// request now, or "" when it can. A half-open breaker lets this caller's
+// request through as its probe, which done ends.
+func (h *Health) usable(ctx context.Context, providerID, served string) string {
+	key := servedModel{providerID, served}
+	// shut reports whether the breaker refuses a request now: open and
+	// cooling off, or open with its one probe already out. h.mu is held.
+	shut := func() bool {
+		b := h.breakers[key]
+		return b != nil && !b.openedAt.IsZero() && (b.probing || h.now().Sub(b.openedAt) < h.coolOff)
+	}
+	h.mu.Lock()
+	if shut() {
+		h.mu.Unlock()
+		return reasonBreakerOpen
+	}
+	h.mu.Unlock()
+	if !h.available(ctx, providerID, served) {
+		return reasonUnavailable
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// The breaker may have opened, or its probe been taken, while
+	// /running was asked, so admit by the same rule again.
+	if shut() {
+		return reasonBreakerOpen
+	}
+	if b := h.breakers[key]; b != nil && !b.openedAt.IsZero() {
+		b.probing = true
+	}
+	return ""
+}
+
+// done records how a request to served on providerID ended, by its
+// failure class, or "" for a success. A failure that falls through
+// counts towards the breaker; a success closes it. Any other failure is
+// about the request, not the model, and shows the server answered, so it
+// closes the breaker too, except a cancellation, which shows nothing.
+func (h *Health) done(providerID, served, class string) {
+	key := servedModel{providerID, served}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	b := h.breakers[key]
+	switch {
+	case class == classCanceled:
+		if b != nil {
+			b.probing = false
+		}
+		return
+	case !fallsThrough(class):
+		delete(h.breakers, key)
+		return
+	}
+	if b == nil {
+		b = &breaker{}
+		h.breakers[key] = b
+	}
+	b.fails++
+	half := b.probing
+	b.probing = false
+	if half || b.fails >= h.failures {
+		b.openedAt = h.now()
+		h.log.Info("model breaker opened", "provider", providerID, "served", served,
+			"failures", b.fails, "class", class, "cool_off_ms", h.coolOff.Milliseconds())
+	}
+}
+
+// available reports whether providerID says it can serve served now.
+func (h *Health) available(ctx context.Context, providerID, served string) bool {
+	p, ok := h.providers[providerID]
+	if !ok || p.Kind != config.KindLlamaSwap {
+		return true
+	}
+	h.mu.Lock()
+	cached, have := h.absent[providerID]
+	h.mu.Unlock()
+	if have && h.now().Sub(cached.at) < h.notLoadedFor {
+		// A kept answer only ever says no: one that would now say yes, as
+		// for a model with another policy, is asked again.
+		if ok, kind := decide(p.Load, served, cached); !ok {
+			h.log.Debug("model availability", "provider", providerID, "served", served, "decision", kind, "cached", true)
+			return false
+		}
+	}
+	answer := runningAnswer{at: h.now()}
+	answer.running, answer.unreachable = h.running(ctx, p.RunningURL())
+	ok, kind := decide(p.Load, served, answer)
+	h.log.Debug("model availability", "provider", providerID, "served", served, "decision", kind, "cached", false)
+	h.mu.Lock()
+	if ok {
+		delete(h.absent, providerID)
+	} else {
+		h.absent[providerID] = answer
+	}
+	h.mu.Unlock()
+	return ok
+}
+
+// The kinds of availability decision, as the log names them.
+const (
+	decisionLoaded          = "loaded"
+	decisionLoadingWhenIdle = "loading_when_idle"
+	decisionLoadingAlways   = "loading_always"
+	decisionNotLoaded       = "not_loaded"
+	decisionBusyOtherModel  = "busy_other_model"
+	decisionUnreachable     = "unreachable"
+)
+
+// decide applies a load policy to one answer from /running.
+func decide(load, served string, a runningAnswer) (bool, string) {
+	switch {
+	case a.unreachable:
+		return false, decisionUnreachable
+	case containsString(a.running, served):
+		return true, decisionLoaded
+	case load == config.LoadAlways:
+		return true, decisionLoadingAlways
+	case load == config.LoadWhenIdle && len(a.running) == 0:
+		return true, decisionLoadingWhenIdle
+	case load == config.LoadWhenIdle:
+		return false, decisionBusyOtherModel
+	}
+	return false, decisionNotLoaded
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// running reads llama-swap's /running: the served ids it lists, or that
+// it could not be read. An answer that is not a JSON object whose
+// "running" is an array, as {}, null, or {"running":null}, could not be
+// read, and is logged as unreachable.
+func (h *Health) running(ctx context.Context, url string) ([]string, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, true
+	}
+	resp, err := h.http.Do(req)
+	if err != nil {
+		return nil, true
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, true
+	}
+	// Running is a pointer so that a body without the list, or with null
+	// for it, is told apart from an empty list: read as idle, it would let
+	// when_idle load a model over whatever is running.
+	var out struct {
+		Running *[]struct {
+			Model string `json:"model"`
+		} `json:"running"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil || out.Running == nil {
+		return nil, true
+	}
+	ids := make([]string, 0, len(*out.Running))
+	for _, m := range *out.Running {
+		ids = append(ids, m.Model)
+	}
+	return ids, false
+}
+
+// classify names the class of a failed model request. parent is the
+// caller's context: a request it ended was canceled, while one that ran
+// out its own time timed out.
+func classify(parent context.Context, err error) string {
+	var se *statusError
+	var pe *provider.ProviderError
+	var ne net.Error
+	switch {
+	case err == nil:
+		return ""
+	case parent.Err() != nil:
+		return classCanceled
+	case errors.As(err, &se):
+		return statusClass(se.code, se.notFound)
+	case errors.As(err, &pe) && pe.Status != 0:
+		return statusClass(pe.Status, mentionsMissingModel(pe.Msg))
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return classTimeout
+	case errors.As(err, &pe) && mentionsMissingModel(pe.Msg):
+		return classNotFound
+	case errors.As(err, &pe) && pe.Transient, provider.IsTransportError(err):
+		// A stream that died before it said anything, or a connection
+		// that failed, refused, or reset.
+		return classConnect
+	case errors.Is(err, context.Canceled):
+		return classCanceled
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		return classConnect
+	}
+	return classOther
+}
+
+// statusClass is the class of an HTTP status. notFound says the body
+// named a missing model, as some servers do with a 400.
+func statusClass(code int, notFound bool) string {
+	switch {
+	case code == http.StatusNotFound, notFound && code/100 == 4:
+		return classNotFound
+	case code == http.StatusTooManyRequests:
+		return class429
+	case code == http.StatusRequestTimeout, code == http.StatusGatewayTimeout:
+		return classTimeout
+	case code >= 500:
+		return class5xx
+	case code/100 == 4:
+		return classBadRequest
+	}
+	return classOther
+}
+
+// mentionsMissingModel reports whether a server's error text says the
+// model it was asked for does not exist. The text is read, never kept
+// or logged: a server may echo the request in it.
+func mentionsMissingModel(msg string) bool {
+	m := strings.ToLower(msg)
+	if strings.Contains(m, "model_not_found") {
+		return true
+	}
+	if !strings.Contains(m, "model") {
+		return false
+	}
+	for _, s := range []string{"not found", "does not exist", "no such model", "unknown model", "could not find"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipped counts and logs an entry a chain passed over for reason, to
+// try its next one, at use "agent" or "judge".
+func skipped(c *airut.Ctx, log *slog.Logger, use, providerID, alias, served, reason string) {
+	c.Metrics().Add("airut_model_fallthrough_total", 1, "use", use, "from", alias, "reason", reason)
+	log.Info("model fell through", "invocation", c.ID(), "use", use, "provider", providerID,
+		"model", alias, "served", served, "reason", reason)
+}
