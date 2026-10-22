@@ -140,7 +140,7 @@ type Bot struct {
 	// during one does not race it.
 	changelog  *changelog.Log
 	announceMu sync.Mutex
-	// owners is where Owner and HasOwner read the bot's owners.
+	// owners is where Owner, IsOwner, and HasOwner read the bot's owners.
 	owners *owners
 	// claimTold holds the senders, by platform and id, told in a direct
 	// message during this Run that the bot has no owner.

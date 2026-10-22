@@ -24,6 +24,17 @@ func Owner(c *Ctx) (bool, error) {
 
 var _ AccessCheck = Owner
 
+// IsOwner reports whether u owns the bot on u's platform: whether
+// Config.Owners lists u's id for it, or u is claimed there with airut
+// claim. It answers as Owner does for a caller, so code outside a
+// command, such as a Matrix invite check, can ask it of any user. A
+// claim is honoured within a minute of being made, and a claims read
+// that fails keeps the claims last read, so an id they do not hold is
+// refused. Treat an error as a refusal.
+func (b *Bot) IsOwner(ctx context.Context, u User) (bool, error) {
+	return b.owners.is(ctx, u)
+}
+
 // HasOwner reports whether the bot has an owner on platform p, from
 // Config.Owners or a claim.
 func (b *Bot) HasOwner(ctx context.Context, p Platform) (bool, error) {

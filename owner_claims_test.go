@@ -375,3 +375,86 @@ func TestMissesShareARead(t *testing.T) {
 		t.Errorf("the claims were read %d times, want once", n)
 	}
 }
+
+// isOwnerAgrees asks IsOwner about u, and checks it answers want and
+// that airut.Owner, through the secret command, answers the same.
+func isOwnerAgrees(t *testing.T, b *airut.Bot, a *airuttest.Adapter, u airut.User, want bool) {
+	t.Helper()
+	got, err := b.IsOwner(context.Background(), u)
+	if got != want || err != nil {
+		t.Errorf("IsOwner(%s %s) = %v, %v; want %v", u.Platform, u.ID, got, err, want)
+	}
+	if u.Platform != airuttest.Platform {
+		return
+	}
+	reply := refusedSecret
+	if want {
+		reply = "reply:yes"
+	}
+	wantEvents(t, a.Text("!secret", airuttest.As(u)), reply)
+}
+
+func TestIsOwnerAnswersAsOwnerDoes(t *testing.T) {
+	claimed := airut.User{Platform: airuttest.Platform, ID: "claimed-one"}
+	claims := &claimsAgent{claims: []airut.Claim{
+		{Platform: claimed.Platform, ID: claimed.ID, At: claimedAt},
+		{Platform: airut.Matrix, ID: "@claimed:example.org", At: claimedAt},
+	}}
+	b, clock, logs := claimsBot(t, airut.Config{Owners: map[airut.Platform][]string{
+		airuttest.Platform: {owner.ID}, airut.Matrix: {"@listed:example.org"},
+	}}, claims)
+	a := airuttest.Start(t, b)
+
+	// Listed and claimed owners, on the test platform and on Matrix.
+	isOwnerAgrees(t, b, a, owner, true)
+	isOwnerAgrees(t, b, a, claimed, true)
+	isOwnerAgrees(t, b, a, airut.User{Platform: airut.Matrix, ID: "@listed:example.org"}, true)
+	isOwnerAgrees(t, b, a, airut.User{Platform: airut.Matrix, ID: "@claimed:example.org"}, true)
+	// Someone else, and an owner's id on a platform it is neither listed
+	// nor claimed for, are not owners.
+	isOwnerAgrees(t, b, a, airut.User{Platform: airuttest.Platform, ID: "stranger"}, false)
+	isOwnerAgrees(t, b, a, airut.User{Platform: airuttest.Platform, ID: "@listed:example.org"}, false)
+	isOwnerAgrees(t, b, a, airut.User{Platform: airut.Discord, ID: owner.ID}, false)
+
+	// A claim made while the bot runs counts once the claims are due a
+	// read, within the minute, and not before.
+	late := airut.User{Platform: airuttest.Platform, ID: "late"}
+	claims.set([]airut.Claim{
+		{Platform: claimed.Platform, ID: claimed.ID, At: claimedAt},
+		{Platform: late.Platform, ID: late.ID, At: claimedAt},
+	}, nil)
+	isOwnerAgrees(t, b, a, late, false)
+	clock.advance(time.Minute)
+	isOwnerAgrees(t, b, a, late, true)
+
+	// A claims read that fails keeps the claims last read: a claimed
+	// owner still is one, and an id they do not hold is refused.
+	reads := claims.readCount()
+	claims.set(nil, errors.New("disk I/O error: the store at /srv/secret/path"))
+	clock.advance(time.Minute)
+	isOwnerAgrees(t, b, a, claimed, true)
+	isOwnerAgrees(t, b, a, owner, true)
+	isOwnerAgrees(t, b, a, airut.User{Platform: airuttest.Platform, ID: "stranger"}, false)
+	if claims.readCount() == reads {
+		t.Error("the failing claims read never ran")
+	}
+	if l := logs.String(); strings.Contains(l, "/srv/secret/path") || strings.Contains(l, "claimed-one") {
+		t.Errorf("the log holds the error's text or an owner's id:\n%s", l)
+	}
+}
+
+// A bot whose first claims read fails has no claimed owner, so IsOwner
+// refuses everyone the config does not list until a read succeeds.
+func TestIsOwnerRefusesWhenTheClaimsWereNeverRead(t *testing.T) {
+	claimed := airut.User{Platform: airuttest.Platform, ID: "claimed-one"}
+	list := []airut.Claim{{Platform: claimed.Platform, ID: claimed.ID, At: claimedAt}}
+	claims := &claimsAgent{claims: list, err: errors.New("database is locked")}
+	b, clock, _ := claimsBot(t, airut.Config{Owners: owned}, claims)
+	a := airuttest.Start(t, b)
+
+	isOwnerAgrees(t, b, a, claimed, false)
+	isOwnerAgrees(t, b, a, owner, true)
+	claims.set(list, nil)
+	clock.advance(time.Minute)
+	isOwnerAgrees(t, b, a, claimed, true)
+}
