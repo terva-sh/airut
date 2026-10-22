@@ -45,6 +45,18 @@ prefix = "!"
 # How many messages up a reply chain the bot reads for a message
 # addressed to it, 0 for none. Defaults to 3; at most 10.
 reply_depth = 3
+# The bot's owners, by platform: Matrix user ids and Discord user ids
+# (snowflakes). airut.Owner admits them, and a bot gives it to whatever
+# only owners may do, such as changing settings or the bot's profile.
+# The built-in status command tells anyone whether the bot has an owner,
+# and shows an owner the list. A bot with no owner on any platform it
+# serves warns at every start, and answers a direct message with how to
+# claim it. An owner can also be claimed on the host, without editing
+# this file, with `airut claim -config FILE @you:example.org`, or the
+# sample bot's own `airut-example claim @you:example.org`. Claims are kept
+# in [store], and the running bot honours one within a minute. No chat
+# command adds or removes an owner.
+owners = { matrix = ["@owner:example.org"], discord = ["123456789012345678"] }
 
 # Model providers: OpenAI-compatible endpoints. The table key is the
 # provider's id, and a model is named as "id/model".
@@ -103,9 +115,6 @@ model = "local/qwen3-32b"
 # models = ["local/qwen3-32b", "proxy/gpt-5.5"]
 # Required. Caps a turn that sets no budget of its own.
 budget = { max_turns = 8, max_tokens = 200000 }
-# Optional. Turns per user and per channel in a sliding window; these
-# are the defaults.
-rate = { per_user = 5, per_channel = 20, window = "10m" }
 # Optional. How much of a remembered conversation a turn resumes, for a
 # turn that sets no bound of its own. Without it nothing is bounded but
 # the model's window. max_messages and max_tokens count the messages and
@@ -119,6 +128,30 @@ rate = { per_user = 5, per_channel = 20, window = "10m" }
 # with their last conversation rather than start a new one; it defaults
 # to 15m.
 history = { max_messages = 200, max_tokens = 60000, max_age = "168h", compaction = "summarize", room_messages = 10, follow_within = "15m" }
+
+# Optional. Turns per user and per channel in a sliding window; these
+# are the defaults.
+[agent.rate]
+per_user = 5
+per_channel = 20
+window = "10m"
+# With wait = true, a turn these caps refuse waits for its slot instead
+# of failing: the bot reacts with an hourglass on the message, or replies
+# once with the wait when it cannot react, and starts the turn when the
+# slot frees. Each person has at most one turn waiting, for at most one
+# window. A turn the access list refuses, and one a chime starts, never
+# waits.
+wait = false
+
+# Optional. The owners' own caps, which [bot] owners and claimed owners
+# take in place of per_user and per_channel above, in the same window.
+# Their turns still count in the shared counts, so members are refused
+# once the room is full. 0 means no cap, and a key left out takes the
+# members' value; here per_channel stays 20. owners is the only group
+# with a rate of its own: any other key under for is a problem.
+[agent.rate.for.owners]
+per_user = 30
+# per_channel = 0
 
 # Optional. The judge: one call with no tools for each judgement a bot
 # asks for, such as whether to speak up in a conversation, on a model of
@@ -180,7 +213,9 @@ roles = ["234567890123456789"]
 users = ["@owner:example.org"]
 rooms = ["!members:example.org"]
 
-# Where agent sessions persist. Required with [agent].
+# Where agent sessions persist, and owners claimed with airut claim.
+# Required with [agent]. A bot without one takes its owners from
+# [bot] owners only.
 [store]
 path = "/var/lib/airut-example/sessions.db"
 # Sessions idle longer than this are deleted. Defaults to 720h, 30 days.
@@ -230,12 +265,13 @@ summary_every = "15m"
 # here, because a setting's value is shown in chat.
 #
 # The Gate's limits are settings too, named agent.per_user,
-# agent.per_channel, agent.window, agent.max_turns, and agent.max_tokens.
-# They are set by [agent] rate and budget, never here, and those values
-# cap them: from chat they can be tightened, not loosened.
+# agent.per_channel, agent.window, agent.max_turns, and agent.max_tokens,
+# with agent.for.owners.per_user and agent.for.owners.per_channel when
+# [agent.rate.for.owners] is set. They are set by [agent] rate and
+# budget, never here, and those values cap them: from chat they can be
+# tightened, not loosened.
 #
-# Who may change a setting is the bot's to say. The sample bot reads its
-# owners from its own [app] table, as owners = { matrix = ["@you:example.org"] },
-# which only programs that read one accept.
+# Who may change a setting is the bot's to say. The sample bot lets the
+# owners [bot] owners names, with Settings.Owner set to airut.Owner.
 [settings]
 roll.max_dice = 10

@@ -280,9 +280,15 @@ func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func(), finalOnly bool) e
 	}
 	m, command := r.c.bot.metrics, r.c.metricCommand()
 	g := r.c.bot.gate
-	if err := g.check(r.c); err != nil {
+	// With Gate.Wait on, enter may wait for the turn's slot; the typing
+	// notice starts only once it is admitted.
+	if err := g.enter(r.c); err != nil {
 		var rf *Refusal
-		errors.As(err, &rf)
+		if !errors.As(err, &rf) {
+			// The invocation ended while the turn waited.
+			m.Add("airut_agent_turns_total", 1, "command", command, "outcome", errorKind(err))
+			return err
+		}
 		r.c.bot.cfg.Logger.Info("agent turn refused", "invocation", r.c.inv.ID,
 			"platform", string(r.c.inv.Caller.Platform), "reason", rf.Reason)
 		m.Add("airut_agent_turns_total", 1, "command", command, "outcome", "refused_"+rf.Reason)

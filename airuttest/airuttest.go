@@ -69,6 +69,7 @@ type Adapter struct {
 	members    map[string]map[string]bool      // channel id -> user id
 	memberErrs map[string]error                // channel id -> the error Member fails with
 	sendErrs   map[string]error                // channel id -> the error Send fails with
+	reactErrs  map[string]error                // channel id -> the error Conn.React fails with
 	// keys maps a message's Key to the ref it was sent as.
 	keys map[string]string
 	// reactions holds the reactions made through the Conn, by ref, and
@@ -610,13 +611,17 @@ func (a *Adapter) Conn() airut.Conn { return conn{a} }
 // own React delivers a member's reaction to the bot.
 type conn struct{ *Adapter }
 
-// React records a reaction the bot added, and returns its ref. Reacting
-// again with the same emoji while the reaction stands records nothing
-// and returns the same ref, as both platforms do.
+// React records a reaction the bot added, and returns its ref, or fails
+// as FailReact set for the channel. Reacting again with the same emoji
+// while the reaction stands records nothing and returns the same ref, as
+// both platforms do.
 func (c conn) React(_ context.Context, ch airut.Channel, ref airut.MessageRef, emoji string) (airut.MessageRef, error) {
 	a := c.Adapter
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.reactErrs[ch.ID]; err != nil {
+		return airut.MessageRef{}, err
+	}
 	r := reaction{ch.ID, ref.ID, emoji}
 	if own, ok := a.live[r]; ok {
 		return airut.MessageRef{ID: own}, nil
@@ -730,6 +735,18 @@ func (a *Adapter) FailSend(channel string, err error) {
 		a.sendErrs = map[string]error{}
 	}
 	a.sendErrs[channel] = err
+}
+
+// FailReact makes Conn.React fail with err for the channel, recording
+// nothing, as a platform that refuses the reaction does. A nil err
+// undoes it.
+func (a *Adapter) FailReact(channel string, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.reactErrs == nil {
+		a.reactErrs = map[string]error{}
+	}
+	a.reactErrs[channel] = err
 }
 
 // Send records a message posted through the Conn. A repeated Key

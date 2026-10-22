@@ -1,6 +1,7 @@
 package airut
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -28,9 +29,39 @@ type Gate struct {
 	PerUser    int
 	PerChannel int
 	Window     time.Duration
+	// Owners, if set, is the rate of a caller Owner admits: their turns
+	// are checked against its caps in place of PerUser and PerChannel, in
+	// the same Window. They are still counted in the caller's and the
+	// channel's shared counts, so members see the room's real usage and
+	// are refused once it is full. nil leaves owners at the members'
+	// rate, and the gate then never asks Owner. A Chime interruption is
+	// the channel's, and never takes it; a follow-up takes its PerUser.
+	// An owner check that fails is logged by kind and the turn takes the
+	// members' rate.
+	Owners *GroupRate
+	// Wait lets a turn the rate refuses wait for its slot instead of
+	// failing. The turn reacts with an hourglass on the message that
+	// started it, or replies once with the wait when it cannot react,
+	// then starts as soon as the gate admits it and removes the
+	// reaction. It waits at most one Window from its first refusal, and
+	// past that fails with the refusal it would have had. It ends with
+	// the invocation's context. Each caller may have one turn waiting; a
+	// second the rate refuses is refused at once. A turn the access list
+	// refuses never waits, nor does one a Chime handler starts, which
+	// nobody asked for. Off, a refused turn fails at once.
+	Wait bool
 	// Budget fills each zero field of a Turn's budget. The Agent stops a
 	// turn at the budget it receives.
 	Budget Budget
+}
+
+// GroupRate is the rate of a group of callers with caps of their own,
+// such as Gate.Owners. PerUser and PerChannel take the Gate's place for
+// the group's turns, counted in the Gate's Window. Zero means no cap of
+// that kind.
+type GroupRate struct {
+	PerUser    int
+	PerChannel int
 }
 
 // Access lists platform user and role ids, and the ids of channels
@@ -49,7 +80,13 @@ type Access struct {
 type Refusal struct {
 	// Reason is RefusedAccess or RefusedRate.
 	Reason string
-	msg    string
+	// Wait is how long until the turn could start, as the message names
+	// it, for a rate refusal; 0 for an access refusal.
+	Wait time.Duration
+	msg  string
+	// retry, on a rate refusal, is the message before the wait, so that
+	// the refusal can be worded for another wait.
+	retry string
 }
 
 // The refusal reasons.
@@ -59,6 +96,11 @@ const (
 )
 
 func (r *Refusal) Error() string { return r.msg }
+
+// rateRefusal is a rate refusal whose message is retry followed by wait.
+func rateRefusal(retry string, wait time.Duration) *Refusal {
+	return &Refusal{Reason: RefusedRate, Wait: wait, msg: retry + after(wait) + ".", retry: retry}
+}
 
 // allows reports whether the caller of c is on the access list, or a
 // member of one of its channels. A membership check that fails is logged
@@ -103,40 +145,81 @@ func errRefusedAccess() *Refusal {
 // Access.Channels, and the turn takes one of PerChannel's turns and none
 // of the sender's. One it starts as a follow-up is the sender's, as a
 // mention's is, and takes none of PerChannel's.
+//
+// A caller Owner admits is checked against Owners' caps, when the Gate
+// sets them, and counted in the same shared counts as anyone else.
 func (g *gate) check(c *Ctx) error {
 	if c.followUp {
 		if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
 			return errRefusedAccess()
 		}
-		mine := g.limits()
-		mine.PerChannel = 0
-		return g.rate.take(mine, c.inv)
+		mine := g.limits().userOnly()
+		return g.rate.charge(g.callerCaps(c, mine).userOnly(), mine, c.inv)
 	}
 	if c.chime != nil {
 		ch := c.inv.Channel
 		if !slices.Contains(g.cfg.Access[ch.Platform].Channels, ch.ID) {
 			return &Refusal{Reason: RefusedAccess, msg: "This channel is not allowed to start an agent turn by itself."}
 		}
-		room := g.limits()
-		room.PerUser = 0
-		return g.rate.take(room, c.inv)
+		room := g.limits().channelOnly()
+		return g.rate.charge(room, room, c.inv)
 	}
 	if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
 		return errRefusedAccess()
 	}
-	return g.rate.take(g.limits(), c.inv)
+	lim := g.limits()
+	return g.rate.charge(g.callerCaps(c, lim), lim, c.inv)
+}
+
+// userOnly returns g with no cap on channels, its Owners' included, for
+// a turn that takes none of the channel's.
+func (g Gate) userOnly() Gate {
+	g.PerChannel = 0
+	if g.Owners != nil {
+		g.Owners = &GroupRate{PerUser: g.Owners.PerUser}
+	}
+	return g
+}
+
+// channelOnly returns g with no cap on callers, its Owners' included,
+// for a turn that is the channel's.
+func (g Gate) channelOnly() Gate {
+	g.PerUser = 0
+	if g.Owners != nil {
+		g.Owners = &GroupRate{PerChannel: g.Owners.PerChannel}
+	}
+	return g
+}
+
+// callerCaps returns lim with the caps the caller of c is checked
+// against: Owners' when lim sets them and Owner admits the caller,
+// otherwise lim's own. An owner check that fails is logged by kind and
+// leaves the members' caps, so a failure never lifts a cap.
+func (g *gate) callerCaps(c *Ctx, lim Gate) Gate {
+	if lim.Owners == nil {
+		return lim
+	}
+	owner, err := g.isOwner(c)
+	if err != nil {
+		c.bot.cfg.Logger.Info("owner check failed", "invocation", c.inv.ID, "error_kind", errorKind(err))
+		return lim
+	}
+	if owner {
+		lim.PerUser, lim.PerChannel = lim.Owners.PerUser, lim.Owners.PerChannel
+	}
+	return lim
 }
 
 // admits reports why a follow-up turn for c would be refused now,
 // without counting one: RefusedAccess, RefusedRate, or "" when it would
-// start.
+// start. An owner is held to Owners' PerUser, as check holds them.
 func (g *gate) admits(c *Ctx) string {
 	if ok, _ := g.cfg.Access[c.inv.Caller.Platform].allows(c); !ok {
 		return RefusedAccess
 	}
-	cfg := g.limits()
+	caps := g.callerCaps(c, g.limits())
 	user := string(c.inv.Caller.Platform) + "/user/" + c.inv.Caller.ID
-	if g.rate.wait(user, cfg.PerUser, cfg.Window) > 0 {
+	if g.rate.wait(user, caps.PerUser, caps.Window) > 0 {
 		return RefusedRate
 	}
 	return ""
@@ -160,6 +243,12 @@ type gate struct {
 	rate limiter
 	// knobs are the Gate's limits as settings, on a bot with an Agent.
 	knobs *gateSettings
+	// isOwner is Owner, which tests replace to make it fail.
+	isOwner AccessCheck
+	// waiters holds the caller keys with a turn waiting for its slot.
+	waiters waiters
+	// sleep waits d or until ctx ends; tests replace it.
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 // limits returns the Gate with the limits in force.
@@ -168,6 +257,9 @@ func (g *gate) limits() Gate {
 	if k := g.knobs; k != nil {
 		cfg.PerUser, cfg.PerChannel, cfg.Window = k.perUser.Get(), k.perChannel.Get(), k.window.Get()
 		cfg.Budget = Budget{Turns: k.turns.Get(), Tokens: k.tokens.Get()}
+		if k.ownersPerUser != nil {
+			cfg.Owners = &GroupRate{PerUser: k.ownersPerUser.Get(), PerChannel: k.ownersPerChannel.Get()}
+		}
 	}
 	return cfg
 }
@@ -181,6 +273,14 @@ func (g *gate) limits() Gate {
 type gateSettings struct {
 	perUser, perChannel, turns, tokens *Setting[int]
 	window                             *Setting[time.Duration]
+	// ownersPerUser and ownersPerChannel are Gate.Owners' caps, declared
+	// only when the Gate sets them.
+	ownersPerUser, ownersPerChannel *Setting[int]
+}
+
+// ownersCapped reports whether either of the owners' caps is set.
+func (k *gateSettings) ownersCapped() bool {
+	return k.ownersPerUser != nil && (k.ownersPerUser.Get() > 0 || k.ownersPerChannel.Get() > 0)
 }
 
 // maxGateWindow bounds the agent.window setting.
@@ -231,12 +331,19 @@ func (b *Bot) declareGateSettings(cfg Gate) *gateSettings {
 			return Errorf("agent.window must be at least %s: a setting may tighten the configured limit, not loosen it.", formatDuration(cfg.Window))
 		case d <= 0 && (k.perUser.Get() > 0 || k.perChannel.Get() > 0):
 			return Errorf("agent.window must be positive while agent.per_user or agent.per_channel is set.")
+		case d <= 0 && k.ownersCapped():
+			return Errorf("agent.window must be positive while agent.for.owners.per_user or agent.for.owners.per_channel is set.")
 		}
 		return nil
 	}
 	fromConfig(ws, cfg.Window)
 	k.perUser = limit("agent.per_user", "Agent turns one person may start in each window", "no cap", cfg.PerUser, true)
 	k.perChannel = limit("agent.per_channel", "Agent turns one channel may start in each window", "no cap", cfg.PerChannel, true)
+	if o := cfg.Owners; o != nil {
+		k.ownersPerUser = limit("agent.for.owners.per_user", "Agent turns one owner may start in each window", "no cap", o.PerUser, true)
+		k.ownersPerChannel = limit("agent.for.owners.per_channel",
+			"Agent turns a channel may have started in each window when an owner starts one", "no cap", o.PerChannel, true)
+	}
 	k.turns = limit("agent.max_turns", "Model requests an agent turn may make when it sets no budget", "none", cfg.Budget.Turns, false)
 	k.tokens = limit("agent.max_tokens", "Tokens an agent turn may spend when it sets no budget", "none", cfg.Budget.Tokens, false)
 	return k
@@ -249,7 +356,18 @@ func newGate(cfg Gate) *gate {
 	if cfg.PerUser < 0 || cfg.PerChannel < 0 || cfg.Budget.Turns < 0 || cfg.Budget.Tokens < 0 {
 		panic("airut: Gate limits cannot be negative")
 	}
-	return &gate{cfg: cfg, rate: limiter{now: time.Now, seen: map[string][]time.Time{}}}
+	if o := cfg.Owners; o != nil {
+		if (o.PerUser > 0 || o.PerChannel > 0) && cfg.Window <= 0 {
+			panic("airut: Gate.Window must be positive when Owners sets a cap")
+		}
+		if o.PerUser < 0 || o.PerChannel < 0 {
+			panic("airut: Gate limits cannot be negative")
+		}
+		// A copy, so the caller changing theirs changes nothing here.
+		own := *o
+		cfg.Owners = &own
+	}
+	return &gate{cfg: cfg, rate: limiter{now: time.Now, seen: map[string][]time.Time{}}, isOwner: Owner, sleep: sleep}
 }
 
 // limiter counts turn starts in a sliding window, per key.
@@ -263,30 +381,45 @@ type limiter struct {
 // take counts a turn for inv's caller and channel, or refuses it when
 // either is at its cap. A refused turn counts against neither.
 func (l *limiter) take(cfg Gate, inv Invocation) error {
-	if cfg.PerUser <= 0 && cfg.PerChannel <= 0 {
+	return l.charge(cfg, cfg, inv)
+}
+
+// charge refuses a turn for inv when its caller or channel is at
+// check's cap, and otherwise counts it. Which counts it is recorded in
+// comes from the caps every group is configured with, count's own and
+// count.Owners', whichever caps apply to this caller: it is counted for
+// the caller when any group caps callers, and for the channel when any
+// caps channels. So a member's turn shows in a count only an owners'
+// cap reads, and an owner's in one only the members' cap reads. The two
+// share check's Window. A refused turn counts against neither.
+func (l *limiter) charge(check, count Gate, inv Invocation) error {
+	countUser := check.PerUser > 0 || count.PerUser > 0 || count.Owners != nil && count.Owners.PerUser > 0
+	countChannel := check.PerChannel > 0 || count.PerChannel > 0 || count.Owners != nil && count.Owners.PerChannel > 0
+	if !countUser && !countChannel {
 		return nil
 	}
+	window := check.Window
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	l.sweep(now, cfg.Window)
+	l.sweep(now, window)
 	p := string(inv.Caller.Platform)
 	user, channel := p+"/user/"+inv.Caller.ID, p+"/channel/"+inv.Channel.ID
 	// When both are full, the one that stays full longer is named, so the
 	// wait the caller is given is one after which the turn can start.
-	uwait, ufull := l.full(user, cfg.PerUser, now, cfg.Window)
-	cwait, cfull := l.full(channel, cfg.PerChannel, now, cfg.Window)
+	uwait, ufull := l.full(user, check.PerUser, now, window)
+	cwait, cfull := l.full(channel, check.PerChannel, now, window)
 	switch {
 	case ufull && (!cfull || uwait >= cwait):
-		return &Refusal{Reason: RefusedRate, msg: "You have started too many agent turns. Try again in " + after(uwait) + "."}
+		return rateRefusal("You have started too many agent turns. Try again in ", uwait)
 	case cfull:
-		return &Refusal{Reason: RefusedRate, msg: "Too many agent turns have started in this channel. Try again in " + after(cwait) + "."}
+		return rateRefusal("Too many agent turns have started in this channel. Try again in ", cwait)
 	}
-	if cfg.PerUser > 0 {
-		l.seen[user] = append(l.seen[user], now)
+	if countUser {
+		l.seen[user] = append(l.prune(user, now, window), now)
 	}
-	if cfg.PerChannel > 0 {
-		l.seen[channel] = append(l.seen[channel], now)
+	if countChannel {
+		l.seen[channel] = append(l.prune(channel, now, window), now)
 	}
 	return nil
 }
@@ -322,11 +455,25 @@ func (l *limiter) left(key string, max int, window time.Duration) int {
 }
 
 // full drops key's starts that left the window and reports whether
-// max remain, with how long until the oldest leaves.
+// max remain, with how long until enough leave that fewer than max do.
+// That is not always the oldest: a group with a higher cap, as owners,
+// can leave more than max in a count another group reads.
 func (l *limiter) full(key string, max int, now time.Time, window time.Duration) (time.Duration, bool) {
 	if max <= 0 {
 		return 0, false
 	}
+	ts := l.prune(key, now, window)
+	if len(ts) < max {
+		return 0, false
+	}
+	return ts[len(ts)-max].Add(window).Sub(now), true
+}
+
+// prune drops key's starts that left the window and returns the rest.
+// A turn counted under no cap of its own, as an uncapped owner's, is
+// pruned when the next is counted, so its key never grows past one
+// window's turns.
+func (l *limiter) prune(key string, now time.Time, window time.Duration) []time.Time {
 	ts := l.seen[key]
 	i := 0
 	for i < len(ts) && !ts[i].After(now.Add(-window)) {
@@ -335,13 +482,10 @@ func (l *limiter) full(key string, max int, now time.Time, window time.Duration)
 	ts = ts[i:]
 	if len(ts) == 0 {
 		delete(l.seen, key)
-		return 0, false
+		return nil
 	}
 	l.seen[key] = ts
-	if len(ts) < max {
-		return 0, false
-	}
-	return ts[0].Add(window).Sub(now), true
+	return ts
 }
 
 // sweep forgets keys whose every start has left the window, at most once

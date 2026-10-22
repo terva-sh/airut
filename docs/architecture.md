@@ -628,6 +628,44 @@ trigger it. So before a turn reaches the agent, the core checks
   per channel in a sliding `Window`. The counts are held in memory, and a
   refused turn counts against neither. A `Chime` interruption counts
   against `PerChannel` only, and a follow-up against `PerUser` only.
+- **Owners' rate:** `Gate.Owners`, a `*GroupRate`, gives a caller
+  `airut.Owner` admits caps of their own, `PerUser` and `PerChannel` in
+  the same `Window`, with zero meaning no cap. An owner's turn is checked
+  against them and still counted in the shared caller and channel
+  counts, so members see the room's real usage and are refused once it
+  is full, even by an owner's turns. A follow-up takes the owners'
+  `PerUser`, and a `Chime` interruption, being the channel's, never
+  takes them. An owner check that fails is logged by kind and the turn
+  takes the members' rate, so a failure never lifts a cap. With
+  `Owners` nil the gate never asks `Owner`. The file sets it with
+  `[agent.rate.for.owners]`, whose `per_user` and `per_channel` each
+  take `[agent] rate`'s value when left out. `owners` is the only key
+  `for` accepts. The keyed table, and a `GroupRate` field named for its
+  group, leave room for a later release to add groups of its own users,
+  roles, and channels beside it without changing this one.
+- **Waiting for a slot:** with `Gate.Wait` on, a turn the rate refuses
+  waits for its slot instead of failing. It reacts with ⏳ on the
+  message that started it, through `Conn.React`, sleeps for the wait its
+  refusal names, and checks the gate again. The window may have moved,
+  so it may wait again, but never past one `Window` from its first
+  refusal: a wait that would end later fails at once with the refusal
+  the turn would have had, and a turn woken past that deadline is not
+  admitted, though one woken exactly at it is. Time spent reacting
+  comes off the sleep, so the retry is due when the refusal said. The reaction comes down when the turn starts,
+  gives up, or is cancelled. Where there is no message to react to, as
+  for a Discord application command, or the reaction fails, the bot
+  replies once instead, "I'll get to this in 1 minute 59 seconds.", with
+  the time left as it is sent, worded as a refusal words a wait. The
+  wait ends with the invocation's context, so stopping the bot drops it. Each caller, by platform and
+  user id, may have one turn waiting; a second the rate refuses is
+  refused at once. A turn the access list refuses never waits, and
+  neither does one a `Chime` handler starts: an interruption is the
+  channel's and nobody asked for it, and a follow-up runs in the room's
+  worker, where waiting would hold up the room, and is already checked
+  before it is judged worth a turn. The typing notice starts only when
+  the turn does. The file sets it with `[agent.rate] wait = true`. It is
+  off by default, and off nothing changes. It is not a setting: it
+  chooses how the bot behaves rather than how much it may spend.
 - **Budget:** each zero field of the turn's `Budget` takes the gate's
   default. The agent stops the turn at the budget it receives.
 
@@ -635,8 +673,10 @@ On a bot with an Agent, the rate and budget are settings whose owners
 may tighten them from chat, as [Settings](#settings) describes.
 
 A refused turn returns a `*Refusal`, and the core answers it in the chat
-with the reason and, for a rate limit, how long to wait. The log gets the
-invocation id, the platform, and the reason, never the prompt.
+with the reason and, for a rate limit, how long to wait, which
+`Refusal.Wait` also carries; it is 0 for an access refusal. The log gets
+the invocation id, the platform, and the reason, never the prompt. A
+waiting turn logs its id and how long it waited, nothing more.
 `agent.Gate` builds the `Gate` from the bot's configuration file.
 
 The gate decides who may start a turn. A command can narrow who may use
@@ -952,7 +992,7 @@ what falls past a cap. `agent.Agent` keeps them in the session store.
   whose caller it refuses is never offered the tool. Nil lets everyone.
   Restrict them where what a member writes should not reach the turns of
   people who act on it, as a bot whose moderators' turns can edit
-  content passes `AnyOf(owners, MemberOf(modRoom))`. A check that
+  content passes `AnyOf(airut.Owner, MemberOf(modRoom))`. A check that
   refuses everyone shuts them.
 - **The tool.** `remember` is also a tool. `Bot.Tools("remember")`,
   called in a handler, hands it to a turn, so "remember that I prefer
@@ -1039,9 +1079,10 @@ panic in it is logged, and the change stands.
   refuses, so a misspelt setting cannot silently do nothing. A stored
   override that no longer validates, as after its declaration changed,
   is logged by name and ignored, and the layers beneath apply.
-- **Who.** airut has no roles, so `Config.Settings.Owner` is an access
-  check the bot supplies. A setting's `Change` check defaults to it, and
-  with no Owner nothing is changeable from chat. A setting's `Read`
+- **Who.** `Config.Settings.Owner` is an access check the bot supplies,
+  usually `airut.Owner`, which admits the bot's owners. A setting's
+  `Change` check defaults to it, and with no Owner nothing is changeable
+  from chat. A setting's `Read`
   check defaults to everyone. One the caller may not read is answered as
   if it did not exist, so its name does not leak.
 - **Built-in commands.** A bot with settings gains three, which a bot
@@ -1077,7 +1118,9 @@ the setting's name, the layer, the actor's id, and the source.
 
 On a bot with an Agent, the Gate's limits are settings:
 `agent.per_user`, `agent.per_channel`, `agent.window`,
-`agent.max_turns`, and `agent.max_tokens`. Their config layer is
+`agent.max_turns`, and `agent.max_tokens`, with
+`agent.for.owners.per_user` and `agent.for.owners.per_channel` when
+`Gate.Owners` is set. Their config layer is
 `Config.Gate`, from `[agent]` rate and budget, and it is also their
 ceiling: from chat a limit can be tightened, or loosened back to the
 configured value, and no further, so spend never exceeds what the
@@ -1086,10 +1129,127 @@ set first. The access lists stay out of settings for the reason owners
 do: a list someone can edit from chat lets them grant themselves
 access.
 
+## Owners
+
+A bot's owners are the people who run it, listed by platform in
+`Config.Owners`, which a config file's `[bot] owners` gives:
+
+```toml
+[bot]
+owners = { matrix = ["@you:example.org"], discord = ["123456789012345678"] }
+```
+
+`config.Load` checks each id's form for its platform, a Matrix user id
+or a Discord snowflake, and `airut.ByPlatform(cfg.Bot.Owners)` keys the
+table by `Platform`. Owners are airut's rather than each app's, so a
+bot that has no agent still has them, and no bot repeats the list.
+
+- **`airut.Owner`** is an `AccessCheck` that admits a caller whose id
+  is listed for their platform, or claimed there with `airut claim`.
+  `Bot.HasOwner` reports whether a platform has any owner, from either.
+- **The built-ins stay opt-in.** `Config.ProfileEditors`,
+  `Config.Settings.Owner`, and `Config.MemoryAccess` do not default to
+  `Owner`. A bot gives it to them, as
+  `ProfileEditors: airut.Owner`. Defaulting them would turn on the
+  profile command and chat settings changes the moment a config gained
+  an owner.
+- **Owners can have their own turn rate**, `Gate.Owners`, from
+  `[agent.rate.for.owners]`, as [Gating](#gating) describes. It is
+  opt-in like the built-ins: without it owners take the members' rate.
+- **Owners never change from chat.** No chat command adds or removes
+  an owner, so an owner account taken over cannot entrench itself or
+  lock the others out. Owners change in the config file or on the host
+  with `airut claim`.
+- **An unowned bot says so.** `Run` logs a warning at every start when
+  no platform the bot serves has an owner: "no owner configured; set
+  [bot] owners or claim the bot with airut claim". It names the
+  platforms and the key, never an id. A direct message that runs no
+  command, on a platform with no owner, is answered with how to claim
+  the bot, once per sender each time the bot starts. Help does not say
+  it, since that would tell every member the bot is unowned.
+- **`status`** is a built-in command, replaced by a bot command of the
+  same name. It answers privately with the running version when
+  `Config.Version` is set, each connected platform, and whether it has
+  an owner or "no owner: claim it with airut claim on the host". To an
+  owner it also lists every owner id with where it comes from: `config`
+  for `Config.Owners`, or `claimed` with the time of the claim. It is
+  not a tool, since what it shows an owner is no turn's business.
+
+### Claiming a bot
+
+A bot deployed without `[bot] owners` is claimed from its host:
+
+```sh
+airut claim -config /etc/mybot/bot.toml @you:example.org
+airut unclaim -config /etc/mybot/bot.toml @you:example.org
+```
+
+The form is `claim [-config FILE] [-actor NAME] [PLATFORM] USER`.
+`PLATFORM` is `matrix` or `discord`, and may be left out when the id's
+form names it: `@you:example.org` is a Matrix id, and a Discord id is
+digits. Running a command on the host is the proof of control. A claim
+by the first person to message the bot was never on the table, and a
+one-time code logged at start was set aside, because anyone who can read
+the log could claim an unclaimed bot with it.
+
+- **Where claims live.** In the `[store]` session database, in an
+  `owner_claims` table that records the platform, the id, when it was
+  claimed, and `-actor`, which defaults to the user running the command.
+  The command is a separate process and finds only the store the config
+  file names, so a bot with no `[store]` takes its owners from
+  `[bot] owners` alone, and `airut claim` exits with "this bot has no
+  [store]; list owners in [bot] owners". The command opens the database
+  as the bot does, in WAL mode, so it is safe beside the running bot,
+  and it sweeps nothing. Run it as the bot's user, so the files it
+  touches stay the bot's.
+- **What the command reads.** `config.LoadOwners` reads `[bot] owners`
+  and `[store]` only, so the command needs none of the bot's secrets
+  and accepts a file with an `[app]` table. It checks the id's form for
+  the platform.
+- **No-ops and refusals.** Claiming an owner `[bot] owners` lists, or
+  one already claimed, changes nothing and says so. Unclaiming an owner
+  the file lists is refused, "edit [bot] owners", after removing any
+  claim the same id has, which would otherwise come back when the list
+  drops them.
+- **How the bot reads claims.** The core declares `airut.OwnerClaims`,
+  one method that lists the claimed owners, and reads claims from
+  `Config.Agent` when it is one. `terva.sh/airut/agent`'s Agent is. The
+  core imports neither the agent nor SQLite. A bot whose Agent keeps no
+  claims, or that has none, has its config owners only. There is no
+  pluggable store: the command could not write one an app set up in
+  code.
+- **Within a minute, without a restart.** The core caches the claims. A
+  check that `[bot] owners` does not answer reads them again when the
+  last read is a minute old, so a new claim is honoured, and a removed
+  one dropped, within a minute, and a busy bot reads them at most once a
+  minute. A read that fails keeps the claims last read and refuses an id
+  they do not hold. It logs the error's kind once per run of failures,
+  never the error's text. Reading claims only at start was rejected,
+  because the restart is the step most likely to be forgotten, and a
+  reload signal would be new machinery for a rare action.
+- **Claims count everywhere owners do**: in `Owner`, `HasOwner`, the
+  start warning, the direct-message claim line, and `status`.
+
+A bot can mount the commands as its own subcommands, so that
+`docker exec mybot mybot claim @you:example.org` works with no second
+binary. `terva.sh/airut/agent/claim` exports them: `claim.Main` is
+`airut claim`, and `claim.Command` names the program and the config file
+`-config` defaults to:
+
+```go
+if len(os.Args) > 1 && (os.Args[1] == "claim" || os.Args[1] == "unclaim") {
+	os.Exit(claim.Command{Prog: "mybot", Config: "/etc/mybot/bot.toml"}.Run(os.Args[1:], os.Stdout, os.Stderr))
+}
+```
+
+The sample bot does this. The commands exit 0 when the owners are as
+asked, a no-op included; 1 when refused or failed; and 2 for a mistake
+in the command line.
+
 ## Profile
 
 `Config.ProfileEditors` registers the built-in `profile` command for
-the callers it allows; nil registers none. `profile` alone shows the
+the callers it allows, usually `airut.Owner`; nil registers none. `profile` alone shows the
 bot's profile on that platform, privately. `profile name TEXT`,
 `profile about TEXT`, and `profile avatar` with a picture attached each
 change one field, on the platform the command was used on. The
@@ -1236,6 +1396,7 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_event_seconds` | `kind` | how long one event's handlers took |
 | `airut_agent_turns_total` | `command`, `outcome` | agent turns, refused ones included |
 | `airut_agent_turn_seconds` | `command` | how long a turn that started took |
+| `airut_agent_turn_waits_total` | `outcome` | turns that waited for a rate slot, by how the wait ended: `started`, `expired`, `cancelled`, or `refused` when the caller already had one waiting or a retry was refused access |
 | `airut_agent_requests_total` | `command` | model requests |
 | `airut_agent_tokens_total` | `command` | tokens the provider reported |
 | `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `length`, `budget`, or `error` |
@@ -1293,6 +1454,7 @@ supplies everything. Each bot has one TOML file, which
   and access lists;
 - the session store;
 - each platform's settings;
+- the bot's owners, by platform, under `[bot] owners`;
 - where metrics are served, and how often they are logged;
 - the config layer of the bot's runtime settings, under `[settings]`.
 
