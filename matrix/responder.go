@@ -391,15 +391,13 @@ func (s *session) direct(ctx context.Context, u id.UserID) (id.RoomID, error) {
 	if room, ok := s.dms[u]; ok && s.privateRoom(ctx, room, u) {
 		return room, nil
 	}
-	direct := event.DirectChatsEventContent{}
-	if err := s.c.GetAccountData(ctx, event.AccountDataDirectChats.Type, &direct); err != nil && !errors.Is(err, mautrix.MNotFound) {
+	room, err := findDirect(ctx, s.c, u)
+	if err != nil {
 		return "", err
 	}
-	for _, room := range direct[u] {
-		if s.privateRoom(ctx, room, u) {
-			s.dms[u] = room
-			return room, nil
-		}
+	if room != "" {
+		s.dms[u] = room
+		return room, nil
 	}
 	// The initial state names the encryption and the join rule, which
 	// CreateRoom records in the state store with the invite, so the room
@@ -478,11 +476,33 @@ func (s *session) isDirect(ctx context.Context, room id.RoomID, u id.UserID) boo
 	return s.listed[room]
 }
 
+// findDirect returns the first room the account's m.direct lists for u
+// that privateRoom holds for, or "" when there is none. It creates
+// nothing.
+func findDirect(ctx context.Context, c *rihma.Client, u id.UserID) (id.RoomID, error) {
+	direct := event.DirectChatsEventContent{}
+	if err := c.GetAccountData(ctx, event.AccountDataDirectChats.Type, &direct); err != nil && !errors.Is(err, mautrix.MNotFound) {
+		return "", err
+	}
+	for _, room := range direct[u] {
+		if privateRoom(ctx, c, room, u) {
+			return room, nil
+		}
+	}
+	return "", nil
+}
+
 // privateRoom reports whether room is fit for a private reply to u, as
-// the state store knows it: encrypted, joinable only by invitation, and
-// with nobody joined or invited but the bot, joined, and u.
+// the state store knows it.
 func (s *session) privateRoom(ctx context.Context, room id.RoomID, u id.UserID) bool {
-	st := s.c.StateStore
+	return privateRoom(ctx, s.c, room, u)
+}
+
+// privateRoom reports whether room is private to c's account and u, as
+// c's state store knows it: encrypted, joinable only by invitation, and
+// with nobody joined or invited but the account, joined, and u.
+func privateRoom(ctx context.Context, c *rihma.Client, room id.RoomID, u id.UserID) bool {
+	st := c.StateStore
 	if enc, err := st.IsEncrypted(ctx, room); err != nil || !enc {
 		return false
 	}
@@ -490,7 +510,7 @@ func (s *session) privateRoom(ctx context.Context, room id.RoomID, u id.UserID) 
 		return false
 	}
 	members, err := st.GetAllMembers(ctx, room)
-	return err == nil && onlyThem(members, s.c.UserID, u)
+	return err == nil && onlyThem(members, c.UserID, u)
 }
 
 // onlyThem reports whether bot is joined and u joined or invited, and

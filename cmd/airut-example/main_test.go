@@ -210,6 +210,48 @@ func TestReadKeyStopsWithItsContext(t *testing.T) {
 	}
 }
 
+// TestReadYes confirms only on an explicit yes, and gives up when its
+// context ends.
+func TestReadYes(t *testing.T) {
+	for in, want := range map[string]bool{
+		"yes\n": true, " Y \n": true, "YES": true,
+		"\n": false, "no\n": false, "yes they do\n": false, "maybe\n": false, "ja\n": false,
+	} {
+		var out bytes.Buffer
+		got, err := readYes(context.Background(), strings.NewReader(in), &out)
+		if got != want || err != nil {
+			t.Errorf("readYes(%q) = %v, %v; want %v", in, got, err, want)
+		}
+		if !strings.Contains(out.String(), "Type yes to confirm") {
+			t.Errorf("the prompt = %q", out.String())
+		}
+	}
+	if got, err := readYes(context.Background(), strings.NewReader(""), io.Discard); got || !errors.Is(err, io.EOF) {
+		t.Errorf("readYes at end of input = %v, %v", got, err)
+	}
+	// A read that fails after "yes" is not a yes.
+	broken := errors.New("terminal gone")
+	if got, err := readYes(context.Background(), io.MultiReader(strings.NewReader("yes"), errReader{broken}), io.Discard); got || !errors.Is(err, broken) {
+		t.Errorf("readYes with a failed read after yes = %v, %v", got, err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got, err := readYes(ctx, r, io.Discard); got || !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled readYes = %v, %v", got, err)
+	}
+}
+
+// errReader fails every read with err.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
 func TestMaxDiceSetting(t *testing.T) {
 	a := airuttest.Start(t, newBot(airut.Config{Settings: airut.Settings{Values: map[string]string{"roll.max_dice": "2"}}}, threes))
 	if got := texts(a.Text("!roll 3d6")); !reflect.DeepEqual(got, []string{"reply:Roll dice written like 2d6: up to 2 dice of 2 to 1000 sides."}) {

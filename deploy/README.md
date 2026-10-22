@@ -149,6 +149,55 @@ commented `recovery_key`, lets the bot sign itself at start instead.
 Uncomment both only if you accept the key living on the host, and comment
 both out again afterwards.
 
+## Verify the bot to its owner
+
+Cross-signing the device makes the bot trust its own device. Your
+clients still show the bot as unverified until you verify it with emoji.
+This happens once per bot, and covers every device you use. You compare
+the emoji on the host's terminal, so a homeserver that tampers with the
+exchange cannot also change what you compare.
+
+Before you start:
+
+- **Cross-sign the device first,** as above. The bot signs you with its
+  account's user-signing key, and only a cross-signed device holds it.
+- **Open an encrypted direct chat with the bot** from your Element, and
+  let the running bot join it. Element ignores a verification request
+  from a user it shares no encrypted room with. `-verify` refuses, and
+  sends nothing, when it finds no such chat. It does not make one,
+  because you would have to join it while the stopped bot waits.
+- **Use a device whose id differs from the bot's.** A defect in the Matrix
+  library the bot uses confuses a device of yours with the bot's own
+  device when both have the same id. `-verify` refuses, and sends
+  nothing, when one of your devices does. Device ids are random, so this
+  is rare. Sign out that device, or verify from another one.
+
+Then, with the bot stopped, in the service's own context:
+
+```sh
+systemctl stop airut-example
+systemd-run --pty --wait --collect \
+  -p User=airut-example -p Group=airut-example -p StateDirectory=airut-example \
+  -p LoadCredentialEncrypted=discord-token:/etc/credstore.encrypted/airut-example-discord-token \
+  -p LoadCredentialEncrypted=matrix-password:/etc/credstore.encrypted/airut-example-matrix-password \
+  -p LoadCredentialEncrypted=proxy-api-key:/etc/credstore.encrypted/airut-example-proxy-api-key \
+  /usr/local/lib/airut-example/airut-example -config /etc/airut-example/airut.toml -verify @you:example.org
+systemctl start airut-example
+```
+
+1. Element shows a verification request from the bot. Accept it, and
+   choose to compare emoji.
+2. The terminal prints seven emoji with their names. Compare them with
+   the ones Element shows, in order.
+3. If they are the same, type `yes` on the terminal and confirm in
+   Element. If they differ, answer anything else and cancel in Element.
+   Nothing is signed, and someone may be interfering with the exchange.
+
+On success the terminal prints your master key, which the bot has now
+signed, and Element shows the bot as verified. If Element never shows the
+request, the verification ends after ten minutes. The likely cause is
+the direct chat: check that it is encrypted and that you are in it.
+
 ## Cross-sign sibling bots
 
 Bots of one owner can sign each other's Matrix identities, so each trusts

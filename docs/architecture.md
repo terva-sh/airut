@@ -311,6 +311,40 @@ encrypted history it could read before.
   - `(*matrix.Adapter).CrossSigning` reports, from the server, whether
     the account has an identity and the running device is signed, for
     a status command.
+- **Verifying the bot to its owner.** Cross-signing makes the bot's
+  device trusted by the bot's own identity. Trust between users does not
+  pass along a chain, though, so the owner's clients show the bot as
+  verified only once the owner's user-signing key has signed the bot's
+  master key. That takes an interactive verification between the two
+  accounts.
+  - `matrix.Verify` runs it, with the bot stopped, as `CrossSign` does.
+    It sends the owner a to-device SAS request through rihma's
+    `VerifyUser`, which syncs the bot's device itself. It writes the
+    emoji to the operator's terminal, and only the operator's yes, from
+    `VerifyIO.Confirm`, confirms. When both sides confirm, rihma signs
+    the owner's master key with the bot's user-signing key, and the
+    owner's client signs the bot. `cmd/airut-example` runs it with
+    `-verify USER`.
+  - The emoji are compared on the host, not in chat. The bot has not
+    verified the owner's devices, so a homeserver that forged the key
+    exchange could also add a device to the owner's account and rewrite
+    a DM. Emoji shown in a DM would then match the forgery.
+  - Element answers a request only from a user whose devices it tracks,
+    and drops any other request without saying so. So `Verify` refuses,
+    before it sends anything, unless the bot's m.direct lists a room
+    with the owner that is private as the adapter's direct rooms are:
+    encrypted, invite-only, and with only the two of them. It reads this
+    from the state the bot stored while it ran, and never makes the
+    room, because the owner would have to join while the stopped bot
+    waits on its own sync.
+  - Each of rihma's refusals becomes an operator message that wraps
+    it: the bot is running, the device lacks the cross-signing keys,
+    the owner has no identity, an owner device has the bot's device id,
+    the emoji did not match, the request was cancelled or timed out, or
+    the owner's identity changed during the exchange. `Verify` logs
+    nothing.
+  - An in-chat option, which trusts the homeserver and is off by
+    default, waits on incoming and in-room SAS in rihma.
 - **Sibling cross-signing.** Bots of one owner, each listing the others
   in `[matrix.siblings]`, sign each other's master keys with their
   user-signing keys, so each trusts the others' devices without a

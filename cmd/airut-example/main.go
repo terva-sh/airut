@@ -27,6 +27,18 @@
 // that has an identity it asks for the recovery key, read without echo,
 // and signs the device with it.
 //
+// With -verify it verifies the bot's Matrix account to its owner instead,
+// with emoji, also with the bot stopped, on the same configuration:
+//
+//	airut-example -config /etc/airut-example/airut.toml -verify @owner:example.org
+//
+// The owner must already share an encrypted direct chat with the bot, and
+// the bot's device must hold its cross-signing keys, which -cross-sign
+// restores. The owner accepts the request in Element, the terminal shows
+// the emoji, and the operator types yes only if Element shows the same
+// ones. Then the owner's Element signs the bot, and the bot signs the
+// owner, so the owner's clients show the bot as verified.
+//
 // claim and unclaim add and remove an owner from the host, as airut
 // claim and airut unclaim do, on the same configuration, which the bot
 // reads again within a minute:
@@ -67,8 +79,20 @@ func main() {
 	}
 	path := flag.String("config", defaultConfig, "the configuration file")
 	crossSign := flag.Bool("cross-sign", false, "run the Matrix cross-signing setup, with the bot stopped, and exit")
+	verify := flag.String("verify", "", "verify the bot's Matrix account to `USER`, its owner, with emoji compared on this terminal, with the bot stopped, and exit")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	if *crossSign && *verify != "" {
+		fmt.Fprintln(os.Stderr, "airut-example: -cross-sign and -verify run one at a time")
+		os.Exit(2)
+	}
+	if *verify != "" {
+		if err := verifyOwner(*path, *verify); err != nil {
+			fmt.Fprintln(os.Stderr, "airut-example:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *crossSign {
 		if err := crossSignSetup(*path); err != nil {
 			fmt.Fprintln(os.Stderr, "airut-example:", err)
@@ -106,6 +130,55 @@ func crossSignSetup(path string) error {
 	defer stop()
 	_, err = matrix.CrossSign(ctx, cfg.Matrix, matrix.CrossSignIO{Out: os.Stdout, RecoveryKey: readRecoveryKey})
 	return err
+}
+
+// verifyOwner runs matrix.Verify for the file's [matrix] table, on the
+// operator's terminal: the emoji go to stdout, and the answer is read
+// from stdin.
+func verifyOwner(path, user string) error {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	if cfg.Matrix == nil {
+		return errors.New("the configuration has no [matrix] table")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	_, err = matrix.Verify(ctx, cfg.Matrix, user, matrix.VerifyIO{
+		Out:     os.Stdout,
+		Confirm: func(ctx context.Context) (bool, error) { return readYes(ctx, os.Stdin, os.Stdout) },
+	})
+	return err
+}
+
+// readYes asks whether the emoji match and reads one line from in until
+// ctx is done. Only "yes" or "y" is a yes; anything else, an empty line
+// included, is a no. As with readKey, a read ctx outlives is left
+// blocked, for a process that is about to exit.
+func readYes(ctx context.Context, in io.Reader, out io.Writer) (bool, error) {
+	fmt.Fprint(out, "Do they match the emoji in Element, in the same order? Type yes to confirm [no]: ")
+	got := make(chan string, 1)
+	errc := make(chan error, 1)
+	go func() {
+		line, err := bufio.NewReader(in).ReadString('\n')
+		// A last line without a newline is an answer; any other failed
+		// read is not, whatever text came with it.
+		if err != nil && (line == "" || !errors.Is(err, io.EOF)) {
+			errc <- err
+			return
+		}
+		got <- line
+	}()
+	select {
+	case line := <-got:
+		a := strings.ToLower(strings.TrimSpace(line))
+		return a == "yes" || a == "y", nil
+	case err := <-errc:
+		return false, err
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 // readRecoveryKey reads the recovery key from the terminal without echo,
