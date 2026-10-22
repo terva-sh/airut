@@ -25,8 +25,20 @@ type Options struct {
 	// models they serve, as Providers builds them.
 	Clients map[string]provider.Client
 	Catalog provider.ModelCatalog
-	// Model is the model every turn uses.
+	// Models is the chain of models a turn walks, as config.Load resolves
+	// one. A turn starts on the first entry Health finds usable, and
+	// falls through to the next usable one when its first request fails
+	// before anything streamed, by a connect error, a 5xx, a 429, a
+	// timeout, or a missing model. Each entry runs under its served id,
+	// with its MaxOutput, Temperature, and Timeout. Empty means Model
+	// alone.
+	Models config.Chain
+	// Model is the model every turn uses when Models is empty.
 	Model config.ModelRef
+	// Health says which entries of Models are usable now. Nil means one
+	// of the agent's own that counts every provider as available and
+	// keeps breakers with the defaults.
+	Health *Health
 	// Personas maps a Turn's Persona to its system prompt. The empty name
 	// is the persona of a turn that names none. A turn naming a persona
 	// that is not here fails.
@@ -46,6 +58,9 @@ type Options struct {
 	// History bounds what a turn resumes in each field the turn's own
 	// History leaves zero. The zero value bounds nothing.
 	History airut.History
+	// Notices are what a turn tells the chat when it ends without a whole
+	// answer.
+	Notices Notices
 	// Now is the clock MaxAge is measured by, for tests. Nil means
 	// time.Now.
 	Now func() time.Time
@@ -57,12 +72,14 @@ type Options struct {
 // Agent runs airut's agent turns on terva's engine. It implements
 // airut.Agent and airut.SessionPrefixForgetter.
 type Agent struct {
-	client   provider.Client
+	clients  map[string]provider.Client
 	catalog  provider.ModelCatalog
-	model    config.ModelRef
+	chain    config.Chain
+	health   *Health
 	personas map[string]string
 	// character opens every turn's system prompt.
 	character string
+	notices   Notices
 	db        *sessions.DB
 	history   airut.History
 	caps      MemoryCaps
@@ -80,20 +97,44 @@ var (
 
 // New returns an Agent. It makes no network request.
 func New(o Options) (*Agent, error) {
-	client, ok := o.Clients[o.Model.Provider]
 	switch {
-	case !ok:
-		return nil, fmt.Errorf("agent: no client for provider %q of model %s", o.Model.Provider, o.Model)
 	case o.Catalog == nil:
 		return nil, errors.New("agent: Options.Catalog is required")
 	case o.Sessions == nil:
 		return nil, errors.New("agent: Options.Sessions is required")
 	}
-	if _, err := o.Catalog.FindModel(o.Model.Provider, o.Model.Model); err != nil {
-		return nil, fmt.Errorf("agent: model %s: %w", o.Model, err)
+	chain := slices.Clone(o.Models)
+	if len(chain) == 0 {
+		chain = config.Chain{{Provider: o.Model.Provider, Model: o.Model.Model, Served: o.Model.Model}}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
+	}
+	clients := map[string]provider.Client{}
+	for i := range chain {
+		e := &chain[i]
+		if e.Served == "" {
+			e.Served = e.Model
+		}
+		ref := config.ModelRef{Provider: e.Provider, Model: e.Served}
+		client, ok := o.Clients[e.Provider]
+		if !ok {
+			return nil, fmt.Errorf("agent: no client for provider %q of model %s", e.Provider, ref)
+		}
+		clients[e.Provider] = client
+		m, err := o.Catalog.FindModel(e.Provider, e.Served)
+		if err != nil {
+			return nil, fmt.Errorf("agent: model %s: %w", ref, err)
+		}
+		if e.MaxOutput == 0 && m.MaxOutput == 0 {
+			// No max_tokens is sent, so the server's own default caps
+			// every answer, and on a llama.cpp server that is 1024.
+			o.Logger.Warn("agent model sets no output limit; the server's default applies",
+				"provider", e.Provider, "model", e.Model)
+		}
+	}
+	if o.Health == nil {
+		o.Health = NewHealth(HealthOptions{Logger: o.Logger})
 	}
 	if err := checkHistory(o.History); err != nil {
 		return nil, fmt.Errorf("agent: Options.History: %w", err)
@@ -119,8 +160,8 @@ func New(o Options) (*Agent, error) {
 		personas[k] = v
 	}
 	return &Agent{
-		client: client, catalog: o.Catalog, model: o.Model, personas: personas, character: o.Character,
-		db: o.Sessions, history: o.History, caps: caps, now: o.Now, log: o.Logger,
+		clients: clients, catalog: o.Catalog, chain: chain, health: o.Health, personas: personas, character: o.Character,
+		db: o.Sessions, history: o.History, caps: caps, now: o.Now, log: o.Logger, notices: o.Notices.withDefaults(),
 	}, nil
 }
 
@@ -132,9 +173,21 @@ func WithCharacter(character string) OpenOption {
 	return func(o *Options) { o.Character = character }
 }
 
+// WithNotices sets Options.Notices.
+func WithNotices(n Notices) OpenOption {
+	return func(o *Options) { o.Notices = n }
+}
+
+// WithHealth sets Options.Health, so that the agent shares h with a judge
+// and each skips a model the other saw fail.
+func WithHealth(h *Health) OpenOption {
+	return func(o *Options) { o.Health = h }
+}
+
 // Open builds the agent a configuration file describes: a client for
-// each provider, the default model, and the session store, which Close
-// closes. It fails when the file has no [agent] table.
+// each provider, the chain of models, a Health over the file's providers,
+// and the session store, which Close closes. It fails when the file has
+// no [agent] table.
 func Open(ctx context.Context, c *config.Config, personas map[string]string, log *slog.Logger, opts ...OpenOption) (*Agent, error) {
 	if c.Agent == nil {
 		return nil, errors.New("agent: the configuration has no [agent] table")
@@ -144,8 +197,15 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 		return nil, err
 	}
 	clients, catalog := Providers(c)
+	// Each entry is described to the engine as the entry describes it.
+	// The last registered wins, so where entries share a served model,
+	// the earliest describes it.
+	for _, e := range slices.Backward(c.Agent.Models) {
+		catalog.RegisterExtraModel(catalogModel(e.Provider, e.Served, e.Capabilities))
+	}
 	o := Options{
-		Clients: clients, Catalog: catalog, Model: c.Agent.Model,
+		Clients: clients, Catalog: catalog, Models: c.Agent.Models, Model: c.Agent.Model,
+		Health:   NewHealth(HealthOptions{Providers: c.Providers, Logger: log}),
 		Personas: personas, Sessions: db, Logger: log,
 		MemoryCaps: MemoryCaps{User: c.Agent.Memory.MaxUser, Channel: c.Agent.Memory.MaxChannel, Bot: c.Agent.Memory.MaxBot},
 		History: airut.History{
@@ -252,7 +312,9 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		system = strings.TrimSpace(a.character + "\n\n" + system)
 	}
 	began := time.Now()
-	tm := &timing{c: c, log: a.log, provider: a.model.Provider, model: a.model.Model}
+	tm := &timing{c: c, log: a.log}
+	tm.on(a.chain[0], 0)
+	tc := &turnClient{c: c, health: a.health, chain: a.chain, clients: a.clients, tm: tm}
 	tools := make(core.Registry, len(t.Tools))
 	for _, tl := range t.Tools {
 		if _, dup := tools[tl.Name()]; dup {
@@ -262,16 +324,22 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	}
 
 	ctx := c.Context()
+	if err := checkHistory(t.History); err != nil {
+		return fmt.Errorf("agent: the turn's History: %w", err)
+	}
 	budget := &budget{turns: t.Budget.Turns, tokens: t.Budget.Tokens}
+	if !tc.start(ctx) {
+		a.finished(c, tm, began, 0, budget, "", ErrNoModel)
+		return ErrNoModel
+	}
+	first := a.chain[tc.cur]
+	defer tc.finish()
 	opts := []core.Option{
 		core.WithGate(gate{c: c}),
 		core.WithTools(tools),
 		core.WithCatalog(a.catalog),
-		core.WithProvider(a.model.Provider),
+		core.WithProvider(first.Provider),
 		core.WithComponent(budget),
-	}
-	if err := checkHistory(t.History); err != nil {
-		return fmt.Errorf("agent: the turn's History: %w", err)
 	}
 	h := history(t.History, a.history)
 	stable, volatile := a.memories(c, t.Prompt)
@@ -299,7 +367,7 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		opts = append(opts, core.WithTranscriptStore(s),
 			core.WithCompactionPolicy(policy{due: due, keep: keepTail(tr.Messages, h)}))
 	}
-	eng, err := core.New(a.client, a.model.Model, opts...)
+	eng, err := core.New(tc, first.Served, opts...)
 	if err != nil {
 		return err
 	}
@@ -310,6 +378,21 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	budget.used = func() int { return tokens(eng.Cost()) - base }
 
 	steps := 0
+	// last is the stop of the last request that ended without failing,
+	// and said whether the turn has passed on any text.
+	var last provider.StopReason
+	said := false
+	pass := func(text string) {
+		said = said || strings.TrimSpace(text) != ""
+		out.Text(text)
+	}
+	// Under FinalOnly, held is the text of the request under way. It is
+	// passed on when the request ends without calling a tool, and
+	// dropped when it calls one or fails, so narration never streams.
+	// called says the request under way began a tool call, which marks
+	// its text as narration even when the output limit cut the call off.
+	var held strings.Builder
+	called := false
 	err = eng.Run(ctx, core.PromptInput{Text: t.Prompt}, func(e core.AgentEvent) {
 		switch e := e.(type) {
 		case core.EvTurnStart:
@@ -317,41 +400,116 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 			tm.begin(e.Step)
 		case core.EvTextDelta:
 			tm.first()
-			out.Text(e.Delta)
+			if t.FinalOnly {
+				held.WriteString(e.Delta)
+			} else {
+				pass(e.Delta)
+			}
 		case core.EvToolUseStart:
 			tm.first()
+			called = true
 		case core.EvUsage:
 			tm.usage(e.Usage)
 		case core.EvTurnEnd:
 			tm.end(e.Stop)
+			if e.Err == nil {
+				last = e.Stop
+			}
+			if t.FinalOnly {
+				if e.Err == nil && e.Stop != provider.StopToolUse && !called && strings.TrimSpace(held.String()) != "" {
+					pass(held.String())
+				}
+				held.Reset()
+			}
+			called = false
 		case core.EvToolCall:
 			out.ToolCall(e.Name)
 		}
 	})
-	stop := stopKind(err, budget.stopped)
-	modelTime, toolTime := tm.totals()
-	a.log.Info("agent turn finished", "invocation", c.ID(), "platform", string(c.Platform()),
-		"requests", budget.allowed(steps), "tokens", budget.used(), "stop", stop,
-		"ms", time.Since(began).Milliseconds(), "model_ms", modelTime.Milliseconds(), "tool_ms", toolTime.Milliseconds())
-	m, command := c.Metrics(), c.MetricCommand()
-	m.Add("airut_agent_requests_total", float64(budget.allowed(steps)), "command", command)
-	m.Add("airut_agent_tokens_total", float64(budget.used()), "command", command)
-	m.Add("airut_agent_stops_total", 1, "command", command, "stop", stop)
+	stop := a.finished(c, tm, began, steps, budget, last, err)
 	if err != nil {
 		return err
 	}
-	if budget.stopped != "" {
-		out.Text("\n\n(" + budget.stopped + ")")
+	var notice string
+	switch {
+	case stop == "budget":
+		notice = "(" + budget.stopped + ")"
+	case stop == "length":
+		notice = a.notices.CutOff
+	case t.FinalOnly && !said:
+		notice = a.notices.NoAnswer
+	}
+	if notice != "" {
+		if said {
+			notice = "\n\n" + notice
+		}
+		out.Text(notice)
 	}
 	return nil
 }
 
-func stopKind(err error, stopped string) string {
+// Notices are what a turn tells the chat when it ends without a whole
+// answer. Each is posted as written, so it should read as the bot's own
+// words. An empty field takes its default.
+type Notices struct {
+	// CutOff ends the reply of a turn whose last model request stopped
+	// at its output limit. Default: DefaultCutOffNotice.
+	CutOff string
+	// NoAnswer is the reply of a FinalOnly turn that ended with nothing
+	// to say, so the chat is never left with no reply. Default:
+	// DefaultNoAnswerNotice.
+	NoAnswer string
+}
+
+// The notices a turn gives when Notices leaves a field empty.
+const (
+	DefaultCutOffNotice   = "My answer was cut off. Ask again, or narrow the request."
+	DefaultNoAnswerNotice = "I finished without an answer. Ask again, or put it another way."
+)
+
+func (n Notices) withDefaults() Notices {
+	if n.CutOff == "" {
+		n.CutOff = DefaultCutOffNotice
+	}
+	if n.NoAnswer == "" {
+		n.NoAnswer = DefaultNoAnswerNotice
+	}
+	return n
+}
+
+// finished logs and counts a turn that ended with err after steps, the
+// last of which stopped for last, and returns how the turn stopped.
+func (a *Agent) finished(c *airut.Ctx, tm *timing, began time.Time, steps int, budget *budget, last provider.StopReason, err error) string {
+	stop := stopKind(err, budget.stopped, last)
+	modelTime, toolTime := tm.totals()
+	used := 0
+	if budget.used != nil {
+		used = budget.used()
+	}
+	provider, model, served, fell := tm.entry()
+	a.log.Info("agent turn finished", "invocation", c.ID(), "platform", string(c.Platform()),
+		"provider", provider, "model", model, "served", served, "fell_through", fell,
+		"requests", budget.allowed(steps), "tokens", used, "stop", stop,
+		"ms", time.Since(began).Milliseconds(), "model_ms", modelTime.Milliseconds(), "tool_ms", toolTime.Milliseconds())
+	m, command := c.Metrics(), c.MetricCommand()
+	m.Add("airut_agent_requests_total", float64(budget.allowed(steps)), "command", command)
+	m.Add("airut_agent_tokens_total", float64(used), "command", command)
+	m.Add("airut_agent_stops_total", 1, "command", command, "stop", stop)
+	return stop
+}
+
+// stopKind is how a turn stopped: with an error, at its budget, cut off
+// by the output limit on its last request, or done. A last request cut
+// off with a tool call in it counts as length too: the engine ends the
+// turn there without running the call.
+func stopKind(err error, stopped string, last provider.StopReason) string {
 	switch {
 	case err != nil:
 		return "error"
 	case stopped != "":
 		return "budget"
+	case last == provider.StopLength:
+		return "length"
 	}
 	return "done"
 }
@@ -399,9 +557,13 @@ func (b *budget) allowed(steps int) int {
 // step's start or the last attempt's end to its own end, so a retry's
 // time holds its backoff.
 type timing struct {
-	c               *airut.Ctx
-	log             *slog.Logger
-	provider, model string
+	c   *airut.Ctx
+	log *slog.Logger
+	// provider, model, and served name the entry the turn runs on, by
+	// its alias and its served id, and fell how many entries it passed
+	// over to reach it. An empty served is model's.
+	provider, model, served string
+	fell                    int
 
 	mu         sync.Mutex
 	step       int
@@ -409,6 +571,24 @@ type timing struct {
 	used       provider.Usage
 	modelTotal time.Duration
 	toolTotal  time.Duration
+}
+
+// on records that the turn runs on e, after passing over fell entries.
+func (t *timing) on(e config.ChainEntry, fell int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.provider, t.model, t.served, t.fell = e.Provider, e.Model, e.Served, fell
+}
+
+// entry is the entry the turn runs on, as on recorded it.
+func (t *timing) entry() (provider, model, served string, fell int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	served = t.served
+	if served == "" {
+		served = t.model
+	}
+	return t.provider, t.model, served, t.fell
 }
 
 func (t *timing) begin(step int) {
@@ -444,12 +624,14 @@ func (t *timing) end(stop provider.StopReason) {
 	t.modelTotal += d
 	t.start, t.tok, t.used = now, time.Time{}, provider.Usage{}
 	t.mu.Unlock()
+	prov, model, served, fell := t.entry()
 	m := t.c.Metrics()
-	m.Observe("airut_agent_request_seconds", d, "provider", t.provider, "model", t.model)
-	attrs := []any{"invocation", t.c.ID(), "step", step, "provider", t.provider, "model", t.model,
-		"ms", d.Milliseconds(), "input_tokens", used.InputTokens, "output_tokens", used.OutputTokens, "stop", string(stop)}
+	m.Observe("airut_agent_request_seconds", d, "provider", prov, "model", model, "served", served)
+	attrs := []any{"invocation", t.c.ID(), "step", step, "provider", prov, "model", model, "served", served,
+		"fell_through", fell, "ms", d.Milliseconds(), "input_tokens", used.InputTokens, "output_tokens", used.OutputTokens,
+		"stop", string(stop)}
 	if first >= 0 {
-		m.Observe("airut_agent_first_token_seconds", first, "provider", t.provider, "model", t.model)
+		m.Observe("airut_agent_first_token_seconds", first, "provider", prov, "model", model, "served", served)
 		attrs = append(attrs, "first_token_ms", first.Milliseconds())
 	}
 	t.log.Info("agent request", attrs...)

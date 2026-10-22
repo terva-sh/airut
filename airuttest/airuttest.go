@@ -68,6 +68,7 @@ type Adapter struct {
 	history    map[string][]airut.MessageEvent // per channel id, oldest first
 	members    map[string]map[string]bool      // channel id -> user id
 	memberErrs map[string]error                // channel id -> the error Member fails with
+	sendErrs   map[string]error                // channel id -> the error Send fails with
 	// keys maps a message's Key to the ref it was sent as.
 	keys map[string]string
 	// reactions holds the reactions made through the Conn, by ref, and
@@ -522,6 +523,10 @@ type Step struct {
 
 // Agent is a scripted agent. It plays Steps in order, may call only the
 // tools its Turn names, and records each Turn and tool result.
+//
+// Under Turn.FinalOnly it holds text back, as the agent package does:
+// the text before each call is dropped, and the text after the last one
+// is passed on whole once the script ends.
 type Agent struct {
 	Steps []Step
 	// Err, when set, is returned after the steps run.
@@ -537,13 +542,19 @@ func (g *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	g.mu.Lock()
 	g.turns = append(g.turns, t)
 	g.mu.Unlock()
+	var held strings.Builder
 	for _, s := range g.Steps {
-		if s.Text != "" {
+		switch {
+		case s.Text == "":
+		case t.FinalOnly:
+			held.WriteString(s.Text)
+		default:
 			out.Text(s.Text)
 		}
 		if s.Call == "" {
 			continue
 		}
+		held.Reset()
 		var res string
 		var tool airut.Tool
 		for _, tl := range t.Tools {
@@ -564,6 +575,9 @@ func (g *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		g.mu.Lock()
 		g.results = append(g.results, res)
 		g.mu.Unlock()
+	}
+	if held.Len() > 0 {
+		out.Text(held.String())
 	}
 	return g.Err
 }
@@ -706,11 +720,26 @@ func (a *Adapter) SetMembers(channel string, users ...string) {
 	a.members[channel] = set
 }
 
+// FailSend makes Conn.Send fail with err for the channel, recording
+// nothing, as a platform that refuses the post does. A nil err undoes
+// it.
+func (a *Adapter) FailSend(channel string, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sendErrs == nil {
+		a.sendErrs = map[string]error{}
+	}
+	a.sendErrs[channel] = err
+}
+
 // Send records a message posted through the Conn. A repeated Key
 // records nothing and returns the first message's ref.
 func (a *Adapter) Send(_ context.Context, ch airut.Channel, m airut.Message) (airut.MessageRef, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.sendErrs[ch.ID]; err != nil {
+		return airut.MessageRef{}, err
+	}
 	if ref, ok := a.keys[m.Key]; ok && m.Key != "" {
 		return airut.MessageRef{ID: ref}, nil
 	}
@@ -827,4 +856,64 @@ func (a *Adapter) Member(_ context.Context, ch airut.Channel, u airut.User) (boo
 		return false, err
 	}
 	return a.members[ch.ID][u.ID], nil
+}
+
+// VersionStoreContract checks the promises every airut.VersionStore
+// keeps, for a store's own tests. s must hold no records.
+func VersionStoreContract(t testing.TB, s airut.VersionStore) {
+	t.Helper()
+	ctx := context.Background()
+	room := airut.Channel{Platform: Platform, ID: "room-1"}
+	get := func(ch airut.Channel) string {
+		t.Helper()
+		v, err := s.AnnouncedVersion(ctx, ch)
+		if err != nil {
+			t.Fatalf("AnnouncedVersion(%v): %v", ch, err)
+		}
+		return v
+	}
+	save := func(ch airut.Channel, v string) {
+		t.Helper()
+		if err := s.SaveAnnouncedVersion(ctx, ch, v); err != nil {
+			t.Fatalf("SaveAnnouncedVersion(%v, %q): %v", ch, v, err)
+		}
+	}
+	if v := get(room); v != "" {
+		t.Errorf("an empty store has %q for a room, want \"\"", v)
+	}
+	save(room, "v1.2.0")
+	if v := get(room); v != "v1.2.0" {
+		t.Errorf("after a save, the room has %q, want v1.2.0", v)
+	}
+	// The store keeps what it is given: whether a version is newer is
+	// the core's question, not the store's.
+	save(room, "v1.1.0")
+	if v := get(room); v != "v1.1.0" {
+		t.Errorf("after a second save, the room has %q, want v1.1.0", v)
+	}
+	other := airut.Channel{Platform: "other", ID: "room-1"}
+	if v := get(other); v != "" {
+		t.Errorf("the same id on another platform has %q, want \"\"", v)
+	}
+	save(other, "v2.0.0")
+	if v := get(room); v != "v1.1.0" {
+		t.Errorf("a save on another platform changed the room to %q", v)
+	}
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() {
+			ch := airut.Channel{Platform: Platform, ID: "concurrent-" + strconv.Itoa(i)}
+			if err := s.SaveAnnouncedVersion(ctx, ch, "v1.0."+strconv.Itoa(i)); err != nil {
+				t.Errorf("concurrent SaveAnnouncedVersion(%v): %v", ch, err)
+			}
+		})
+	}
+	wg.Wait()
+	for i := range 8 {
+		ch := airut.Channel{Platform: Platform, ID: "concurrent-" + strconv.Itoa(i)}
+		if v, want := get(ch), "v1.0."+strconv.Itoa(i); v != want {
+			t.Errorf("after concurrent saves, %s has %q, want %q", ch.ID, v, want)
+		}
+	}
 }

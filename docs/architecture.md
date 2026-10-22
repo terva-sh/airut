@@ -433,10 +433,21 @@ each turn, `core.New(client, model, ...)`, with:
   resumed before the turn. Turns in one session run one at a time.
 - `core.WithCatalog`: the model catalog `agent.Providers` builds from
   the bot's configuration.
+- A client of the turn's own, which walks the chain of models (below).
 - A turn filter that holds the budget: before each model request it
   stops the turn once the turn has made `Budget.Turns` requests or used
   `Budget.Tokens` tokens, and the chat is told why. The answer so far is
   kept, because a stop never cuts a response off mid-stream.
+
+A turn whose last model request stopped at the model's output limit did
+not finish its answer. The agent logs and counts its stop as `length`
+rather than `done`, and ends the reply with a notice, after a blank
+line when the turn said anything first. The bot sets the notice's text
+with `Options.Notices`, or `agent.WithNotices` for `agent.Open`, and
+the default is `agent.DefaultCutOffNotice`: "My answer was cut off. Ask
+again, or narrow the request." A request cut off inside a tool call
+counts the same, because the engine ends the turn without running the
+call.
 
 Output reaches the chat in one of three ways:
 
@@ -445,12 +456,35 @@ Output reaches the chat in one of three ways:
 - `Text` returns the answer for the app to post.
 - `RunTo` hands the app each piece and each tool call as they happen.
 
-With `FinalOnly`, `Text` returns only the text after the last tool call,
-and `StreamTo` replaces its reply with each new segment. The model's
-narration between calls then never stays in the chat. `StreamTo` sends
-what its throttle held back when a tool is called, and before any `Ask`
-the turn makes, an approval included. A question therefore always sits
-below a complete reply.
+`Turn.FinalOnly` asks the agent for the answer alone: the text of the
+turn's last model request. The agent holds each request's text until
+the request ends. It drops the text of a request that ends in tool
+calls, which is narration, and of one that fails and is retried, and
+passes on the rest. Narration therefore never reaches the chat, not even
+to be edited away, and the typing notice is what shows the turn working
+while its tools run. The cost is that the answer arrives whole when its
+request ends, so `StreamTo` posts it once rather than growing it. A
+FinalOnly turn that ends with no text says so, with the cut-off notice,
+the budget's, or `Notices.NoAnswer`, whose default is
+`agent.DefaultNoAnswerNotice`, so the chat is never left with nothing.
+Without the field, text is passed on as it comes, as before.
+
+`TurnRun.FinalOnly` sets `Turn.FinalOnly` for `Text` and `StreamTo`.
+For an agent that does not honour the field, the core keeps only the
+last segment itself: `Text` returns the text after the last tool call,
+and `StreamTo` replaces its reply with each new segment. `RunTo` passes
+on what the agent gives it, and an app that wants only the answer from
+it sets `Turn.FinalOnly`.
+
+The option is on the `Turn`, not on the bot's configuration, for two
+reasons. Only the agent sees where a model request ends and whether it
+called a tool, and the `Turn` is what reaches the agent. A turn is also
+scoped per command, like its tools and budget, so one command can keep
+the narration while another drops it.
+
+`StreamTo` sends what its throttle held back when a tool is called, and
+before any `Ask` the turn makes, an approval included. A question
+therefore always sits below a complete reply.
 
 A running turn shows a typing notice in the chat it answers in.
 
@@ -459,14 +493,16 @@ in the model or in the app's own tools. Each line carries ids, counts,
 and kinds, never text:
 
 - **Each model request** logs "agent request" at Info: the step, the
-  provider and model, `ms`, `first_token_ms` to its first text or
-  tool-call delta, its input and output tokens, and its stop. A retried
-  step logs each attempt, timed from the last one's end, so a retry's
-  time holds its backoff.
+  provider, the alias as `model` and the `served` id, `fell_through`,
+  the count of entries the turn passed over, `ms`, `first_token_ms` to
+  its first text or tool-call delta, its input and output tokens, and
+  its stop. A retried step logs each attempt, timed from the last one's
+  end, so a retry's time holds its backoff.
 - **Each tool call** logs "agent tool" with the step, the tool's name,
   `ms`, and `ok` or `error`.
-- **The turn** adds `ms`, `model_ms`, and `tool_ms` to "agent turn
-  finished", the sums of the two above.
+- **The turn** adds the provider, `model`, `served`, and
+  `fell_through` of the entry it ran on, and `ms`, `model_ms`, and
+  `tool_ms`, the sums of the two above, to "agent turn finished".
 
 - The first notice comes after `Config.TypingDelay`, one second by
   default, so an instant answer or refusal shows none.
@@ -505,6 +541,72 @@ The agent never receives a shell, a file system, the bot's
 configuration, or its credentials. Chat text is untrusted input, so every
 tool a turn can reach has to be safe to trigger for anyone who can reach
 that command.
+
+### Model chains
+
+`Options.Models` is the chain `config.Load` resolves from `[agent]`, and
+`agent.Open` passes it with an `agent.Health` over the file's providers.
+The turn takes the first entry it can use, and the engine runs on that
+entry's served id, described as the entry describes it. An entry cannot
+be used when:
+
+- its provider is of kind `llama-swap` and says it cannot serve the
+  model now (below);
+- its circuit breaker is open.
+
+The turn falls through to the next entry it can use only while its
+first model request has streamed nothing. The failures that fall
+through are a connect error, a 5xx, a 429, a timeout, and a missing
+model, a 404 or an error that says so. Any other 4xx says the request
+itself is bad, and fails the turn. The fall-through happens inside the
+one request the engine sees, so a session records the prompt once. Once
+the model has streamed anything, the turn is committed to its entry,
+and a failure fails the turn as it would on one model. A failure on the
+chain's last entry is retried by terva as usual. Each request carries
+the entry's served id, and its `max_output` and `temperature` when the
+entry sets them. An entry with no `max_output`, whose model the catalog
+gives no output limit either, sends none, and the server's own default
+applies: 1024 tokens on llama.cpp's server. `agent.New` warns once for
+each such entry, naming its provider and alias. The entry's `timeout`, when set, bounds each request.
+The engine measures context by the entry the turn started on. With no
+entry to use, the turn fails with `agent.ErrNoModel` and makes no
+request.
+
+Availability and health key on the provider and the served model, never
+the alias, so every variant of a model shares them. One `Health` may
+serve an agent and a judge, with `agent.WithHealth` and
+`agent.WithJudgeHealth`, so that each skips a model the other saw fail.
+
+- **llama-swap.** Before it uses an entry on a `llama-swap` provider,
+  the chain asks `Provider.RunningURL`, giving up after 3 seconds. A
+  model `/running` lists is used. One it does not list is used under
+  `load = "always"`, under `when_idle` only when nothing is running, and
+  never under `never`. An unreachable server, or an answer that is not
+  a JSON object whose `running` is an array, such as `{}`, `null`, or
+  `{"running":null}`, makes the model unavailable, logged as
+  `unreachable`, so a malformed answer never reads as idle. An answer that makes a model
+  available is never kept, since llama-swap can swap the model out the
+  moment after. One that makes it unavailable is kept for 30 seconds per
+  provider, so a busy room does not ask at each judgement. Each decision
+  logs "model availability" at Debug with the provider, the served
+  model, and its kind: `loaded`, `loading_when_idle`, `loading_always`,
+  `not_loaded`, `busy_other_model`, or `unreachable`. A provider of any
+  other kind is always available.
+- **Breakers.** Three failures in a row of a kind that falls through
+  open a served model's breaker, which logs "model breaker opened". An
+  open breaker skips the model for 30 seconds. Then it is half-open: one
+  request tries the model, and its success closes the breaker while its
+  failure opens it for another 30 seconds. A success resets the count,
+  and so does a failure about the request, such as a 400 for a request
+  too large, since the server answered. These are
+  `agent.DefaultBreakerFailures` and `agent.DefaultBreakerCoolOff`,
+  which `HealthOptions` can change.
+- **Accounting.** Each entry passed over logs "model fell through" at
+  Info, with the use, the provider, the alias as `model`, the `served`
+  id, and the reason, and counts once in
+  `airut_model_fallthrough_total`. The reason is `unavailable`,
+  `breaker_open`, `too_large` (judgements only), or the failure's kind:
+  `connect`, `5xx`, `429`, `timeout`, or `not_found`.
 
 ## Gating
 
@@ -591,9 +693,21 @@ OpenAI-compatible goes through a terva client, without them.
 
 - **Constrained output.** `Output` sends OpenAI's `response_format`,
   llama.cpp's `json_schema` or GBNF `grammar`, or nothing. The schema
-  bounds the target to the batch. The reply is then parsed strictly: one
-  JSON object with a decision, a target, and a reason, and nothing after
-  it.
+  bounds the target to the batch. Under a constraint the reply is parsed
+  strictly: one JSON object with a decision, a target, and a reason, and
+  nothing after it.
+- **Unconstrained replies.** With `Output = "none"` the model may wrap
+  its verdict in prose or a code fence. The last decision key inside a
+  JSON object picks the verdict: the outermost object around it, closed
+  or cut off at the end, unless a later closed object decodes with a
+  `decision` property spelled with escapes. The last, because a model
+  that reasons aloud or quotes chat answers at the end. That object is
+  final: if it is out of range or not valid JSON, the judgement abstains
+  rather than trying an earlier object. A reply over 64 KiB abstains
+  unread. With no decision key inside an object, the judge reads
+  `decision:`, `target:`, and `reason:` lines, or else the reply's
+  words. It abstains on anything ambiguous: yes and no both, two
+  targets, a target outside the batch, or a yes that names no message.
 - **Untrusted input.** Every message is quoted chat, with the
   instruction to read it and never follow it. Injected text can at worst
   produce a yes about a message of the batch.
@@ -621,9 +735,32 @@ OpenAI-compatible goes through a terva client, without them.
   whether a judgement fits before making it, and each call logs the
   server's `prompt_tokens` beside the estimate.
 
-`agent.OpenJudge` builds the judge from `[agent.judge]`, on its
-provider's base URL and key, and `agent.JudgeRate` builds the core's
-`JudgeRate` from its `rate`.
+- **Chains.** `JudgeOptions.Models` is a chain of `JudgeModel`s, each
+  with its own served id, base URL and key, output, slots, prompt cache
+  hint, temperature, reply cap, timeout, and input cap. Each judgement
+  walks the chain from its start. It passes over a model whose provider
+  says it is unavailable, whose breaker is open, or whose cap the
+  judgement cannot be cut to fit, and cuts the judgement to each model's
+  own cap. It falls through when a call fails as an agent turn's first
+  request does (above). A reply that is not a verdict is the model's
+  answer, and abstains there. The first model the judgement fits shares
+  its timeout with the wait for a free place, which bounds that model's
+  call when it is called first. Every other call has its own model's
+  timeout, from the call's start. The output picks the parse, strict or loose,
+  per model. A judgement that fits no model abstains with
+  `ErrJudgementTooLarge` without a call or a wait, and one that finds no
+  model to use abstains with `agent.ErrNoModel`. On a chain,
+  `InputTokens` is the largest model's cap, or zero when one caps
+  nothing, and `Fits` asks whether some model's cap fits.
+- **Logs.** Each call logs "judge request" at Debug, with the provider,
+  the alias as `model`, the `served` id, `fell_through`, the counts the
+  input cap uses, `ms`, and the outcome.
+
+`agent.OpenJudge` builds the judge from `[agent.judge]`: its chain, each
+model on its provider's base URL and key and with its effective
+capabilities, and a `Health` over the file's providers. A model's
+`max_output` below the judge's reply cap of 256 lowers it.
+`agent.JudgeRate` builds the core's `JudgeRate` from its `rate`.
 
 ### Chime
 
@@ -1032,6 +1169,60 @@ for it. Its other helpers:
   the check that separates them. `Base` returns the tag a build was made
   from.
 
+### Announcing an update
+
+`Changelog.Channels` lists the rooms told what changed when the bot
+starts on a newer release, each naming its platform, typically from the
+app's config file. When a platform's adapter connects, the bot checks
+each room listed for that platform on a goroutine of its own, as it runs
+`OnReady` handlers, and `Run` waits for it. For each room it compares
+the running `Version` with the last version recorded there:
+
+- **A newer release.** The bot posts the sections from the record up to
+  and including the running version, newest first, as one message under
+  the `Heading`, with `{version}` the running version. One section reads
+  as `changelog` shows it, and several each open with their version in
+  bold. The adapters split a message that is too long. A move from
+  v1.2.0 to v1.5.0 posts 1.5, 1.4, and 1.3 together. A release leaves
+  out prerelease sections, since its own notes cover them, so a room
+  told of v1.5.0-rc.1 is not told it again when v1.5.0 ships. Only a
+  running prerelease posts prerelease notes.
+- **A build that is not a release,** such as
+  `v1.5.0-4-gabc1234-dirty`, or no `Version` at all, posts nothing and
+  leaves every record alone, so the release after it is announced in
+  full. A deploy from main makes no noise.
+- **A prerelease** counts only when the notes have a section for it.
+  Without one it posts nothing and does not move the record, so the full
+  release posts properly later.
+- **A release without a section** is recorded and logged, and nothing is
+  posted. `changelog.Covers` in a release check is how a bot avoids it.
+- **A room with no record,** on a first run or when it is newly listed,
+  gets nothing, and the running version is recorded there. A welcome
+  message is a separate feature.
+- **A rollback,** or the same version again, posts nothing and does not
+  lower the record.
+
+A room is recorded only after its post succeeds, so a room whose post
+failed is tried again on the next connect, and a short outage at deploy
+time does not silently cost it the release. The failure is logged by
+room id. Each post is keyed by the version and the room, so a restart
+between a post and its record does not post twice while the platform
+remembers the key. An announcement pings nobody, like every other airut
+send.
+
+`Changelog.Store` is the `VersionStore` that keeps the records, and it
+defaults to the Agent when that is one. `agent.Agent` keeps them in the
+session database. A bot without an agent uses
+`airut.FileVersionStore(path)`, a small JSON file that is written to a
+new file beside it and renamed into place, so a crash leaves the old
+records or the new ones. `Run` fails before it starts an adapter when
+`Channels` is set and there is no store, because without one every start
+would look like a first run and announce nothing. The adapters' state
+directories are no place for it, since Discord has none.
+
+The log carries room ids, versions, and the message's size, never the
+notes.
+
 ## Metrics
 
 Every bot keeps metrics in memory, which `Bot.Metrics()` and
@@ -1047,19 +1238,21 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_agent_turn_seconds` | `command` | how long a turn that started took |
 | `airut_agent_requests_total` | `command` | model requests |
 | `airut_agent_tokens_total` | `command` | tokens the provider reported |
-| `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `budget`, or `error` |
-| `airut_agent_request_seconds` | `provider`, `model` | how long each model request took |
-| `airut_agent_first_token_seconds` | `provider`, `model` | how long a request took to its first delta |
+| `airut_agent_stops_total` | `command`, `stop` | turns by how they stopped: `done`, `length`, `budget`, or `error` |
+| `airut_agent_request_seconds` | `provider`, `model`, `served` | how long each model request took, by alias and served id |
+| `airut_agent_first_token_seconds` | `provider`, `model`, `served` | how long a request took to its first delta |
 | `airut_agent_tool_seconds` | `tool` | how long each tool call took |
 | `airut_judge_total` | `persona`, `decision` | judgements, by decision, abstentions included |
 | `airut_judge_seconds` | `persona` | how long a judgement took, waiting for the judge included |
-| `airut_judge_request_seconds` | `model`, `outcome` | how long the judge's call to its model took, by `ok` or the error's kind |
+| `airut_judge_request_seconds` | `model`, `served`, `outcome` | how long the judge's call to its model took, by `ok` or the error's kind |
+| `airut_model_fallthrough_total` | `use`, `from`, `reason` | chain entries passed over, by `agent` or `judge`, the alias, and why |
 | `airut_chime_total` | `persona`, `outcome`, `engaged` | Chime batches, by how each ended |
 | `airut_chime_misses_total` | `persona` | Chime replies marked as a miss |
 | `airut_memory_writes_total` | `scope`, `source`, `status` | memories saved, by how they were saved |
 | `airut_profile_changes_total` | `platform`, `field` | changes made with the profile command |
 | `airut_memory_consents_total` | `answer` | answers to a pending memory's question |
 | `airut_setting_changes_total` | `setting`, `source` | settings changed from chat, by a command or the agent |
+| `airut_changelog_posts_total` | `platform`, `outcome` | each listed room's changelog check on a connect: `posted`, `first_run`, `not_newer`, `not_release`, `no_section`, `send_failed`, `record_failed`, or `store_failed` |
 | `airut_adapter_up` | `platform` | 1 while the adapter runs |
 | `airut_uptime_seconds` | | seconds since the bot was made |
 
@@ -1094,12 +1287,48 @@ The engine reads no file and no environment variable, so the framework
 supplies everything. Each bot has one TOML file, which
 [config.example.toml](config.example.toml) shows key by key. It holds:
 
-- the model providers: OpenAI-compatible endpoints and their models;
-- the agent's default model, budget, rate limit, and access lists;
+- the model providers: OpenAI-compatible endpoints, their kinds, and
+  their models;
+- the agent's default model or chain of models, budget, rate limit,
+  and access lists;
 - the session store;
 - each platform's settings;
 - where metrics are served, and how often they are logged;
 - the config layer of the bot's runtime settings, under `[settings]`.
+
+A model's description lives on its provider, in one place. Each entry
+under `[providers.X] models` has an `id`, which the rest of the file
+names it by, and a `model`, the id sent to the server, which defaults to
+`id`. It also carries its capabilities: `context_window`, `max_output`,
+`reasoning`, `output`, `timeout`, `slots`, `cache_prompt`, and
+`temperature`. An entry with `base` is a variant. It takes every key it
+leaves out, `model` included, from the entry it names in the same
+provider. A missing base and a cycle of bases are problems. Variants
+let two use sites call one served model with different settings, such
+as a judge variant with a smaller window and a temperature of 0.
+
+A provider's `kind` is `openai` by default. `llama-swap` marks a server
+that loads one model at a time and lists the loaded ones at `/running`
+beside its base URL, which `Provider.RunningURL` derives. Its `load`
+policy says what a chain does with a model that is not loaded: `never`,
+the default, skips it, `when_idle` uses it only when nothing is loaded,
+and `always` uses it whatever it evicts. `never` is the default because
+loading a model can stop whatever else the server runs, so only a
+deployment that has weighed that cost should ask for it.
+
+A use site, `[agent]` or `[agent.judge]`, names its model as
+`model = "provider/model"`, or names a chain as `models = [...]`, but
+not both. An entry in the chain is `"provider/model"`, or a table that
+names one as `model` and overrides any of its capabilities. Load
+resolves each use site into a `config.Chain`. Each entry carries its
+provider, its alias, its served id, and its effective capabilities.
+Those are the model's after its base, then the use site's table, then
+the entry's own table. The judge's table-level `output`, `slots`,
+`cache_prompt`, `timeout`, and `max_input_tokens` override every entry,
+as they set the judge's one model before chains. Each judge entry's
+`MaxInputTokens` defaults to its `context_window`, so the cap follows
+the model a call lands on. `Agent.Model` and `Judge.Model` name the
+first entry.
 
 Secrets are never in the file. A key that holds one names where the
 deployment put it: an environment variable, a systemd credential, or a
@@ -1128,7 +1357,8 @@ cfg, err := config.LoadApp("/etc/bot/airut.toml", &s)
 
 `airut/config` only parses: it imports neither terva nor a platform
 library. `agent.Providers` turns its providers into terva clients, one
-per provider id, and a model catalog holding every model the file lists.
+per provider id, and a model catalog holding every model the file
+lists, by the id its server knows.
 
 ## Building
 

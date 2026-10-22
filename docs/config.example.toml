@@ -23,23 +23,58 @@ reply_depth = 3
 # Model providers: OpenAI-compatible endpoints. The table key is the
 # provider's id, and a model is named as "id/model".
 [providers.local]
-base_url = "http://127.0.0.1:8000/v1"
+base_url = "http://127.0.0.1:8080/v1"
+# What else the server answers: "openai" (the default) for none, or
+# "llama-swap", which loads one model at a time and lists the loaded
+# ones at /running beside base_url. A chain skips a llama-swap model
+# that is not loaded, unless load says to use it anyway: "never" (the
+# default), "when_idle" (only when no model is loaded, so loading it
+# evicts nothing), or "always" (evicting whatever is loaded). load
+# applies only to llama-swap.
+kind = "llama-swap"
+load = "when_idle"
 # A keyless local server leaves out api_key.
 models = [
+  # id is what the rest of this file names. model is the id sent to the
+  # server, and defaults to id.
+  #
   # context_window and max_output are in tokens; 0 or absent leaves
-  # them unknown. reasoning marks a model that thinks before answering.
-  { id = "qwen3-32b", context_window = 32768, max_output = 8192, reasoning = true },
+  # them unknown. context_window is what one request gets, so on a
+  # llama.cpp server with parallel slots it is one slot's share.
+  # Set max_output on a model an agent uses: without it no limit is
+  # sent, and the server's own default, 1024 on llama.cpp, cuts
+  # answers short.
+  # reasoning marks a model that thinks before answering.
+  #
+  # The rest set how a call is made, for every use site that names the
+  # model, and a use site may override each one. output is how a reply
+  # is held to a JSON shape: "response_format" (OpenAI's and
+  # llama-server's), "json_schema" or "grammar" (llama.cpp's own
+  # fields), or "none". timeout bounds a call. slots and cache_prompt
+  # are llama.cpp's: pin each room to one of this many slots, and ask the
+  # server to keep the prompt cached, so a room's next call reuses it.
+  # temperature is 0 to 2. Absent, each is left to the use site.
+  { id = "qwen3-32b", model = "Qwen3-32B-Q4_K_M", context_window = 32768, max_output = 8192, reasoning = true },
+  # base makes a variant: the entry takes every key it leaves out,
+  # model included, from another entry of the same provider. Use sites
+  # name the variant, and the server sees the one model both serve.
+  { id = "qwen3-judge", base = "qwen3-32b", context_window = 8192, reasoning = false, output = "json_schema", slots = 2, cache_prompt = true, temperature = 0 },
 ]
 
 [providers.proxy]
 base_url = "https://llm.example.net/v1"
 api_key = { credential = "proxy-api-key" }
-models = [{ id = "gpt-5.5" }]
+models = [{ id = "gpt-5.5", context_window = 128000, output = "response_format" }]
 
 # Agent turns. Without this table the bot runs plain commands only.
 [agent]
-# The model a turn uses when it names none.
+# The model a turn uses when it names none, as "provider/model". Set
+# either model or models, a chain tried in order: a turn starts on the
+# first entry that is available. An entry is "provider/model" or a
+# table naming one as model, with any of the model's keys to override
+# them here, such as { model = "proxy/gpt-5.5", timeout = "2m" }.
 model = "local/qwen3-32b"
+# models = ["local/qwen3-32b", "proxy/gpt-5.5"]
 # Required. Caps a turn that sets no budget of its own.
 budget = { max_turns = 8, max_tokens = 200000 }
 # Optional. Turns per user and per channel in a sliding window; these
@@ -63,27 +98,28 @@ history = { max_messages = 200, max_tokens = 60000, max_age = "168h", compaction
 # asks for, such as whether to speak up in a conversation, on a model of
 # its own. Without this table every judgement abstains.
 [agent.judge]
-model = "local/qwen3-32b"
+# The judge's model, or its chain, as [agent] names them. A judgement
+# tries each entry in turn, and each call takes its own entry's output,
+# slots, cache_prompt, timeout, and max_input_tokens.
+models = ["local/qwen3-judge", { model = "proxy/gpt-5.5", timeout = "40s", max_input_tokens = 16000 }]
 # Judge calls in flight across the bot; more wait, and a room's waiting
 # call is replaced by its newer one. Set it to the server's parallel
 # slots. Defaults to 1.
 concurrency = 2
-# How the reply is held to the verdict's JSON: "response_format" (the
-# default, OpenAI's and llama-server's), "json_schema" or "grammar"
-# (llama.cpp's own fields), or "none".
-output = "json_schema"
-# llama.cpp only: pin each room to one of this many slots, and ask the
-# server to keep the prompt cached, so a room's next judgement reuses
-# it. 0 and false leave both to the server.
-slots = 2
-cache_prompt = true
-# Bounds a call, waiting included. Defaults to 30s.
+# output, slots, cache_prompt, and timeout set here override them for
+# every entry, beneath an entry's own. timeout bounds a call, waiting
+# included, and defaults to 30s; output defaults to "response_format".
 timeout = "20s"
+# output = "json_schema"
+# slots = 2
+# cache_prompt = true
+#
 # Caps each call's whole request, instructions, chat, and reserved reply
 # together, so it fits the server's per-slot context. With no tokenizer,
 # the judge counts one token per bytes_per_token bytes, 3 by default,
 # which overestimates English. Over the cap it drops the oldest context
-# first. 0 caps nothing.
+# first. Without it each entry is capped at its model's context_window,
+# or not at all when that is unknown. 0 caps nothing.
 max_input_tokens = 8000
 # bytes_per_token = 3
 # Judgements per channel in a sliding window, apart from the turn rate,

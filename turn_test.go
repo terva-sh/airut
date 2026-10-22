@@ -42,13 +42,50 @@ func TestFinalOnly(t *testing.T) {
 	if text != "You got 4." {
 		t.Errorf("Text() = %q, want the last segment", text)
 	}
-	// Each tool call sends what the hour-long throttle held back, and
-	// each segment replaces the last.
-	wantEvents(t, a.Text("!stream"), "reply:Let me ", "edit:Let me roll. ", "edit:Checking again.", "edit:You got 4.")
+	// The agent leaves the narration out, so the answer is posted once,
+	// and nothing is posted to be replaced.
+	wantEvents(t, a.Text("!stream"), "reply:You got 4.")
 	// Without FinalOnly the segments add up, and the throttle is still
 	// flushed at each call.
 	wantEvents(t, a.Text("!all"), "reply:Let me ", "edit:Let me roll. ", "edit:Let me roll. Checking again.",
 		"edit:Let me roll. Checking again.You got 4.")
+	if turns := agent.Turns(); !turns[0].FinalOnly || !turns[1].FinalOnly || turns[2].FinalOnly {
+		t.Errorf("Turn.FinalOnly = %v, %v, %v; want it set by FinalOnly only", turns[0].FinalOnly, turns[1].FinalOnly, turns[2].FinalOnly)
+	}
+}
+
+// TestFinalOnlyWithAnAgentThatIgnoresIt has the core keep only the last
+// segment itself, for an agent that passes the narration on anyway.
+func TestFinalOnlyWithAnAgentThatIgnoresIt(t *testing.T) {
+	agent := agentFunc(func(c *airut.Ctx, out airut.TurnOutput) error {
+		out.Text("Let me ")
+		out.Text("roll. ")
+		out.ToolCall("roll")
+		out.Text("Checking again.")
+		out.ToolCall("roll")
+		out.Text("You got ")
+		out.Text("4.")
+		return nil
+	})
+	b, _ := newBot(airut.Config{Gate: openGate, Agent: agent, EditInterval: time.Hour})
+	var text string
+	b.Command("text", "Text", func(c *airut.Ctx) error {
+		var err error
+		text, err = c.Agent(airut.Turn{Prompt: "roll"}).FinalOnly().Text()
+		return err
+	})
+	b.Command("stream", "Stream", func(c *airut.Ctx) error {
+		return c.Agent(airut.Turn{Prompt: "roll"}).FinalOnly().StreamTo(c)
+	})
+	a := airuttest.Start(t, b)
+
+	a.Text("!text")
+	if text != "You got 4." {
+		t.Errorf("Text() = %q, want the last segment", text)
+	}
+	// Each tool call sends what the hour-long throttle held back, and
+	// each segment replaces the last.
+	wantEvents(t, a.Text("!stream"), "reply:Let me ", "edit:Let me roll. ", "edit:Checking again.", "edit:You got 4.")
 }
 
 func TestRunTo(t *testing.T) {

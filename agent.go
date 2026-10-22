@@ -112,6 +112,16 @@ type Turn struct {
 	// History bounds how much of Session the turn resumes.
 	History History
 	Budget  Budget
+	// FinalOnly asks the agent to pass on only the answer: the text of
+	// the turn's last model request. What the model says in a request
+	// that ends in tool calls is narration, and the agent drops it
+	// rather than passing it on, so it never reaches the chat, not even
+	// for a moment; while tools run, the typing notice shows the turn is
+	// working. The answer is passed on whole when its request ends, so
+	// a streamed reply is posted once rather than growing. A turn whose
+	// answer has no text passes on a notice saying so instead of
+	// nothing. TurnRun.FinalOnly sets it for Text and StreamTo.
+	FinalOnly bool
 }
 
 // Tool is something an agent turn may call. A Command registered with
@@ -236,12 +246,15 @@ type TurnRun struct {
 // Agent prepares an agent turn for this invocation.
 func (c *Ctx) Agent(t Turn) *TurnRun { return &TurnRun{c: c, t: t} }
 
-// FinalOnly keeps only the answer's last segment, the text after the
-// last tool call, so what the model narrates while it works never
-// reaches the chat. Text returns the last segment, and StreamTo replaces
-// the reply's text with each new segment, so the reply ends as the
-// answer. A turn that calls no tool is unchanged. RunTo is not affected:
-// it passes the output on as it comes.
+// FinalOnly keeps only the answer, so what the model narrates while it
+// works never reaches the chat. It sets Turn.FinalOnly for Text and
+// StreamTo, and so the agent leaves the narration out. For an agent
+// that does not honour Turn.FinalOnly, Text still returns only the
+// last segment, the text after the last tool call, and StreamTo
+// replaces the reply's text with each new segment, so the reply ends
+// as the answer. A turn that calls no tool is unchanged. RunTo is not
+// affected: it passes the output on as it comes, and an app that wants
+// only the answer from it sets Turn.FinalOnly itself.
 func (r *TurnRun) FinalOnly() *TurnRun {
 	r.finalOnly = true
 	return r
@@ -251,13 +264,14 @@ func (r *TurnRun) FinalOnly() *TurnRun {
 // app that presents the answer its own way. Typing shows in the chat c
 // replies to.
 func (r *TurnRun) RunTo(out TurnOutput) error {
-	return r.run(out, r.c, nil)
+	return r.run(out, r.c, nil, false)
 }
 
 // run runs the turn with out as its output and a typing keepalive in
 // chat's chat. flush, if set, sends what out holds back; an Ask calls
-// it so the question posts below a complete reply.
-func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func()) error {
+// it so the question posts below a complete reply. finalOnly sets the
+// turn's FinalOnly.
+func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func(), finalOnly bool) error {
 	switch {
 	case r.c.capture != nil:
 		return errNested
@@ -275,6 +289,7 @@ func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func()) error {
 		return err
 	}
 	t := r.t
+	t.FinalOnly = t.FinalOnly || finalOnly
 	t.Budget = g.budget(t.Budget)
 	t.Tools = r.c.reachable(t.Tools)
 	key, how, err := r.c.sessionKey(t)
@@ -336,7 +351,7 @@ func (r *TurnRun) run(out TurnOutput, chat *Ctx, flush func()) error {
 // under FinalOnly.
 func (r *TurnRun) Text() (string, error) {
 	b := &collector{finalOnly: r.finalOnly}
-	err := r.run(b, r.c, nil)
+	err := r.run(b, r.c, nil, r.finalOnly)
 	return b.String(), err
 }
 
@@ -347,7 +362,7 @@ func (r *TurnRun) Text() (string, error) {
 func (r *TurnRun) StreamTo(c *Ctx) error {
 	s := &streamer{c: c, every: c.bot.cfg.EditInterval, now: time.Now, finalOnly: r.finalOnly,
 		typing: c.bot.cfg.TypingEvery <= 0}
-	err := r.run(s, c, s.sendPending)
+	err := r.run(s, c, s.sendPending, r.finalOnly)
 	if ferr := s.flush(); err == nil {
 		err = ferr
 	}

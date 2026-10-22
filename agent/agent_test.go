@@ -28,6 +28,9 @@ type reply struct {
 	// delay holds the reply back after its first event, and gap between
 	// its text deltas.
 	delay, gap time.Duration
+	// toolStarts announces each tool call as it begins, as a streaming
+	// provider does.
+	toolStarts bool
 }
 
 func say(text string) reply {
@@ -66,11 +69,16 @@ func (f *fake) Stream(ctx context.Context, req provider.Request) (<-chan provide
 		ch <- provider.EventStart{Model: req.Model, Provider: "fake"}
 		time.Sleep(r.delay)
 		for i, c := range r.content {
-			if t, ok := c.(provider.TextBlock); ok {
+			switch c := c.(type) {
+			case provider.TextBlock:
 				if i > 0 {
 					time.Sleep(r.gap)
 				}
-				ch <- provider.EventTextDelta{Delta: t.Text}
+				ch <- provider.EventTextDelta{Delta: c.Text}
+			case provider.ToolCallBlock:
+				if r.toolStarts {
+					ch <- provider.EventToolStart{ID: c.ID, Name: c.Name}
+				}
 			}
 		}
 		ch <- provider.EventUsage{Usage: provider.Usage{InputTokens: r.tokens / 2, OutputTokens: r.tokens - r.tokens/2}}
