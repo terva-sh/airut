@@ -57,7 +57,7 @@ func isSecretRef(t map[string]any) bool {
 		return false
 	}
 	for k := range t {
-		return k == "env" || k == "credential" || k == "file"
+		return k == "env" || k == "credential" || k == "file" || k == "sealed"
 	}
 	return false
 }

@@ -253,8 +253,10 @@ func (f fileCaps) apply(c *Capabilities) {
 	}
 }
 
-func buildProvider(p *problems, id string, f fileProvider, dir string) Provider {
-	key := "providers." + id
+func buildProvider(p *problems, id string, f fileProvider, src *secretSource) Provider {
+	// The id is written as a key path writes it, so that a refused id
+	// with a dot in it cannot share an api_key's binding with another.
+	key := childKey("providers", id)
 	pr := Provider{ID: id, BaseURL: f.BaseURL, Kind: f.Kind}
 	if !providerIDRE.MatchString(id) {
 		p.addf(key, "a provider id is lowercase letters, digits, - and _, starting with a letter or digit")
@@ -279,7 +281,7 @@ func buildProvider(p *problems, id string, f fileProvider, dir string) Provider 
 		p.add(key+".load", `must be "never", "when_idle", or "always"`)
 	}
 	if f.APIKey != nil {
-		pr.APIKey = resolveSecret(p, key+".api_key", f.APIKey, dir)
+		pr.APIKey = resolveSecret(p, key+".api_key", f.APIKey, src)
 	}
 	if len(f.Models) == 0 {
 		p.add(key+".models", "a provider needs at least one model")

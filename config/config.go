@@ -1,9 +1,11 @@
 // Package config loads a bot's configuration file: its model providers,
 // its platforms, and the guards on its agent turns.
 //
-// The file is TOML. Secrets are never in it: each one is named as an
-// environment variable, a systemd credential, or a file, and Load reads
-// it from there. docs/config.example.toml shows every key.
+// The file is TOML. Secrets are never in it as plaintext: each one is
+// named as an environment variable, a systemd credential, or a file, and
+// Load reads it from there, or is sealed to an age recipient and bound
+// to its key, and Load opens it with the key [secrets] names.
+// docs/config.example.toml shows every key.
 //
 // The package parses into plain Go types and imports no terva package;
 // agent.Providers turns the providers into terva clients.
@@ -231,12 +233,18 @@ type fileConfig struct {
 	Discord   *fileDiscord            `toml:"discord"`
 	Matrix    *fileMatrix             `toml:"matrix"`
 	Metrics   *fileMetrics            `toml:"metrics"`
+	Secrets   *fileSecrets            `toml:"secrets"`
 	// Settings is any for the reason App is.
 	Settings any `toml:"settings"`
 	// App is the bot's own settings, which LoadApp decodes. It is any,
 	// not a table, so that a value of the wrong type is a problem
 	// reported with the rest rather than a failure of the whole decode.
 	App any `toml:"app"`
+}
+
+// fileSecrets is the [secrets] table: the key that opens sealed values.
+type fileSecrets struct {
+	Key any `toml:"key"`
 }
 
 type fileBot struct {
@@ -358,7 +366,13 @@ func parse(path string, src []byte, app reflect.Value) (*Config, error) {
 		return nil, decodeError(path, err)
 	}
 	p := &problems{file: path}
-	c := build(p, &f, filepath.Dir(path))
+	sec := &secretSource{dir: filepath.Dir(path)}
+	// The key is read before any secret, so that a sealed value anywhere
+	// in the file opens with it.
+	if f.Secrets != nil && f.Secrets.Key != nil {
+		readSealKey(p, sec, f.Secrets.Key)
+	}
+	c := build(p, &f, sec)
 	if f.App != nil {
 		table, isTable := f.App.(map[string]any)
 		switch {
@@ -367,7 +381,7 @@ func parse(path string, src []byte, app reflect.Value) (*Config, error) {
 		case !isTable:
 			p.add("app", "the value is not a table")
 		default:
-			decodeTable(p, "app", table, app, filepath.Dir(path))
+			decodeTable(p, "app", table, app, sec)
 		}
 	}
 	if err := p.err(); err != nil {
@@ -388,7 +402,7 @@ var (
 	snowflakeRE  = regexp.MustCompile(`^[0-9]{1,20}$`)
 )
 
-func build(p *problems, f *fileConfig, dir string) *Config {
+func build(p *problems, f *fileConfig, src *secretSource) *Config {
 	c := &Config{Bot: Bot{Prefix: f.Bot.Prefix}}
 	if strings.ContainsAny(f.Bot.Prefix, " \t\r\n") {
 		p.add("bot.prefix", "a prefix cannot contain spaces")
@@ -422,12 +436,12 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		c.Providers = append(c.Providers, buildProvider(p, id, f.Providers[id], dir))
+		c.Providers = append(c.Providers, buildProvider(p, id, f.Providers[id], src))
 	}
 
 	if f.Agent != nil {
 		c.Agent = buildAgent(p, f.Agent, c.Providers)
-		c.Store = buildStore(p, f.Store, dir)
+		c.Store = buildStore(p, f.Store, src.dir)
 	} else if f.Store != nil {
 		p.add("store", "a session store needs an [agent] table; without one the bot runs no agent turns")
 	}
@@ -437,7 +451,7 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 		if f.Discord.Token == nil {
 			p.add("discord.token", "required: the bot token, as a secret reference")
 		} else {
-			d.Token = resolveSecret(p, "discord.token", f.Discord.Token, dir)
+			d.Token = resolveSecret(p, "discord.token", f.Discord.Token, src)
 		}
 		for i, g := range d.Guilds {
 			if !snowflakeRE.MatchString(g) {
@@ -447,7 +461,7 @@ func build(p *problems, f *fileConfig, dir string) *Config {
 		c.Discord = d
 	}
 	if f.Matrix != nil {
-		c.Matrix = buildMatrix(p, f.Matrix, dir)
+		c.Matrix = buildMatrix(p, f.Matrix, src)
 	}
 	if f.Settings != nil {
 		c.Settings = buildSettings(p, f.Settings)
@@ -629,22 +643,22 @@ func buildStore(p *problems, f *fileStore, dir string) Store {
 	return s
 }
 
-func buildMatrix(p *problems, f *fileMatrix, dir string) *Matrix {
+func buildMatrix(p *problems, f *fileMatrix, src *secretSource) *Matrix {
 	m := &Matrix{Homeserver: f.Homeserver, UserID: f.UserID, StateDir: f.StateDir, DeviceName: f.DeviceName}
 	checkURL(p, "matrix.homeserver", f.Homeserver)
 	if !validMXID(f.UserID) {
 		p.add("matrix.user_id", "required: the bot's Matrix user id, such as @bot:example.org")
 	}
 	if f.Password != nil {
-		m.Password = resolveSecret(p, "matrix.password", f.Password, dir)
+		m.Password = resolveSecret(p, "matrix.password", f.Password, src)
 	}
 	if f.RecoveryKey != nil {
-		m.RecoveryKey = resolveSecret(p, "matrix.recovery_key", f.RecoveryKey, dir)
+		m.RecoveryKey = resolveSecret(p, "matrix.recovery_key", f.RecoveryKey, src)
 	}
 	if m.StateDir == "" {
 		p.add("matrix.state_dir", "required: the directory that keeps the Matrix session and crypto store")
 	} else if !filepath.IsAbs(m.StateDir) {
-		m.StateDir = filepath.Join(dir, m.StateDir)
+		m.StateDir = filepath.Join(src.dir, m.StateDir)
 	}
 	return m
 }

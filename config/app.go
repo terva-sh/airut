@@ -20,9 +20,11 @@ import (
 // maps.
 //
 // A field of type Secret takes a secret reference, as airut's own
-// secrets do: { env = "NAME" }, { credential = "NAME" }, or
-// { file = "PATH" }. A plain string there is refused, because secrets
-// are never in the file. A key the struct does not name, or a value of
+// secrets do: { env = "NAME" }, { credential = "NAME" },
+// { file = "PATH" }, or { sealed = "enc:age:v2:..." }. A sealed value
+// is bound to its own key path under app, such as app.booru.token, and
+// opens nowhere else. A plain string there is refused, because secrets
+// are never in the file as plaintext. A key the struct does not name, or a value of
 // the wrong type, is a problem, reported with every other problem in the
 // file. A file without an [app] table leaves app as it was.
 func LoadApp(path string, app any) (*Config, error) {
@@ -43,7 +45,7 @@ var (
 )
 
 // decodeTable decodes raw, the table at key, into the struct v.
-func decodeTable(p *problems, key string, raw map[string]any, v reflect.Value, dir string) {
+func decodeTable(p *problems, key string, raw map[string]any, v reflect.Value, src *secretSource) {
 	t := v.Type()
 	fields := map[string]int{}
 	for i := range t.NumField() {
@@ -68,22 +70,22 @@ func decodeTable(p *problems, key string, raw map[string]any, v reflect.Value, d
 	for _, k := range keys {
 		i, ok := fields[k]
 		if !ok {
-			p.add(key+"."+k, "unknown key")
+			p.add(childKey(key, k), "unknown key")
 			continue
 		}
-		decodeValue(p, key+"."+k, raw[k], v.Field(i), dir)
+		decodeValue(p, childKey(key, k), raw[k], v.Field(i), src)
 	}
 }
 
 // decodeValue decodes raw, the value at key, into v.
-func decodeValue(p *problems, key string, raw any, v reflect.Value, dir string) {
+func decodeValue(p *problems, key string, raw any, v reflect.Value, src *secretSource) {
 	t := v.Type()
 	switch {
 	case t == secretType:
-		v.Set(reflect.ValueOf(resolveSecret(p, key, raw, dir)))
+		v.Set(reflect.ValueOf(resolveSecret(p, key, raw, src)))
 	case t.Kind() == reflect.Pointer:
 		nv := reflect.New(t.Elem())
-		decodeValue(p, key, raw, nv.Elem(), dir)
+		decodeValue(p, key, raw, nv.Elem(), src)
 		v.Set(nv)
 	case t.Kind() == reflect.Struct && !reflect.PointerTo(t).Implements(textUnmarshalerType):
 		m, ok := raw.(map[string]any)
@@ -91,7 +93,7 @@ func decodeValue(p *problems, key string, raw any, v reflect.Value, dir string) 
 			p.add(key, "the value is not a table")
 			return
 		}
-		decodeTable(p, key, m, v, dir)
+		decodeTable(p, key, m, v, src)
 	case t.Kind() == reflect.Slice && t.Elem().Kind() != reflect.Uint8:
 		list, ok := raw.([]any)
 		if !ok {
@@ -100,7 +102,7 @@ func decodeValue(p *problems, key string, raw any, v reflect.Value, dir string) 
 		}
 		s := reflect.MakeSlice(t, len(list), len(list))
 		for i, item := range list {
-			decodeValue(p, fmt.Sprintf("%s.%d", key, i), item, s.Index(i), dir)
+			decodeValue(p, indexKey(key, i), item, s.Index(i), src)
 		}
 		v.Set(s)
 	case t.Kind() == reflect.Array:
@@ -114,7 +116,7 @@ func decodeValue(p *problems, key string, raw any, v reflect.Value, dir string) 
 			return
 		}
 		for i, item := range list {
-			decodeValue(p, fmt.Sprintf("%s.%d", key, i), item, v.Index(i), dir)
+			decodeValue(p, indexKey(key, i), item, v.Index(i), src)
 		}
 	case t.Kind() == reflect.Map && t.Key().Kind() == reflect.String:
 		m, ok := raw.(map[string]any)
@@ -125,7 +127,7 @@ func decodeValue(p *problems, key string, raw any, v reflect.Value, dir string) 
 		out := reflect.MakeMapWithSize(t, len(m))
 		for k, item := range m {
 			ev := reflect.New(t.Elem()).Elem()
-			decodeValue(p, key+"."+k, item, ev, dir)
+			decodeValue(p, childKey(key, k), item, ev, src)
 			out.SetMapIndex(reflect.ValueOf(k).Convert(t.Key()), ev)
 		}
 		v.Set(out)

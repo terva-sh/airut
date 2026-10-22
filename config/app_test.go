@@ -148,7 +148,7 @@ enabled = "yes"
 		"app.backfill.enabled", "app.backfill.open_reviews",
 		"app.booru.extra", "app.booru.token",
 		"app.colour", "app.limits.per_hour", "app.main_room",
-		"app.mirrors.0.key", "app.mirrors.1.key", "app.pair",
+		"app.mirrors[0].key", "app.mirrors[1].key", "app.pair",
 		"app.watched", "bot.prefix",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -192,7 +192,7 @@ func TestAnAppThatIsNotATableIsReportedWithTheRest(t *testing.T) {
 func TestFixedSizeArrays(t *testing.T) {
 	var s botSettings
 	_, err := loadApp(t, matrixOnly+"[app]\npair = [{ url = \"https://p.example.org\", typo = true }]\n", &s)
-	if got := problemKeys(t, err); !reflect.DeepEqual(got, []string{"app.pair.0.typo"}) {
+	if got := problemKeys(t, err); !reflect.DeepEqual(got, []string{"app.pair[0].typo"}) {
 		t.Errorf("problems at %q, want the unknown key inside the array", got)
 	}
 	_, err = loadApp(t, matrixOnly+"[app]\npair = [{}, {}, {}]\n", &s)
