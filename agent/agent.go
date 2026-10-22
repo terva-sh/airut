@@ -31,6 +31,12 @@ type Options struct {
 	// is the persona of a turn that names none. A turn naming a persona
 	// that is not here fails.
 	Personas map[string]string
+	// Character is who the bot is and how it speaks: its voice, its
+	// temperament, how it addresses people. Every turn's system prompt
+	// opens with it, whatever the persona, and the persona's prompt
+	// follows, so the rules and tools a persona sets are read last. A
+	// judge does not take it. Empty means none.
+	Character string
 	// Sessions keeps the conversations turns remember, and the bot's
 	// long-term memories.
 	Sessions *sessions.DB
@@ -55,13 +61,15 @@ type Agent struct {
 	catalog  provider.ModelCatalog
 	model    config.ModelRef
 	personas map[string]string
-	db       *sessions.DB
-	history  airut.History
-	caps     MemoryCaps
-	now      func() time.Time
-	ownsDB   bool
-	log      *slog.Logger
-	locks    keyLocks
+	// character opens every turn's system prompt.
+	character string
+	db        *sessions.DB
+	history   airut.History
+	caps      MemoryCaps
+	now       func() time.Time
+	ownsDB    bool
+	log       *slog.Logger
+	locks     keyLocks
 }
 
 var (
@@ -111,15 +119,23 @@ func New(o Options) (*Agent, error) {
 		personas[k] = v
 	}
 	return &Agent{
-		client: client, catalog: o.Catalog, model: o.Model, personas: personas,
+		client: client, catalog: o.Catalog, model: o.Model, personas: personas, character: o.Character,
 		db: o.Sessions, history: o.History, caps: caps, now: o.Now, log: o.Logger,
 	}, nil
+}
+
+// OpenOption sets an Option that Open does not read from the file.
+type OpenOption func(*Options)
+
+// WithCharacter sets Options.Character.
+func WithCharacter(character string) OpenOption {
+	return func(o *Options) { o.Character = character }
 }
 
 // Open builds the agent a configuration file describes: a client for
 // each provider, the default model, and the session store, which Close
 // closes. It fails when the file has no [agent] table.
-func Open(ctx context.Context, c *config.Config, personas map[string]string, log *slog.Logger) (*Agent, error) {
+func Open(ctx context.Context, c *config.Config, personas map[string]string, log *slog.Logger, opts ...OpenOption) (*Agent, error) {
 	if c.Agent == nil {
 		return nil, errors.New("agent: the configuration has no [agent] table")
 	}
@@ -128,7 +144,7 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 		return nil, err
 	}
 	clients, catalog := Providers(c)
-	a, err := New(Options{
+	o := Options{
 		Clients: clients, Catalog: catalog, Model: c.Agent.Model,
 		Personas: personas, Sessions: db, Logger: log,
 		MemoryCaps: MemoryCaps{User: c.Agent.Memory.MaxUser, Channel: c.Agent.Memory.MaxChannel, Bot: c.Agent.Memory.MaxBot},
@@ -140,7 +156,11 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 			FollowWithin: c.Agent.History.FollowWithin,
 			Compaction:   airut.Compaction(c.Agent.History.Compaction),
 		},
-	})
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	a, err := New(o)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -227,6 +247,9 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	system, ok := a.personas[t.Persona]
 	if !ok && t.Persona != "" {
 		return fmt.Errorf("agent: no persona %q", t.Persona)
+	}
+	if a.character != "" {
+		system = strings.TrimSpace(a.character + "\n\n" + system)
 	}
 	began := time.Now()
 	tm := &timing{c: c, log: a.log, provider: a.model.Provider, model: a.model.Model}

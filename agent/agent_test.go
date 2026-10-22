@@ -462,6 +462,36 @@ func TestPersonas(t *testing.T) {
 	}
 }
 
+func TestCharacterOpensEveryPersona(t *testing.T) {
+	db := openDB(t, filepath.Join(t.TempDir(), "sessions.db"))
+	model := &fake{}
+	reg := provider.NewRegistry()
+	reg.RegisterExtraModel(provider.Model{Provider: "fake", ID: "m", ContextWindow: 32000, MaxOutput: 1024})
+	ag, err := New(Options{
+		Clients: map[string]provider.Client{"fake": model}, Catalog: reg,
+		Model:     config.ModelRef{Provider: "fake", Model: "m"},
+		Personas:  map[string]string{"search": "Find posts."},
+		Character: "You are the archive's librarian.",
+		Sessions:  db,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bot := airut.New(airut.Config{Agent: ag, Gate: allow, EditInterval: time.Nanosecond})
+	persona := "search"
+	bot.Command("ask", "Ask", func(c *airut.Ctx) error {
+		return c.Agent(airut.Turn{Prompt: "hi", Persona: persona}).StreamTo(c)
+	})
+	a := airuttest.Start(t, bot)
+	a.Text("!ask")
+	persona = ""
+	a.Text("!ask")
+	want := []string{"You are the archive's librarian.\n\nFind posts.", "You are the archive's librarian."}
+	if got := systems(model.requests()); !slices.Equal(got, want) {
+		t.Fatalf("system prompts = %q, want %q", got, want)
+	}
+}
+
 func TestNew(t *testing.T) {
 	reg := provider.NewRegistry()
 	reg.RegisterExtraModel(provider.Model{Provider: "fake", ID: "m"})

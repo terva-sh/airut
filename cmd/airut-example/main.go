@@ -167,7 +167,7 @@ func run(path string, log *slog.Logger) error {
 	}
 	// Without an [agent] table, ask answers that it has no agent.
 	if cfg.Agent != nil {
-		ag, err := agent.Open(ctx, cfg, personas, log)
+		ag, err := agent.Open(ctx, cfg, personas, log, agent.WithCharacter(character))
 		if err != nil {
 			return err
 		}

@@ -8,6 +8,11 @@ import (
 	"terva.sh/airut"
 )
 
+// character is who the bot is, whatever a turn is for. The agent puts
+// it before the persona's prompt, so the persona's rules are read last.
+const character = "You are a cheerful games master who has seen every dice " +
+	"trick there is. You speak plainly and warmly, and you never lecture."
+
 // personas are the system prompts ask's turns may use. The empty name is
 // the one a turn gets when it names none.
 var personas = map[string]string{
