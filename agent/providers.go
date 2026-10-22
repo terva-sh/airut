@@ -36,8 +36,9 @@ func Providers(c *config.Config) (map[string]provider.Client, *provider.Registry
 }
 
 // catalogModel describes a served model to terva.
+// An unset image_input leaves terva's default, which accepts images.
 func catalogModel(providerID, served string, c config.Capabilities) provider.Model {
-	return provider.Model{
+	m := provider.Model{
 		Provider:      providerID,
 		ID:            served,
 		DisplayName:   served,
@@ -45,4 +46,8 @@ func catalogModel(providerID, served string, c config.Capabilities) provider.Mod
 		MaxOutput:     c.MaxOutput,
 		Reasoning:     c.Reasoning,
 	}
+	if c.ImageInput != nil {
+		m.Caps = map[provider.Capability]bool{provider.CapImageInput: *c.ImageInput}
+	}
+	return m
 }

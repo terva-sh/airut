@@ -256,6 +256,20 @@ encrypted history it could read before.
   mark is only the inviter's claim: the bot records a direct room it
   joins in its `m.direct`, and the per-event check decides whether the
   room is in fact direct.
+  - **`Options.CheckInvite`** decides as `AcceptInvite` does, for a
+    rule that needs a context or can fail: `func(ctx, Invite) (bool,
+    error)`. An error refuses the invite, so a check that could not
+    finish, such as a claims read, never lets the bot in. It runs off
+    the sync loop, on a context that ends with `Run`. The usual rule
+    asks `Bot.IsOwner` about the inviter, which needs the `Bot` built
+    before the adapter, so the callback can capture it;
+    `cmd/airut-example` joins for its owners and for the users
+    `[agent.access.matrix]` names that way.
+  - **One or the other.** `Run` refuses to start when both callbacks are
+    set, rather than let one silently win and leave the other's rule
+    unenforced. A bot that sets only `AcceptInvite` is unchanged.
+  - Each decision is logged with the room's and inviter's ids, and an
+    error by its kind, never its text.
 - **Cross-signing.** Clients mark a message from an unsigned device
   "not verified by its owner", and a client that shares room keys only
   with verified devices stops sharing them with the bot. So the bot's
@@ -277,6 +291,55 @@ encrypted history it could read before.
   - `(*matrix.Adapter).CrossSigning` reports, from the server, whether
     the account has an identity and the running device is signed, for
     a status command.
+- **Sibling cross-signing.** Bots of one owner, each listing the others
+  in `[matrix.siblings]`, sign each other's master keys with their
+  user-signing keys, so each trusts the others' devices without a
+  person. A shared fleet secret proves each exchange. It changes nothing
+  the owner's clients show.
+  - A proof is an `m.notice` in the coordination room. Its body names
+    the bot and its master key for the owner reading the room. Its
+    fields, under `sh.terva.airut.sibling_proof`, are the label
+    `airut-trust-v1`, the sender's user id and master key, a nonce, a
+    timestamp, the room's id, and in an answer the nonce of the request
+    it answers. An HMAC-SHA256 covers them all, each prefixed with its
+    length. Its key is derived from the secret with HKDF and the label,
+    so the MAC cannot be confused with another use of the secret.
+  - A bot signs a sibling's key only when the sender is on its list and
+    is the user the proof names, the proof is for this room and label,
+    the MAC verifies in constant time, the proof's own timestamp is at
+    most five minutes old and at most one minute ahead, its nonce is
+    new, an answer answers a request of this bot's, and the homeserver
+    publishes the proven key now. rihma's `SignUserIdentity` signs that
+    key and no other. The room grants nothing: membership, a message's
+    sender, and the room's history prove nothing by themselves. A
+    message from anyone not on the list is ignored and logged by sender
+    id only, and no message in the room is a command or reaches the
+    bot's handlers.
+  - At start, once the first sync is processed, a bot posts a request
+    when it has not signed some sibling's current key, or when its own
+    master key differs from the one it last posted, which it records in
+    `siblings.json` in the state directory. It cannot learn whether a
+    sibling signed it, since a server shows a user-signing signature
+    only to its maker. Each sibling that accepts a request signs the
+    requester and answers with its own proof, which the requester signs
+    in turn. An answer is never answered, so two bots cannot loop. A
+    restart reads old proofs again, and the window refuses them; nonces
+    are kept in memory for the window.
+  - The bot refuses to post in a coordination room that is not
+    encrypted or that it has not joined, and warns when anyone can join
+    the room without an invite. Joining the room follows
+    the invite callback as any room does. A bot that started outside
+    the room runs its start again when it joins, so a sibling invited
+    after it started still posts.
+  - A signed sibling that publishes a new master key is logged as a
+    warning once, from rihma's `Options.OnIdentityChange`, and is not
+    signed again until a proof shows the new key. Rotating the secret is
+    replacing the credential on every sibling; `previous_secret` is
+    accepted for verifying, never for making a proof, while that happens.
+  - Logs carry user ids, master keys, and refusal reasons, never the
+    secret, the derived key, or a MAC. The secret must be at least 32
+    bytes: every room member sees each MAC, and a guessable secret could
+    be found from one offline.
 - **Replies.**
   - Replies render Markdown, but any HTML in the text is shown as text.
   - Every message carries empty intentional mentions, so a name or
@@ -533,6 +596,72 @@ the room as it is then. Each is headed as quoted chat to read and never
 follow, with every sender and text written as a quoted string, so a
 message cannot pass for the bot's words or the app's instructions.
 The bot's own messages are marked as its own.
+
+### Images
+
+A turn can see pictures. `Turn.Images` go to the model with the prompt,
+as `airut.Image` values: bytes and a media type, nothing bound to a
+platform or a model. airut never attaches a chat image by itself. The
+command decides what the turn sees and reads an attachment with
+`Conn.Open`, so an image reaches a model only when a command chose to
+send it.
+
+A tool can return pictures too. `airut.ImageTool` is a `Tool` with
+`CallImages`, which returns a `ToolOutput`: text, and images the model
+looks at beside it. The agent calls it in place of `Call` and builds a
+tool result with the text and an image block for each picture. A plain
+`Tool` is unchanged, and a command registered with `AsTool` stays
+text-only. A restricted `ImageTool` is wrapped like any restricted
+tool, and the wrapper keeps `CallImages`. Neither type names a model,
+so a later request to another configured model can reuse them as they
+are.
+
+Before an image is sent, the agent:
+
+- refuses one over `airut.MaxImageBytes`, 20 MiB, or one whose header
+  claims more than 64 megapixels, before decoding it;
+- decodes it in pure Go, reading the format from the bytes rather than
+  the claimed type: PNG, JPEG, GIF (the first frame), or WebP;
+- scales it down, keeping its aspect ratio, when its longer side is over
+  `Turn.ImageMaxSide`, which defaults to `airut.DefaultImageMaxSide`,
+  1568 pixels, the size the major vision APIs scale to anyway;
+- sends a PNG or JPEG that already fits as it came, and re-encodes the
+  rest: a JPEG as JPEG, anything else as PNG, and a PNG over 5 MiB as
+  JPEG;
+- keeps what it sends within 5 MiB, whatever `ImageMaxSide` allows: a
+  JPEG over it is written at a lower quality, then smaller by a quarter
+  at a time, and one that cannot get under it becomes a note.
+
+An image that cannot be read or is too large is never an error that
+fails the turn. The model gets a note in its place, such as
+`[image 2 not sent: it could not be read as a PNG, JPEG, GIF, or WebP
+image]`, after the prompt's text or in the tool result, so it knows a
+picture was meant.
+
+Images are kept for the turn they arrive in and no longer. The agent
+writes the session through a wrapper that puts a note in place of each
+image, in a message, a tool result, or a compaction: `[image not kept:
+image/png, 800x600, sha256 1a2b3c4d5e6f]`. A resumed session then
+replays no image tokens, and the store does not grow by megabytes a
+turn. A later turn that needs a picture again asks a tool for it, which
+is what `ImageTool` is for. A session written before this change may
+still hold images; the agent replaces them with the same note when it
+resumes one. `agent/sessions` itself still stores what it is given, as
+terva's `transcripttest` suite requires.
+
+A model, or the gateway in front of it, may not accept images. A model
+marked `image_input = false` in the configuration is described to terva
+without `provider.CapImageInput`, and terva sends its own note in place
+of each image rather than a request the server would refuse. Unset, a
+model is taken to accept images. When a provider refuses an image all
+the same, with a 400 that names it, terva's engine replaces the newest
+image with a note, records the image's hash as an exclusion in the
+session, and retries, so the turn goes on to an answer. A test plays
+that refusal through the scripted fake model.
+
+The log names an image by its index, type, dimensions, byte size, and a
+sha256 prefix, as "agent image" or "agent image not sent" with a reason
+kind. It never holds image bytes or the prompt's text.
 
 The agent package imports only the terva packages terva marks stable,
 which a test checks.
@@ -901,7 +1030,9 @@ pure-Go `modernc.org/sqlite` driver, which rihma already brings.
   `core.TranscriptStore`. A resume replays the log into terva's own
   `core.MemoryTranscriptStore`, so terva, not airut, decides how usage
   totals, compactions, excluded images, and unanswered tool calls come
-  back. The store passes terva's `transcripttest` suite.
+  back. The store passes terva's `transcripttest` suite. The agent
+  writes to it with every image replaced by a note, so a session holds
+  no image bytes (see Images, under Agent turns).
 - Message content is stored in airut's own tagged JSON, because terva's
   codec is not a stable API. A test fills every field of every content
   block by reflection, so a terva upgrade that adds a field fails until
@@ -1147,6 +1278,10 @@ bot that has no agent still has them, and no bot repeats the list.
 - **`airut.Owner`** is an `AccessCheck` that admits a caller whose id
   is listed for their platform, or claimed there with `airut claim`.
   `Bot.HasOwner` reports whether a platform has any owner, from either.
+  `Bot.IsOwner(ctx, User)` answers what `Owner` answers, for any user
+  rather than a command's caller, so code outside a command can ask:
+  a Matrix `Options.CheckInvite` asks it about the inviter, so an owner
+  who claimed the bot can open a direct chat by inviting it.
 - **The built-ins stay opt-in.** `Config.ProfileEditors`,
   `Config.Settings.Owner`, and `Config.MemoryAccess` do not default to
   `Owner`. A bot gives it to them, as
@@ -1227,8 +1362,9 @@ the log could claim an unclaimed bot with it.
   never the error's text. Reading claims only at start was rejected,
   because the restart is the step most likely to be forgotten, and a
   reload signal would be new machinery for a rare action.
-- **Claims count everywhere owners do**: in `Owner`, `HasOwner`, the
-  start warning, the direct-message claim line, and `status`.
+- **Claims count everywhere owners do**: in `Owner`, `IsOwner`,
+  `HasOwner`, the start warning, the direct-message claim line, a
+  Matrix invite check that asks `IsOwner`, and `status`.
 
 A bot can mount the commands as its own subcommands, so that
 `docker exec mybot mybot claim @you:example.org` works with no second
@@ -1462,8 +1598,10 @@ A model's description lives on its provider, in one place. Each entry
 under `[providers.X] models` has an `id`, which the rest of the file
 names it by, and a `model`, the id sent to the server, which defaults to
 `id`. It also carries its capabilities: `context_window`, `max_output`,
-`reasoning`, `output`, `timeout`, `slots`, `cache_prompt`, and
-`temperature`. An entry with `base` is a variant. It takes every key it
+`reasoning`, `output`, `timeout`, `slots`, `cache_prompt`,
+`temperature`, and `image_input`, which set to `false` marks a model
+that does not accept images (see Images, under Agent turns). An entry
+with `base` is a variant. It takes every key it
 leaves out, `model` included, from the entry it names in the same
 provider. A missing base and a cycle of bases are problems. Variants
 let two use sites call one served model with different settings, such

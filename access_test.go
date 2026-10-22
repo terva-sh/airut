@@ -177,6 +177,46 @@ func (p *plainTool) Call(*airut.Ctx, json.RawMessage) (string, error) {
 	return "ran", nil
 }
 
+// imageTool is a plainTool that returns images.
+type imageTool struct{ plainTool }
+
+func (p *imageTool) CallImages(*airut.Ctx, json.RawMessage) (airut.ToolOutput, error) {
+	p.ran.Add(1)
+	return airut.ToolOutput{Text: "ran", Images: []airut.Image{{Data: []byte("png")}}}, nil
+}
+
+func TestRestrictedImageToolsKeepTheirImages(t *testing.T) {
+	it := &imageTool{plainTool{allowFor: 2}}
+	agent := &airuttest.Agent{}
+	b, _ := newBot(airut.Config{Gate: openGate, Agent: agent})
+	b.Command("ask", "Ask the agent", func(c *airut.Ctx) error {
+		return c.Agent(airut.Turn{Tools: []airut.Tool{it}}).StreamTo(c)
+	})
+	a := airuttest.Start(t, b)
+	a.Text("!ask")
+
+	turns := agent.Turns()
+	if len(turns) != 1 || len(turns[0].Tools) != 1 {
+		t.Fatalf("turns = %+v", turns)
+	}
+	offered, ok := turns[0].Tools[0].(airut.ImageTool)
+	if !ok {
+		t.Fatal("the offered tool lost CallImages")
+	}
+	// The offer used one check; the next call is allowed, the one after
+	// refused.
+	if out, err := offered.CallImages(nil, nil); err != nil || len(out.Images) != 1 {
+		t.Fatalf("an allowed call returned %+v, %v", out, err)
+	}
+	var rf *airut.Refusal
+	if _, err := offered.CallImages(nil, nil); !errors.As(err, &rf) || rf.Reason != airut.RefusedAccess {
+		t.Errorf("a refused CallImages returned %v, want an access Refusal", err)
+	}
+	if n := it.ran.Load(); n != 1 {
+		t.Errorf("the tool ran %d times, want once", n)
+	}
+}
+
 func TestPlainRestrictedToolsAreCheckedAgainWhenCalled(t *testing.T) {
 	pt := &plainTool{allowFor: 1, approve: true}
 	agent := &airuttest.Agent{Steps: []airuttest.Step{{Call: "plain", Args: `{}`}}}

@@ -83,6 +83,10 @@ models = [
   # sent, and the server's own default, 1024 on llama.cpp, cuts
   # answers short.
   # reasoning marks a model that thinks before answering.
+  # image_input = false marks a model, or a gateway in front of it, that
+  # does not accept images: an agent turn on it sends a note in place of
+  # each image rather than a request the server would refuse. Absent,
+  # the model is taken to accept them.
   #
   # The rest set how a call is made, for every use site that names the
   # model, and a use site may override each one. output is how a reply
@@ -92,7 +96,7 @@ models = [
   # are llama.cpp's: pin each room to one of this many slots, and ask the
   # server to keep the prompt cached, so a room's next call reuses it.
   # temperature is 0 to 2. Absent, each is left to the use site.
-  { id = "qwen3-32b", model = "Qwen3-32B-Q4_K_M", context_window = 32768, max_output = 8192, reasoning = true },
+  { id = "qwen3-32b", model = "Qwen3-32B-Q4_K_M", context_window = 32768, max_output = 8192, reasoning = true, image_input = false },
   # base makes a variant: the entry takes every key it leaves out,
   # model included, from another entry of the same provider. Use sites
   # name the variant, and the server sees the one model both serve.
@@ -243,6 +247,26 @@ device_name = "airut sample"
 # never rests on the host. Guard it like the password: it can sign any
 # device as the bot's.
 # recovery_key = { credential = "matrix-recovery-key" }
+
+# Optional. Sibling bots: other airut bots of the same owner, which sign
+# each other's cross-signing identities once each proves, with a fleet
+# secret they share, that its master key is its own. Each bot needs its
+# device cross-signed first. The proofs go to one coordination room,
+# which the owner makes invite-only and encrypted and invites every
+# sibling to; the bot will not post in a room that is not encrypted.
+# [matrix.siblings]
+# The siblings' user ids. Only these are signed. The bot's own id may be
+# listed too, so every sibling can share one list.
+# users = ["@sample:example.org", "@other:example.org"]
+# The coordination room, by id, never an alias.
+# room = "!siblings:example.org"
+# The fleet secret: the same on every sibling, at least 32 random bytes,
+# made by the owner, as with `openssl rand -base64 48`. Whoever holds it
+# can vouch for any listed account.
+# secret = { credential = "matrix-fleet-secret" }
+# While the secret is replaced on each sibling in turn, the one being
+# replaced. Proofs made with it are still accepted; none are made.
+# previous_secret = { credential = "matrix-fleet-secret-previous" }
 
 # Metrics. Without this table the bot keeps its metrics in memory only,
 # for a command that reports them.

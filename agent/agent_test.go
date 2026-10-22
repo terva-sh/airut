@@ -31,6 +31,8 @@ type reply struct {
 	// toolStarts announces each tool call as it begins, as a streaming
 	// provider does.
 	toolStarts bool
+	// err fails the request before it streams anything.
+	err error
 }
 
 func say(text string) reply {
@@ -57,12 +59,15 @@ func (f *fake) Name() string { return "fake" }
 
 func (f *fake) Stream(ctx context.Context, req provider.Request) (<-chan provider.Event, error) {
 	f.mu.Lock()
-	f.reqs = append(f.reqs, req)
+	f.reqs = append(f.reqs, snapshot(req))
 	r := say("the script has ended")
 	if len(f.script) > 0 {
 		r, f.script = f.script[0], f.script[1:]
 	}
 	f.mu.Unlock()
+	if r.err != nil {
+		return nil, r.err
+	}
 	ch := make(chan provider.Event, len(r.content)+3)
 	go func() {
 		defer close(ch)
@@ -88,6 +93,24 @@ func (f *fake) Stream(ctx context.Context, req provider.Request) (<-chan provide
 		}
 	}()
 	return ch, nil
+}
+
+// snapshot copies req's messages' content, as the engine may change the
+// live transcript in place after the request, as when it takes out an
+// image the provider refused.
+func snapshot(req provider.Request) provider.Request {
+	ms := slices.Clone(req.Messages)
+	for i := range ms {
+		ms[i].Content = slices.Clone(ms[i].Content)
+		for j, c := range ms[i].Content {
+			if r, ok := c.(provider.ToolResultBlock); ok {
+				r.Content = slices.Clone(r.Content)
+				ms[i].Content[j] = r
+			}
+		}
+	}
+	req.Messages = ms
+	return req
 }
 
 func (f *fake) requests() []provider.Request {

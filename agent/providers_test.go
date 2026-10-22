@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -207,5 +209,66 @@ token = { env = "AIRUT_TEST_KEY" }
 	}
 	if len(j.models) != 2 || j.models[0].Alias != "small" || j.models[1].Alias != "fast" || j.models[1].MaxInputTokens != 32768 {
 		t.Errorf("the judge's chain = %+v", j.models)
+	}
+}
+
+// TestImageInput checks that a model's image_input reaches terva: an
+// image bound for a model marked false is sent as terva's note, and one
+// for a model that leaves it unset is sent as an image.
+func TestImageInput(t *testing.T) {
+	bodies := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies <- string(b)
+		http.Error(w, "fake", http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("AIRUT_TEST_KEY", "token")
+	path := filepath.Join(t.TempDir(), "airut.toml")
+	src := `
+[providers.local]
+base_url = "` + srv.URL + `/v1"
+models = [{ id = "blind", image_input = false }, { id = "seeing" }]
+
+[discord]
+token = { env = "AIRUT_TEST_KEY" }
+`
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients, catalog := Providers(cfg)
+	if m, _ := catalog.FindModel("local", "blind"); m.Has(provider.CapImageInput) {
+		t.Error("the catalog says blind accepts images")
+	}
+	if m, _ := catalog.FindModel("local", "seeing"); !m.Has(provider.CapImageInput) {
+		t.Error("an unset image_input did not leave terva's default")
+	}
+	img := []byte("\x89PNG\r\n\x1a\nnot a real one")
+	data := base64.StdEncoding.EncodeToString(img)
+	for model, wantImage := range map[string]bool{"blind": false, "seeing": true} {
+		req := provider.Request{Model: model, MaxTokens: 16, Messages: []provider.Message{{Role: provider.RoleUser,
+			Content: []provider.Content{provider.TextBlock{Text: "what is this"}, provider.ImageBlock{MimeType: "image/png", Data: img}}}}}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if events, err := clients["local"].Stream(ctx, req); err == nil {
+			for range events {
+			}
+		}
+		cancel()
+		var body string
+		select {
+		case body = <-bodies:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s never reached the endpoint", model)
+		}
+		if got := strings.Contains(body, data); got != wantImage {
+			t.Errorf("%s: the image was sent: %v, want %v", model, got, wantImage)
+		}
+		if got := strings.Contains(body, "does not accept image input"); got == wantImage {
+			t.Errorf("%s: terva's omission note was sent: %v, want %v", model, got, !wantImage)
+		}
 	}
 }

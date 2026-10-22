@@ -108,7 +108,11 @@ func (c *Ctx) reachable(tools []Tool) []Tool {
 				continue
 			}
 			if _, isCommand := t.(*Command); !isCommand {
-				t = guarded{rt}
+				if _, images := t.(ImageTool); images {
+					t = guardedImages{guarded{rt}}
+				} else {
+					t = guarded{rt}
+				}
 			}
 		}
 		out = append(out, t)
@@ -121,13 +125,21 @@ func (c *Ctx) reachable(tools []Tool) []Tool {
 type guarded struct{ RestrictedTool }
 
 func (g guarded) Call(c *Ctx, args json.RawMessage) (string, error) {
-	switch ok, err := g.Allows(c); {
-	case err != nil:
+	if err := g.check(c); err != nil {
 		return "", err
-	case !ok:
-		return "", &Refusal{Reason: RefusedAccess, msg: "You are not allowed to use " + g.Name() + "."}
 	}
 	return g.RestrictedTool.Call(c, args)
+}
+
+// check refuses a caller the tool's access check no longer allows.
+func (g guarded) check(c *Ctx) error {
+	switch ok, err := g.Allows(c); {
+	case err != nil:
+		return err
+	case !ok:
+		return &Refusal{Reason: RefusedAccess, msg: "You are not allowed to use " + g.Name() + "."}
+	}
+	return nil
 }
 
 // NeedsApproval keeps the wrapped tool's approval, so wrapping it does
@@ -138,3 +150,19 @@ func (g guarded) NeedsApproval() bool {
 }
 
 var _ ApprovalTool = guarded{}
+
+// guardedImages is guarded for a restricted ImageTool, so wrapping it
+// keeps its images.
+type guardedImages struct{ guarded }
+
+func (g guardedImages) CallImages(c *Ctx, args json.RawMessage) (ToolOutput, error) {
+	if err := g.check(c); err != nil {
+		return ToolOutput{}, err
+	}
+	return g.RestrictedTool.(ImageTool).CallImages(c, args)
+}
+
+var (
+	_ ImageTool    = guardedImages{}
+	_ ApprovalTool = guardedImages{}
+)

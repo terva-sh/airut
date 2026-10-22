@@ -105,6 +105,20 @@ type Budget struct {
 // stops at Budget.
 type Turn struct {
 	Prompt string
+	// Images go to the model with the prompt. airut attaches none by
+	// itself: the command decides what the turn sees, reading a chat
+	// attachment with Conn.Open. Each is decoded, scaled down to
+	// ImageMaxSide, and re-encoded before it is sent; one that cannot be
+	// read, or is over MaxImageBytes, reaches the model as a note saying
+	// so rather than failing the turn. Images are never kept in a
+	// session: what the conversation remembers of one is a note naming
+	// its type, size, and hash, so a later turn that needs it again asks
+	// a tool for it.
+	Images []Image
+	// ImageMaxSide caps the longer side, in pixels, of every image the
+	// turn sends, with the prompt or from a tool. Zero means
+	// DefaultImageMaxSide.
+	ImageMaxSide int
 	// Persona names the system frame the agent package resolves.
 	Persona string
 	Tools   []Tool
@@ -133,6 +147,32 @@ type Tool interface {
 	// Call runs the tool for the turn started from c and returns what
 	// the model reads.
 	Call(c *Ctx, args json.RawMessage) (string, error)
+}
+
+// DefaultImageMaxSide is Turn.ImageMaxSide when the turn sets none: the
+// longer side the major vision APIs scale an image down to anyway.
+const DefaultImageMaxSide = 1568
+
+// MaxImageBytes is the most an image given to a turn may hold, before
+// it is scaled down. A larger one reaches the model as a note.
+const MaxImageBytes = 20 << 20
+
+// ToolOutput is what an ImageTool returns: text, and images the model
+// looks at beside it. Nothing in it is bound to a model, so the same
+// output can be shown to whichever model a turn asks.
+type ToolOutput struct {
+	Text   string
+	Images []Image
+}
+
+// ImageTool is a Tool whose calls may return images as well as text, such
+// as one that fetches a picture the conversation worked with. The agent
+// calls CallImages in place of Call, and treats the images as it treats a
+// Turn's: scaled down, and kept in no session. A Command registered with
+// AsTool is not one; its replies stay text.
+type ImageTool interface {
+	Tool
+	CallImages(c *Ctx, args json.RawMessage) (ToolOutput, error)
 }
 
 // ApprovalTool is a Tool whose calls may need the caller's approval.

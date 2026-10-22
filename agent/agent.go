@@ -315,12 +315,19 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	tm := &timing{c: c, log: a.log}
 	tm.on(a.chain[0], 0)
 	tc := &turnClient{c: c, health: a.health, chain: a.chain, clients: a.clients, tm: tm}
+	maxSide := t.ImageMaxSide
+	switch {
+	case maxSide < 0:
+		return fmt.Errorf("agent: the turn's ImageMaxSide %d is negative", maxSide)
+	case maxSide == 0:
+		maxSide = airut.DefaultImageMaxSide
+	}
 	tools := make(core.Registry, len(t.Tools))
 	for _, tl := range t.Tools {
 		if _, dup := tools[tl.Name()]; dup {
 			return fmt.Errorf("agent: the turn names tool %q twice", tl.Name())
 		}
-		tools[tl.Name()] = &tool{c: c, t: tl, tm: tm}
+		tools[tl.Name()] = &tool{c: c, t: tl, tm: tm, a: a, maxSide: maxSide}
 	}
 
 	ctx := c.Context()
@@ -362,9 +369,12 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		if err != nil {
 			return err
 		}
+		// A session written before images were left out may still hold
+		// some; none is sent again.
+		tr.Messages = allWithoutImages(tr.Messages)
 		tr, due := window(tr, h, a.now())
 		resume = &tr
-		opts = append(opts, core.WithTranscriptStore(s),
+		opts = append(opts, core.WithTranscriptStore(imageless{s}),
 			core.WithCompactionPolicy(policy{due: due, keep: keepTail(tr.Messages, h)}))
 	}
 	eng, err := core.New(tc, first.Served, opts...)
@@ -393,7 +403,7 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	// its text as narration even when the output limit cut the call off.
 	var held strings.Builder
 	called := false
-	err = eng.Run(ctx, core.PromptInput{Text: t.Prompt}, func(e core.AgentEvent) {
+	err = eng.Run(ctx, a.prompt(c, t, maxSide), func(e core.AgentEvent) {
 		switch e := e.(type) {
 		case core.EvTurnStart:
 			steps = e.Step
@@ -446,6 +456,26 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		out.Text(notice)
 	}
 	return nil
+}
+
+// prompt is the turn's prompt for the engine: its text, and its images
+// prepared for the model. A note for each image that cannot be sent
+// follows the text.
+func (a *Agent) prompt(c *airut.Ctx, t airut.Turn, maxSide int) core.PromptInput {
+	in := core.PromptInput{Text: t.Prompt}
+	var notes []string
+	for _, b := range a.images(c, "prompt", "", t.Images, maxSide) {
+		switch b := b.(type) {
+		case provider.ImageBlock:
+			in.Images = append(in.Images, b)
+		case provider.TextBlock:
+			notes = append(notes, b.Text)
+		}
+	}
+	if len(notes) > 0 {
+		in.Text = strings.TrimSpace(in.Text + "\n\n" + strings.Join(notes, "\n"))
+	}
+	return in
 }
 
 // Notices are what a turn tells the chat when it ends without a whole
@@ -653,11 +683,14 @@ func (t *timing) totals() (model, tools time.Duration) {
 	return t.modelTotal, t.toolTotal
 }
 
-// tool adapts an airut.Tool to terva's.
+// tool adapts an airut.Tool to terva's. maxSide caps the images an
+// airut.ImageTool returns.
 type tool struct {
-	c  *airut.Ctx
-	t  airut.Tool
-	tm *timing
+	c       *airut.Ctx
+	t       airut.Tool
+	tm      *timing
+	a       *Agent
+	maxSide int
 }
 
 func (x *tool) Name() string            { return x.t.Name() }
@@ -670,7 +703,16 @@ func (x *tool) Schema() json.RawMessage { return x.t.Schema() }
 func (x *tool) Execute(ctx context.Context, args json.RawMessage, _ func(string)) (core.ToolResult, error) {
 	start, outcome := time.Now(), "ok"
 	defer func() { x.tm.tool(x.t.Name(), time.Since(start), outcome) }()
-	text, err := x.t.Call(x.c, args)
+	var text string
+	var imgs []airut.Image
+	var err error
+	if it, ok := x.t.(airut.ImageTool); ok {
+		var out airut.ToolOutput
+		out, err = it.CallImages(x.c, args)
+		text, imgs = out.Text, out.Images
+	} else {
+		text, err = x.t.Call(x.c, args)
+	}
 	if err != nil {
 		outcome = "error"
 		// Only when the turn itself has ended does the engine record the
@@ -681,6 +723,16 @@ func (x *tool) Execute(ctx context.Context, args json.RawMessage, _ func(string)
 		}
 		text = strings.TrimSpace(text + "\n" + forModel(err))
 		return core.ToolResult{Content: []provider.Content{provider.TextBlock{Text: text}}, IsError: true}, nil
+	}
+	if len(imgs) > 0 {
+		// The images follow the text, each in its place or a note saying
+		// why it is not there.
+		content := []provider.Content{}
+		if strings.TrimSpace(text) != "" {
+			content = append(content, provider.TextBlock{Text: text})
+		}
+		content = append(content, x.a.images(x.c, "tool", x.t.Name(), imgs, x.maxSide)...)
+		return core.ToolResult{Content: content}, nil
 	}
 	if strings.TrimSpace(text) == "" {
 		text = "The command finished and sent no reply."

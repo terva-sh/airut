@@ -30,11 +30,13 @@ type ProfileChange struct {
 	Avatar *Image
 }
 
-// Image is a picture's bytes and media type.
+// Image is a picture's bytes and media type. A profile's avatar is one,
+// and so is a picture an agent turn sees.
 type Image struct {
 	Data []byte
 	// Type is image/png, image/jpeg, image/gif, or image/webp, and must
-	// be what Data holds.
+	// be what Data holds. An agent turn reads the type from Data itself,
+	// so a turn's image may leave it empty.
 	Type string
 }
 
