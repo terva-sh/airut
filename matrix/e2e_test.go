@@ -1182,3 +1182,53 @@ func TestE2EStaleCommandsAndInvites(t *testing.T) {
 		t.Error("the bot joined a room AcceptInvite refused")
 	}
 }
+
+func TestE2EProfile(t *testing.T) {
+	hs := homeserver(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tg := tag()
+	botName, aliceName := "bot-"+tg, "alice-"+tg
+	register(t, ctx, hs, botName)
+	register(t, ctx, hs, aliceName)
+	botID := id.UserID("@" + botName + ":localhost")
+	s := startBot(t, ctx, hs, botName, matrix.Options{})
+	alice := openHuman(t, ctx, hs, aliceName)
+	s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
+	conn := s.conn
+
+	name := "Baphomet " + tg
+	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00")
+	if err := conn.SetProfile(ctx, airut.ProfileChange{Name: &name, Avatar: &airut.Image{Data: png, Type: "image/png"}}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := conn.Profile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != name || !strings.HasPrefix(p.Avatar, "mxc://") || p.About != "" {
+		t.Errorf("profile = %+v", p)
+	}
+	// Another user sees the same, and reads back the picture as sent.
+	theirs, err := alice.GetProfile(ctx, botID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if theirs.DisplayName != name || theirs.AvatarURL.String() != p.Avatar {
+		t.Errorf("alice sees %+v, want %q and %q", theirs, name, p.Avatar)
+	}
+	got, err := alice.DownloadBytes(ctx, theirs.AvatarURL)
+	if err != nil || !bytes.Equal(got, png) {
+		t.Errorf("the avatar downloads as %d bytes, err %v", len(got), err)
+	}
+
+	about := "The archive's librarian."
+	if err := conn.SetProfile(ctx, airut.ProfileChange{Name: ptr("Changed"), About: &about}); !errors.Is(err, airut.ErrUnsupported) {
+		t.Errorf("setting a description = %v, want ErrUnsupported", err)
+	}
+	if p, _ := conn.Profile(ctx); p.Name != name {
+		t.Errorf("a refused change renamed the bot to %q", p.Name)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }

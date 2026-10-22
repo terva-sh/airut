@@ -3,6 +3,7 @@ package matrix
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -232,4 +233,56 @@ func (s *session) Direct(ctx context.Context, ch airut.Channel) (airut.User, boo
 		return airut.User{}, false, nil
 	}
 	return s.user(ctx, room, other), true, nil
+}
+
+// Profile reads the bot's global display name and avatar. Matrix has no
+// description, so About is always empty.
+func (s *session) Profile(ctx context.Context) (airut.Profile, error) {
+	if err := s.c.Connect(ctx); err != nil {
+		return airut.Profile{}, err
+	}
+	resp, err := s.c.GetProfile(ctx, s.c.UserID)
+	if err != nil {
+		return airut.Profile{}, err
+	}
+	p := airut.Profile{Name: resp.DisplayName}
+	if !resp.AvatarURL.IsEmpty() {
+		p.Avatar = resp.AvatarURL.String()
+	}
+	return p, nil
+}
+
+// SetProfile changes the bot's global display name and avatar, which
+// the homeserver carries into every room the bot is in. A new picture is
+// uploaded as plain media, since a profile is public. A change that sets
+// About fails with airut.ErrUnsupported before anything changes, and a
+// name the bot already has is not set again.
+func (s *session) SetProfile(ctx context.Context, p airut.ProfileChange) error {
+	if err := p.Check(); err != nil {
+		return err
+	}
+	if p.About != nil {
+		return fmt.Errorf("matrix: a profile description: %w", airut.ErrUnsupported)
+	}
+	if err := s.c.Connect(ctx); err != nil {
+		return err
+	}
+	if p.Name != nil {
+		cur, err := s.c.GetOwnDisplayName(ctx)
+		if err != nil || cur.DisplayName != *p.Name {
+			if err := s.c.SetDisplayName(ctx, *p.Name); err != nil {
+				return err
+			}
+		}
+	}
+	if p.Avatar != nil {
+		up, err := s.c.UploadBytes(ctx, p.Avatar.Data, p.Avatar.Type)
+		if err != nil {
+			return err
+		}
+		if err := s.c.SetAvatarURL(ctx, up.ContentURI); err != nil {
+			return err
+		}
+	}
+	return nil
 }

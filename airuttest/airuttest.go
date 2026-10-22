@@ -26,7 +26,9 @@ const Platform airut.Platform = "test"
 type Event struct {
 	// Kind is "reply", "edit", "react", "ask", "ask-all", "answered",
 	// "typing", "typing-stop", or "thread", or "send" for a message
-	// posted through the adapter's Conn. A
+	// posted through the adapter's Conn, or "profile" for a change to
+	// the bot's profile, with Text naming the fields it set, joined by
+	// commas. A
 	// reaction added through the Conn is also "react", with Channel and
 	// Reaction set, and one retracted through it is "unreact".
 	Kind    string
@@ -75,6 +77,8 @@ type Adapter struct {
 	// direct maps a channel id to the person Conn.Direct reports it as
 	// private to.
 	direct map[string]airut.User
+	// profile is the bot's profile, as SetProfile left it.
+	profile airut.Profile
 }
 
 // reaction is one reaction the bot made through the Conn.
@@ -630,6 +634,41 @@ func (c conn) Unreact(_ context.Context, ch airut.Channel, ref airut.MessageRef)
 	delete(a.live, r)
 	a.events = append(a.events, Event{Kind: "unreact", Ref: r.target, Text: r.emoji, Channel: ch.ID, Reaction: ref.ID})
 	return nil
+}
+
+// Profile returns the bot's profile.
+func (c conn) Profile(context.Context) (airut.Profile, error) {
+	return c.BotProfile(), nil
+}
+
+// SetProfile checks p and applies it, records it as a "profile" event,
+// and serves a new picture as "avatar-N".
+func (c conn) SetProfile(_ context.Context, p airut.ProfileChange) error {
+	if err := p.Check(); err != nil {
+		return err
+	}
+	a := c.Adapter
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if p.Name != nil {
+		a.profile.Name = *p.Name
+	}
+	if p.About != nil {
+		a.profile.About = *p.About
+	}
+	if p.Avatar != nil {
+		a.refSeq++
+		a.profile.Avatar = "avatar-" + strconv.Itoa(a.refSeq)
+	}
+	a.events = append(a.events, Event{Kind: "profile", Text: strings.Join(p.Fields(), ",")})
+	return nil
+}
+
+// BotProfile returns the bot's profile as the Conn serves it.
+func (a *Adapter) BotProfile() airut.Profile {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.profile
 }
 
 // AddFile makes Conn.Open serve data for an attachment with this URL.

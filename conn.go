@@ -12,8 +12,9 @@ import (
 // Conn is an adapter's connection to its platform, for what a bot does
 // outside any one invocation: posting to another channel, reading an
 // attachment, walking a channel's history, checking membership, adding
-// and retracting the bot's own reactions, and checking whether a channel
-// is private to one person. An
+// and retracting the bot's own reactions, checking whether a channel
+// is private to one person, and reading and changing the bot's own
+// profile. An
 // adapter announces its Conn through Host.Ready once it is connected.
 // Its methods must be safe for concurrent use.
 type Conn interface {
@@ -52,6 +53,13 @@ type Conn interface {
 	// It checks the channel as it is now, so a bot can check again just
 	// before it sends something meant for that person alone.
 	Direct(ctx context.Context, ch Channel) (User, bool, error)
+	// Profile reads the bot's own profile as it is now.
+	Profile(ctx context.Context) (Profile, error)
+	// SetProfile changes the fields of the bot's own profile that p
+	// sets. It checks p with ProfileChange.Check first, and fails with
+	// ErrUnsupported, changing nothing, when p sets a field the platform
+	// does not have.
+	SetProfile(ctx context.Context, p ProfileChange) error
 }
 
 // ErrNotOwnReaction is returned by Conn.Unreact for a ref that does not

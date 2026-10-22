@@ -2,6 +2,8 @@ package discord
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -216,4 +218,84 @@ func (s *session) Unreact(ctx context.Context, ch airut.Channel, reaction airut.
 // before the @me that limits a removal to the bot's own reaction.
 func pathSafe(e string) bool {
 	return e != "" && !strings.ContainsAny(e, "/\\?%. \t\r\n")
+}
+
+// application is the part of the bot's application a profile reads and
+// changes: its description, which Discord shows on the bot's profile as
+// "About me".
+type application struct {
+	Description string `json:"description"`
+}
+
+// applicationMe is the bot's own application.
+var applicationMe = discordgo.EndpointApplications + "/@me"
+
+// Profile reads the bot user's name and avatar, and its application's
+// description.
+func (s *session) Profile(ctx context.Context) (airut.Profile, error) {
+	u, err := s.dg.User("@me", discordgo.WithContext(ctx))
+	if err != nil {
+		return airut.Profile{}, err
+	}
+	app, err := s.application(ctx)
+	if err != nil {
+		return airut.Profile{}, err
+	}
+	p := airut.Profile{Name: u.Username, About: app.Description}
+	if u.Avatar != "" {
+		p.Avatar = u.AvatarURL("")
+	}
+	return p, nil
+}
+
+func (s *session) application(ctx context.Context) (application, error) {
+	var app application
+	body, err := s.dg.RequestWithBucketID("GET", applicationMe, nil, applicationMe, discordgo.WithContext(ctx))
+	if err != nil {
+		return app, err
+	}
+	err = json.Unmarshal(body, &app)
+	return app, err
+}
+
+// SetProfile changes the bot user's name and avatar, and its
+// application's description. Discord lets a name change twice an hour,
+// so a name or description the bot already has is not sent again. A
+// picture is always sent, since Discord's avatar hash cannot be compared
+// with the bytes.
+func (s *session) SetProfile(ctx context.Context, p airut.ProfileChange) error {
+	if err := p.Check(); err != nil {
+		return err
+	}
+	var name, avatar string
+	if p.Name != nil {
+		u, err := s.dg.User("@me", discordgo.WithContext(ctx))
+		if err != nil {
+			return err
+		}
+		if u.Username != *p.Name {
+			name = *p.Name
+		}
+	}
+	if p.Avatar != nil {
+		avatar = "data:" + p.Avatar.Type + ";base64," + base64.StdEncoding.EncodeToString(p.Avatar.Data)
+	}
+	if name != "" || avatar != "" {
+		if _, err := s.dg.UserUpdate(name, avatar, "", discordgo.WithContext(ctx)); err != nil {
+			return err
+		}
+	}
+	if p.About != nil {
+		app, err := s.application(ctx)
+		if err != nil {
+			return err
+		}
+		if app.Description != *p.About {
+			body := application{Description: *p.About}
+			if _, err := s.dg.RequestWithBucketID("PATCH", applicationMe, body, applicationMe, discordgo.WithContext(ctx)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
