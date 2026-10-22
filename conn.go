@@ -178,7 +178,8 @@ func (b *Bot) Conn(p Platform) (Conn, error) {
 // called the command, so a tool's author decides whether a tool may.
 func (c *Ctx) Conn() (Conn, error) { return c.bot.Conn(c.Platform()) }
 
-// ready records conn and runs the OnReady handlers.
+// ready records conn, runs the OnReady handlers, and announces the
+// changelog in the channels listed for conn's platform.
 func (b *Bot) ready(ctx context.Context, conn Conn) {
 	if conn == nil {
 		return
@@ -199,6 +200,16 @@ func (b *Bot) ready(ctx context.Context, conn Conn) {
 				}
 			}()
 			h(ctx, conn)
+		})
+	}
+	if b.announcing(conn.Platform()) {
+		b.inflight.Go(func() {
+			defer func() {
+				if e := recovered(recover()); e != nil {
+					log.Error("changelog announcement panicked", "stack", string(e.(panicError).stack))
+				}
+			}()
+			b.announce(ctx, conn)
 		})
 	}
 }

@@ -60,6 +60,9 @@ func TestChimeEngagesARoomTheBotSpokeIn(t *testing.T) {
 	if outcome(b, "deferred") != 0 {
 		t.Error("an engaged room was deferred")
 	}
+	// The bot counts an answer after its handler returns, which may be
+	// after ran was signalled, so wait for both answers to be counted.
+	waitOutcome(t, b, "spoke", 2)
 	s, _ := b.Metrics().Get("airut_chime_total", "persona", "chime", "outcome", "spoke", "engaged", "true")
 	if s.Value != 1 {
 		t.Errorf("engaged answers counted %v times", s.Value)

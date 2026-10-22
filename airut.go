@@ -128,8 +128,11 @@ type Bot struct {
 	// serialises their changes, since one can be checked against another.
 	settings   map[string]*setting
 	settingsMu sync.Mutex
-	// changelog is Config.Changelog's notes, which Run parses.
-	changelog *changelog.Log
+	// changelog is Config.Changelog's notes, which Run parses, and
+	// announceMu serialises the announcements of them, so a reconnect
+	// during one does not race it.
+	changelog  *changelog.Log
+	announceMu sync.Mutex
 }
 
 // New returns a Bot with no commands. It panics on a Gate whose limits

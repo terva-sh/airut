@@ -4,6 +4,12 @@
 
 package dbq
 
+type ChangelogAnnouncement struct {
+	Room    string
+	Version string
+	Updated int64
+}
+
 type Entry struct {
 	SessionID int64
 	Seq       int64

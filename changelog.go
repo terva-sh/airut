@@ -1,6 +1,7 @@
 package airut
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -19,6 +20,17 @@ type Changelog struct {
 	// version, as "📚 New in the archive ({version}):". It defaults to
 	// "New in {version}:".
 	Heading string
+	// Channels are the rooms told what changed when the bot starts on a
+	// newer release, each naming its platform. A room is told once the
+	// platform's adapter connects, with every section since the last
+	// version announced there, and a room with no record is only
+	// recorded. Run fails on a channel without a platform or an id.
+	Channels []Channel
+	// Store records the last version announced in each of Channels. It
+	// defaults to the Agent when that is a VersionStore. Run fails when
+	// Channels is set and there is no store, since without one every
+	// start would look like a first run and announce nothing.
+	Store VersionStore
 }
 
 // defaultChangelogHeading is the Heading of a Changelog that sets none.
@@ -33,8 +45,8 @@ func (c *Changelog) heading(version string) string {
 	return strings.ReplaceAll(h, "{version}", version)
 }
 
-// parseChangelog parses Config.Changelog, for Run, which fails on an
-// error.
+// parseChangelog parses Config.Changelog and checks its channels and
+// their store, for Run, which fails on an error.
 func (b *Bot) parseChangelog() error {
 	if b.cfg.Changelog == nil {
 		return nil
@@ -42,6 +54,14 @@ func (b *Bot) parseChangelog() error {
 	l, err := changelog.Parse(b.cfg.Changelog.Notes)
 	if err != nil {
 		return fmt.Errorf("airut: Config.Changelog: %w", err)
+	}
+	for _, ch := range b.cfg.Changelog.Channels {
+		if ch.Platform == "" || ch.ID == "" {
+			return errors.New("airut: Config.Changelog.Channels lists a channel without a platform or an id")
+		}
+	}
+	if len(b.cfg.Changelog.Channels) > 0 && b.versionStore() == nil {
+		return errors.New("airut: Config.Changelog lists channels but has no Store, and the Agent is not a VersionStore")
 	}
 	b.changelog = l
 	return nil
