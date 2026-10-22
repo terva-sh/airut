@@ -121,7 +121,7 @@ var ErrNeedRecoveryKey = errors.New("matrix: the account has a cross-signing ide
 // io.Out could not be written. It writes to io.Out before it creates an
 // identity, so an output that fails stops it with the account unchanged.
 func CrossSign(ctx context.Context, cfg *config.Matrix, io CrossSignIO) (CrossSigningState, error) {
-	c, err := open(ctx, cfg, slog.New(slog.DiscardHandler))
+	c, err := open(ctx, cfg, slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		return CrossSigningState{}, err
 	}

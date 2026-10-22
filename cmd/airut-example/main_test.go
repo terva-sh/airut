@@ -115,7 +115,7 @@ func TestOneBinaryServesEachConfiguredPlatform(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	platforms := func(cfg *config.Config) []airut.Platform {
 		var out []airut.Platform
-		for _, a := range adapters(cfg, log) {
+		for _, a := range adapters(cfg, log, newBot(airut.Config{}, threes)) {
 			out = append(out, a.Platform())
 		}
 		return out
@@ -132,22 +132,42 @@ func TestOneBinaryServesEachConfiguredPlatform(t *testing.T) {
 	}
 }
 
-func TestInvitesComeOnlyFromNamedUsers(t *testing.T) {
+// claimsOnly is an Agent that keeps owner claims and runs no turns.
+type claimsOnly []airut.Claim
+
+func (claimsOnly) Run(*airut.Ctx, airut.Turn, airut.TurnOutput) error { return nil }
+
+func (c claimsOnly) ClaimedOwners(context.Context) ([]airut.Claim, error) { return c, nil }
+
+func TestInvitesComeOnlyFromOwnersAndNamedUsers(t *testing.T) {
 	cfg := &config.Config{Agent: &config.Agent{Access: map[string]config.Access{
-		"matrix":  {Users: []string{"@owner:example.org"}},
+		"matrix":  {Users: []string{"@named:example.org"}},
 		"discord": {Users: []string{"@stranger:example.org"}},
 	}}}
-	accept := inviters(cfg)
+	b := newBot(airut.Config{
+		Owners: map[airut.Platform][]string{airut.Matrix: {"@listed:example.org"}, airut.Discord: {"@discord-owner:example.org"}},
+		Agent:  claimsOnly{{Platform: airut.Matrix, ID: "@claimed:example.org"}},
+	}, threes)
+	accept := inviters(cfg, b)
+	ctx := context.Background()
 	for _, direct := range []bool{false, true} {
-		if !accept(matrix.Invite{Room: "!r:example.org", Inviter: "@owner:example.org", Direct: direct}) {
-			t.Errorf("refused an invite from a named user, direct %v", direct)
-		}
-		if accept(matrix.Invite{Room: "!r:example.org", Inviter: "@stranger:example.org", Direct: direct}) {
-			t.Errorf("accepted an invite from a user named only for Discord, direct %v", direct)
+		for inviter, want := range map[string]bool{
+			"@named:example.org":         true,
+			"@listed:example.org":        true,
+			"@claimed:example.org":       true,
+			"@stranger:example.org":      false, // named only for Discord
+			"@discord-owner:example.org": false, // an owner only on Discord
+			"@nobody:example.org":        false,
+		} {
+			got, err := accept(ctx, matrix.Invite{Room: "!r:example.org", Inviter: inviter, Direct: direct})
+			if got != want || err != nil {
+				t.Errorf("an invite from %s, direct %v: %v, %v; want %v", inviter, direct, got, err, want)
+			}
 		}
 	}
-	if inviters(&config.Config{})(matrix.Invite{Room: "!r:example.org", Inviter: "@owner:example.org"}) {
-		t.Error("accepted an invite with no [agent] table")
+	none := inviters(&config.Config{}, newBot(airut.Config{}, threes))
+	if ok, err := none(ctx, matrix.Invite{Room: "!r:example.org", Inviter: "@named:example.org"}); ok || err != nil {
+		t.Errorf("an invite with no [agent] table and no owners: %v, %v", ok, err)
 	}
 }
 

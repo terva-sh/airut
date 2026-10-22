@@ -323,7 +323,7 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		s.conn = c
 		s.mu.Unlock()
 	})
-	if o.AcceptInvite == nil {
+	if o.AcceptInvite == nil && o.CheckInvite == nil {
 		o.AcceptInvite = func(matrix.Invite) bool { return true }
 	}
 	a := matrix.New(&config.Matrix{
@@ -1180,6 +1180,38 @@ func TestE2EStaleCommandsAndInvites(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	if m, _ := alice.StateStore.GetMember(ctx, resp.RoomID, botID); m != nil && m.Membership == event.MembershipJoin {
 		t.Error("the bot joined a room AcceptInvite refused")
+	}
+}
+
+// CheckInvite admits alice, and errors for carol while saying yes, which
+// must still refuse her invite.
+func TestE2ECheckInvite(t *testing.T) {
+	hs := homeserver(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	tg := tag()
+	botName, aliceName, carolName := "bot-"+tg, "alice-"+tg, "carol-"+tg
+	for _, n := range []string{botName, aliceName, carolName} {
+		register(t, ctx, hs, n)
+	}
+	botID := id.UserID("@" + botName + ":localhost")
+	alice := openHuman(t, ctx, hs, aliceName)
+	carol := openHuman(t, ctx, hs, carolName)
+	startBot(t, ctx, hs, botName, matrix.Options{CheckInvite: func(_ context.Context, inv matrix.Invite) (bool, error) {
+		if inv.Inviter == string(alice.UserID) {
+			return true, nil
+		}
+		return true, errors.New("the check could not finish")
+	}})
+
+	createRoom(t, ctx, alice, botID, false)
+	resp, err := carol.CreateRoom(ctx, &mautrix.ReqCreateRoom{Preset: "private_chat", Invite: []id.UserID{botID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	if m, _ := carol.StateStore.GetMember(ctx, resp.RoomID, botID); m != nil && m.Membership == event.MembershipJoin {
+		t.Error("the bot joined a room whose invite check failed")
 	}
 }
 

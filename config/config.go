@@ -231,6 +231,34 @@ type Matrix struct {
 	// With it the adapter signs its own device at start when the device
 	// is not signed yet, as after the state directory was re-created.
 	RecoveryKey Secret
+	// Siblings is the [matrix.siblings] table, or nil without one.
+	Siblings *Siblings
+}
+
+// MinFleetSecret is the fewest bytes a fleet secret may have. Every
+// member of the coordination room sees each proof's MAC, so a secret
+// short enough to guess could be found from one by trying guesses
+// offline.
+const MinFleetSecret = 32
+
+// Siblings are the other airut bots of one owner, which cross-sign each
+// other's Matrix identities after proving, with a shared fleet secret,
+// that each is who it says. The matrix package documents the exchange.
+type Siblings struct {
+	// Users are the sibling bots' user ids. Only a bot on the list is
+	// signed; the secret alone vouches for nobody else. The bot's own id
+	// may be on it, so every sibling can share one list, and is skipped.
+	Users []string
+	// Room is the coordination room's id, where proofs are posted.
+	Room string
+	// Secret is the fleet secret, the same on every sibling, of
+	// MinFleetSecret bytes or more.
+	Secret Secret
+	// PreviousSecret, if set, is the secret being replaced. Proofs made
+	// with it are still accepted, so bots on the old and the new secret
+	// agree while the credential is replaced on each. It never makes a
+	// proof.
+	PreviousSecret Secret
 }
 
 // Defaults for keys a file may leave out.
@@ -367,12 +395,20 @@ type fileMetrics struct {
 }
 
 type fileMatrix struct {
-	Homeserver  string `toml:"homeserver"`
-	UserID      string `toml:"user_id"`
-	Password    any    `toml:"password"`
-	StateDir    string `toml:"state_dir"`
-	DeviceName  string `toml:"device_name"`
-	RecoveryKey any    `toml:"recovery_key"`
+	Homeserver  string        `toml:"homeserver"`
+	UserID      string        `toml:"user_id"`
+	Password    any           `toml:"password"`
+	StateDir    string        `toml:"state_dir"`
+	DeviceName  string        `toml:"device_name"`
+	RecoveryKey any           `toml:"recovery_key"`
+	Siblings    *fileSiblings `toml:"siblings"`
+}
+
+type fileSiblings struct {
+	Users          []string `toml:"users"`
+	Room           string   `toml:"room"`
+	Secret         any      `toml:"secret"`
+	PreviousSecret any      `toml:"previous_secret"`
 }
 
 // Load reads and checks the config file at path, and reads the secrets
@@ -750,12 +786,60 @@ func buildMatrix(p *problems, f *fileMatrix, src *secretSource) *Matrix {
 	if f.RecoveryKey != nil {
 		m.RecoveryKey = resolveSecret(p, "matrix.recovery_key", f.RecoveryKey, src)
 	}
+	if f.Siblings != nil {
+		m.Siblings = buildSiblings(p, f.Siblings, src)
+	}
 	if m.StateDir == "" {
 		p.add("matrix.state_dir", "required: the directory that keeps the Matrix session and crypto store")
 	} else if !filepath.IsAbs(m.StateDir) {
 		m.StateDir = filepath.Join(src.dir, m.StateDir)
 	}
 	return m
+}
+
+// buildSiblings checks [matrix.siblings]. Problems name the key and an
+// index, never an id or a secret.
+func buildSiblings(p *problems, f *fileSiblings, src *secretSource) *Siblings {
+	const key = "matrix.siblings"
+	s := &Siblings{Users: f.Users, Room: f.Room}
+	if len(f.Users) == 0 {
+		p.add(key+".users", "required: the sibling bots' Matrix user ids")
+	}
+	seen := map[string]bool{}
+	for i, u := range f.Users {
+		switch {
+		case !validMXID(u):
+			p.addf(fmt.Sprintf("%s.users.%d", key, i), "not a Matrix user id, such as @name:example.org")
+		case seen[u]:
+			p.addf(fmt.Sprintf("%s.users.%d", key, i), "listed twice")
+		}
+		seen[u] = true
+	}
+	if !validRoomID(f.Room) {
+		p.add(key+".room", "required: the coordination room's id, such as !abc:example.org, never an alias")
+	}
+	if f.Secret == nil {
+		p.add(key+".secret", "required: the fleet secret, as a secret reference")
+	} else {
+		s.Secret = fleetSecret(p, key+".secret", f.Secret, src)
+	}
+	if f.PreviousSecret != nil {
+		s.PreviousSecret = fleetSecret(p, key+".previous_secret", f.PreviousSecret, src)
+	}
+	return s
+}
+
+// fleetSecret reads a fleet secret and refuses one shorter than
+// MinFleetSecret bytes. The problem gives the bound, never the length
+// read.
+func fleetSecret(p *problems, key string, raw any, src *secretSource) Secret {
+	n := len(p.list)
+	s := resolveSecret(p, key, raw, src)
+	if len(p.list) == n && len(s.Value()) < MinFleetSecret {
+		p.addf(key, "a fleet secret must be at least %d bytes, made at random", MinFleetSecret)
+		return Secret{}
+	}
+	return s
 }
 
 // checkURL requires an absolute http or https URL. It never quotes the

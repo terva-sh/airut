@@ -32,8 +32,9 @@ func unitLines(t *testing.T, key string) (set, commented []string) {
 
 // The reference unit loads, by id, exactly the credentials the example
 // configuration names. The recovery key is commented out in both, so it
-// stays off the host, and a configuration copied from the example never
-// names a credential the unit does not load.
+// stays off the host, and so are the optional fleet secrets, so a
+// configuration copied from the example never names a credential the
+// unit does not load.
 func TestUnitCredentialsMatchTheExample(t *testing.T) {
 	src, err := os.ReadFile("../../docs/config.example.toml")
 	if err != nil {
@@ -65,8 +66,9 @@ func TestUnitCredentialsMatchTheExample(t *testing.T) {
 	if loaded := ids(set); !slices.Equal(loaded, named) {
 		t.Errorf("the unit loads %v, but the example configuration names %v", loaded, named)
 	}
-	if off := ids(commented); !slices.Equal(off, []string{"matrix-recovery-key"}) || !slices.Equal(namedOff, off) {
-		t.Errorf("commented out: the unit's %v and the example's %v, want only the recovery key in both", off, namedOff)
+	want := []string{"matrix-fleet-secret", "matrix-fleet-secret-previous", "matrix-recovery-key"}
+	if off := ids(commented); !slices.Equal(off, want) || !slices.Equal(namedOff, off) {
+		t.Errorf("commented out: the unit's %v and the example's %v, want %v in both", off, namedOff, want)
 	}
 }
 

@@ -44,6 +44,10 @@ LoadCredentialEncrypted=proxy-api-key:/etc/credstore.encrypted/airut-example-pro
 # host. Add it only for a start that has to re-sign the device, as after
 # the state directory was re-created, and remove it afterwards.
 #LoadCredentialEncrypted=matrix-recovery-key:/etc/credstore.encrypted/airut-example-matrix-recovery-key
+# The fleet secret, for a bot with [matrix.siblings], and the one it
+# replaces while the secret is rotated.
+#LoadCredentialEncrypted=matrix-fleet-secret:/etc/credstore.encrypted/airut-example-matrix-fleet-secret
+#LoadCredentialEncrypted=matrix-fleet-secret-previous:/etc/credstore.encrypted/airut-example-matrix-fleet-secret-previous
 
 # Hardening. A static Go binary needs none of what these take away.
 NoNewPrivileges=true

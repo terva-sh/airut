@@ -100,6 +100,10 @@ type Capabilities struct {
 	CachePrompt bool
 	// Temperature is nil to leave it to the caller.
 	Temperature *float64
+	// ImageInput says whether the model accepts images: nil leaves it to
+	// the caller's default, which for an agent turn is that it does.
+	// False makes an agent turn send a note in place of each image.
+	ImageInput *bool
 }
 
 // Model is one model a provider lists.
@@ -167,6 +171,7 @@ type fileCaps struct {
 	Slots         *int     `toml:"slots"`
 	CachePrompt   *bool    `toml:"cache_prompt"`
 	Temperature   *float64 `toml:"temperature"`
+	ImageInput    *bool    `toml:"image_input"`
 }
 
 type fileProvider struct {
@@ -250,6 +255,10 @@ func (f fileCaps) apply(c *Capabilities) {
 	if f.Temperature != nil {
 		t := *f.Temperature
 		c.Temperature = &t
+	}
+	if f.ImageInput != nil {
+		v := *f.ImageInput
+		c.ImageInput = &v
 	}
 }
 

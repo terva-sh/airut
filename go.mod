@@ -7,11 +7,12 @@ require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/rs/zerolog v1.35.1
+	golang.org/x/image v0.44.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.46.0
 	maunium.net/go/mautrix v0.31.0
 	modernc.org/sqlite v1.60.1
-	terva.sh/rihma v0.1.9
+	terva.sh/rihma v0.1.10
 	terva.sh/seal v0.1.0
 	terva.sh/terva v0.141.5
 )
@@ -36,7 +37,6 @@ require (
 	go.mau.fi/util v0.10.1 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	modernc.org/libc v1.77.1 // indirect

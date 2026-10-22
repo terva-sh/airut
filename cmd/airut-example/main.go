@@ -9,10 +9,10 @@
 // by settings, and the owners [bot] owners names may change it with set,
 // and the bot's name, description, and picture with profile. status
 // tells anyone whether the bot has an owner. ask puts a question to the
-// agent,
-// which may roll dice to answer it; it needs the file's [agent] table,
-// and only the users and roles its access tables name may use it. On
-// Matrix the bot joins a room only when one of the users named in
+// agent, which may roll dice to answer it; it needs the file's [agent]
+// table, and only the users and roles its access tables name may use it.
+// On Matrix the bot joins a room only when one of its owners, listed in
+// [bot] owners or claimed, or one of the users named in
 // [agent.access.matrix] invites it. docs/config.example.toml shows every
 // key. Secrets are references to where the deployment put them, never
 // values.
@@ -176,35 +176,46 @@ func run(path string, log *slog.Logger) error {
 		defer ag.Close()
 		bc.Agent, bc.Gate, bc.MemoryWrites = ag, agent.Gate(cfg), agent.MemoryWrites(cfg)
 	}
-	as := adapters(cfg, log)
+	// The bot is built before the adapters, so the Matrix invite check
+	// can ask it who owns it.
+	b := newBot(bc, nil)
+	as := adapters(cfg, log, b)
 	if len(as) == 0 {
 		return fmt.Errorf("%s has neither a [discord] nor a [matrix] table", path)
 	}
-	return newBot(bc, nil).Run(ctx, as...)
+	return b.Run(ctx, as...)
 }
 
-// adapters returns one adapter for each platform the file configures.
-func adapters(cfg *config.Config, log *slog.Logger) []airut.Adapter {
+// adapters returns one adapter for each platform the file configures,
+// for b to run.
+func adapters(cfg *config.Config, log *slog.Logger, b *airut.Bot) []airut.Adapter {
 	var as []airut.Adapter
 	if cfg.Discord != nil {
 		as = append(as, discord.New(cfg.Discord, discord.Options{Logger: log, ReplyDepth: cfg.Bot.ReplyDepth}))
 	}
 	if cfg.Matrix != nil {
-		as = append(as, matrix.New(cfg.Matrix, matrix.Options{Logger: log, AcceptInvite: inviters(cfg), ReplyDepth: cfg.Bot.ReplyDepth}))
+		as = append(as, matrix.New(cfg.Matrix, matrix.Options{Logger: log, CheckInvite: inviters(cfg, b), ReplyDepth: cfg.Bot.ReplyDepth}))
 	}
 	return as
 }
 
-// inviters lets the bot join a Matrix room when the invite comes from a
-// user the file's [agent.access.matrix] names, and from nobody else.
-func inviters(cfg *config.Config) func(matrix.Invite) bool {
+// inviters lets the bot join a Matrix room when the invite comes from
+// one of b's owners, listed in [bot] owners or claimed with claim, or
+// from a user the file's [agent.access.matrix] names, and from nobody
+// else. An owner check that fails refuses the invite.
+func inviters(cfg *config.Config, b *airut.Bot) func(context.Context, matrix.Invite) (bool, error) {
 	allowed := map[string]bool{}
 	if cfg.Agent != nil {
 		for _, u := range cfg.Agent.Access[string(airut.Matrix)].Users {
 			allowed[u] = true
 		}
 	}
-	return func(inv matrix.Invite) bool { return allowed[inv.Inviter] }
+	return func(ctx context.Context, inv matrix.Invite) (bool, error) {
+		if allowed[inv.Inviter] {
+			return true, nil
+		}
+		return b.IsOwner(ctx, airut.User{Platform: airut.Matrix, ID: inv.Inviter})
+	}
 }
 
 // botConfig is the core's configuration from the file's. The owners

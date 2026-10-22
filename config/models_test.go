@@ -2,6 +2,7 @@ package config
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,8 +47,49 @@ func TestEarlierExampleLoadsUnchanged(t *testing.T) {
 
 func chainEntryEqual(a, b ChainEntry) bool {
 	ta, tb := a.Temperature, b.Temperature
-	a.Temperature, b.Temperature = nil, nil
-	return a == b && (ta == nil) == (tb == nil) && (ta == nil || *ta == *tb)
+	ia, ib := a.ImageInput, b.ImageInput
+	a.Temperature, b.Temperature, a.ImageInput, b.ImageInput = nil, nil, nil, nil
+	return a == b && (ta == nil) == (tb == nil) && (ta == nil || *ta == *tb) &&
+		(ia == nil) == (ib == nil) && (ia == nil || *ia == *ib)
+}
+
+// TestImageInput reads image_input on a model, inherits it in a variant,
+// and lets a use site override it; unset stays nil, the caller's default.
+func TestImageInput(t *testing.T) {
+	t.Setenv("AIRUT_TEST_TOKEN", sentinel)
+	c, err := load(t, withAgent(`
+[providers.p]
+base_url = "http://h.example/v1"
+models = [
+  { id = "text", image_input = false },
+  { id = "text-variant", base = "text" },
+  { id = "vision", image_input = true },
+  { id = "unknown" },
+]
+`, `models = ["p/text", { model = "p/vision", image_input = false }, "p/unknown"]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.Provider("p")
+	str := func(b *bool) string {
+		if b == nil {
+			return "unset"
+		}
+		return strconv.FormatBool(*b)
+	}
+	for id, want := range map[string]string{"text": "false", "text-variant": "false", "vision": "true", "unknown": "unset"} {
+		m, _ := p.Model(id)
+		if got := str(m.ImageInput); got != want {
+			t.Errorf("%s: image_input %s, want %s", id, got, want)
+		}
+	}
+	var got []string
+	for _, e := range c.Agent.Models {
+		got = append(got, str(e.ImageInput))
+	}
+	if want := []string{"false", "false", "unset"}; !slices.Equal(got, want) {
+		t.Errorf("chain image_input = %v, want %v", got, want)
+	}
 }
 
 // withAgent is a file with a platform, the providers in providers, and

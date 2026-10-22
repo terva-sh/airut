@@ -154,14 +154,15 @@ func CheckSealKey(key string) error {
 		return errors.New("config: secrets.key opens sealed values and cannot itself be sealed")
 	case top == "providers" && len(parts) == 3 && providerIDRE.MatchString(keyAt(1)) && keyAt(2) == "api_key",
 		top == "discord" && len(parts) == 2 && keyAt(1) == "token",
-		top == "matrix" && len(parts) == 2 && (keyAt(1) == "password" || keyAt(1) == "recovery_key"):
+		top == "matrix" && len(parts) == 2 && (keyAt(1) == "password" || keyAt(1) == "recovery_key"),
+		top == "matrix" && len(parts) == 3 && keyAt(1) == "siblings" && (keyAt(2) == "secret" || keyAt(2) == "previous_secret"):
 		return nil
 	case top == "app" && len(parts) >= 2 && !parts[1].isIndex:
 		return nil
 	case hasIndex && top != "app":
 		return errors.New("config: an index appears only in a key path under app")
 	}
-	return errors.New("config: no secret is read from that key path; seal for providers.ID.api_key, discord.token, matrix.password, matrix.recovery_key, or a key under app")
+	return errors.New("config: no secret is read from that key path; seal for providers.ID.api_key, discord.token, matrix.password, matrix.recovery_key, matrix.siblings.secret, matrix.siblings.previous_secret, or a key under app")
 }
 
 // readSealKey reads [secrets] key, the age identity that opens sealed

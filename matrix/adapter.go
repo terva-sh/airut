@@ -42,9 +42,28 @@ const DefaultMaxCommandAge = 10 * time.Minute
 // not hold.
 type Options struct {
 	// AcceptInvite decides whether the bot joins a room it is invited to.
-	// When it is nil, the bot joins none, so nobody can pull it into a
-	// room it was not meant for.
+	// When it and CheckInvite are both nil, the bot joins none, so nobody
+	// can pull it into a room it was not meant for.
 	AcceptInvite func(Invite) bool
+	// CheckInvite decides as AcceptInvite does, for a decision that needs
+	// a context or can fail, such as asking airut.Bot.IsOwner whether the
+	// inviter owns the bot. An error refuses the invite, so a check that
+	// could not finish never lets the bot in. ctx ends when Run does. It
+	// runs off the sync loop, one call for each invite, and must be safe
+	// for concurrent use.
+	//
+	// Set one of AcceptInvite and CheckInvite: Run refuses to start with
+	// both, rather than ignore either.
+	//
+	// The Bot is usually built before its adapters, so CheckInvite can
+	// capture it:
+	//
+	//	b := airut.New(cfg)
+	//	m := matrix.New(&mcfg, matrix.Options{CheckInvite: func(ctx context.Context, inv matrix.Invite) (bool, error) {
+	//		return b.IsOwner(ctx, airut.User{Platform: airut.Matrix, ID: inv.Inviter})
+	//	}})
+	//	err := b.Run(ctx, m)
+	CheckInvite func(ctx context.Context, inv Invite) (bool, error)
 	// MaxCommandAge is how old a command may be and still be answered.
 	// Zero means DefaultMaxCommandAge.
 	MaxCommandAge time.Duration
@@ -56,7 +75,8 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// Invite is an invitation to a room, for Options.AcceptInvite.
+// Invite is an invitation to a room, for Options.AcceptInvite and
+// Options.CheckInvite.
 type Invite struct {
 	Room, Inviter string
 	// Direct reports that the invite says it opens a direct chat, as a
@@ -66,6 +86,10 @@ type Invite struct {
 	// it joins in its m.direct, as clients do.
 	Direct bool
 }
+
+// errBothInviteChecks is Run's error for Options that set both invite
+// callbacks.
+var errBothInviteChecks = errors.New("matrix: Options sets both AcceptInvite and CheckInvite; set one")
 
 // Adapter is an airut.Adapter for Matrix.
 type Adapter struct {
@@ -96,12 +120,21 @@ func (a *Adapter) Platform() airut.Platform { return airut.Matrix }
 // crypto store, which cannot be rebuilt: lose it and the bot can no
 // longer read encrypted history it could read before.
 func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
+	if a.opts.AcceptInvite != nil && a.opts.CheckInvite != nil {
+		return errBothInviteChecks
+	}
 	log := a.opts.Logger
 	if log == nil {
 		log = h.Logger()
 	}
 	log = log.With("platform", string(airut.Matrix))
-	c, err := open(ctx, &a.cfg, log)
+	var sib *siblings
+	var onIdentity func(rihma.IdentityChange)
+	if a.cfg.Siblings != nil {
+		sib = newSiblings(a.cfg.Siblings, id.UserID(a.cfg.UserID), a.cfg.StateDir, log)
+		onIdentity = sib.identityChanged
+	}
+	c, err := open(ctx, &a.cfg, log, onIdentity)
 	if err != nil {
 		return err
 	}
@@ -115,6 +148,10 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 		a.mu.Unlock()
 	}()
 	s := newSession(ctx, c, h, log, a.opts)
+	if sib != nil {
+		sib.ids, sib.rm = c, coordRoom{s: s, room: sib.room}
+		s.sib = sib
+	}
 	if dn, err := c.GetOwnDisplayName(ctx); err == nil {
 		s.me.display = dn.DisplayName
 	}
@@ -130,7 +167,7 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 
 // open opens the account cfg describes, from its state directory, or by
 // logging in when none is stored yet.
-func open(ctx context.Context, cfg *config.Matrix, log *slog.Logger) (*rihma.Client, error) {
+func open(ctx context.Context, cfg *config.Matrix, log *slog.Logger, onIdentity func(rihma.IdentityChange)) (*rihma.Client, error) {
 	user := id.UserID(cfg.UserID)
 	local, _, err := user.Parse()
 	if err != nil || cfg.Homeserver == "" || cfg.StateDir == "" {
@@ -145,6 +182,8 @@ func open(ctx context.Context, cfg *config.Matrix, log *slog.Logger) (*rihma.Cli
 		Sessions:   rihma.FileSessionStore{Path: filepath.Join(cfg.StateDir, "session.json")},
 		DeviceName: cfg.DeviceName,
 		Logger:     zerologTo(log),
+
+		OnIdentityChange: onIdentity,
 	}
 	if !cfg.Password.IsZero() {
 		ro.Login = &mautrix.ReqLogin{
@@ -188,6 +227,8 @@ type session struct {
 	replyDepth int
 	// bundles are the bundles waiting for replies.
 	bundles bundles
+	// sib runs sibling cross-signing, or is nil without [matrix.siblings].
+	sib *siblings
 
 	mu      sync.Mutex
 	stopped bool
@@ -281,6 +322,9 @@ func (s *session) onSync(_ context.Context, _ *mautrix.RespSync, since string) b
 	s.ready = s.ready || announce
 	s.mu.Unlock()
 	if announce {
+		if s.sib != nil {
+			s.spawn(func() { s.sib.start(s.ctx) })
+		}
 		s.h.Ready(s.ctx, s)
 	}
 	return true
@@ -288,6 +332,13 @@ func (s *session) onSync(_ context.Context, _ *mautrix.RespSync, since string) b
 
 func (s *session) onMessage(ctx context.Context, evt *event.Event) {
 	if skip(evt, s.c.UserID) {
+		return
+	}
+	if s.sib != nil && evt.RoomID == s.sib.room {
+		// The coordination room carries proofs and nothing else: no
+		// message there is a command or reaches the bot's handlers.
+		raw := evt.Content.VeryRaw
+		s.spawn(func() { s.sib.handle(s.ctx, evt.Sender, raw) })
 		return
 	}
 	in, ok := s.parse(evt)
@@ -343,16 +394,27 @@ func (s *session) onReaction(ctx context.Context, evt *event.Event) {
 }
 
 func (s *session) onMember(_ context.Context, evt *event.Event) {
-	if evt.GetStateKey() != string(s.c.UserID) || evt.Content.AsMember().Membership != event.MembershipInvite {
+	if evt.GetStateKey() != string(s.c.UserID) {
+		return
+	}
+	if s.sib != nil && evt.RoomID == s.sib.room && evt.Content.AsMember().Membership == event.MembershipJoin {
+		s.spawn(func() { s.sib.joined(s.ctx) })
+		return
+	}
+	if evt.Content.AsMember().Membership != event.MembershipInvite {
 		return
 	}
 	room, inviter := evt.RoomID, evt.Sender
 	inv := Invite{Room: string(room), Inviter: string(inviter), Direct: evt.Content.AsMember().IsDirect}
-	if s.opts.AcceptInvite == nil || !s.opts.AcceptInvite(inv) {
-		s.log.Info("ignored an invite", "room", string(room), "direct", inv.Direct)
+	// AcceptInvite decides on the sync loop, as it always has; CheckInvite
+	// may wait on I/O, so it decides off it.
+	if s.opts.CheckInvite == nil && !s.admit(s.ctx, inv) {
 		return
 	}
 	s.spawn(func() {
+		if s.opts.CheckInvite != nil && !s.admit(s.ctx, inv) {
+			return
+		}
 		if _, err := s.c.JoinRoomByID(s.ctx, room); err != nil {
 			s.log.Warn("could not join a room it was invited to", "room", string(room), "error_kind", errKind(err))
 			return
@@ -365,6 +427,33 @@ func (s *session) onMember(_ context.Context, evt *event.Event) {
 			}
 		}
 	})
+}
+
+// admit reports whether the bot joins the room inv invites it to, by
+// Options.CheckInvite or Options.AcceptInvite, and logs the decision by
+// the room's and inviter's ids. With neither set it refuses, and an error
+// from CheckInvite refuses too.
+func (s *session) admit(ctx context.Context, inv Invite) bool {
+	log := s.log.With("room", inv.Room, "inviter", inv.Inviter, "direct", inv.Direct)
+	ok := false
+	switch {
+	case s.opts.CheckInvite != nil:
+		var err error
+		if ok, err = s.opts.CheckInvite(ctx, inv); err != nil {
+			if ctx.Err() == nil {
+				log.Warn("refused an invite its check could not decide", "error_kind", errKind(err))
+			}
+			return false
+		}
+	case s.opts.AcceptInvite != nil:
+		ok = s.opts.AcceptInvite(inv)
+	}
+	if !ok {
+		log.Info("ignored an invite")
+		return false
+	}
+	log.Info("accepted an invite")
+	return true
 }
 
 // skip reports events the bot never acts on: its own, and those from

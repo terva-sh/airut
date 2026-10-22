@@ -66,8 +66,8 @@ func TestExample(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret := NewSecret(sentinel)
-	zero := 0.0
-	judgeCaps := Capabilities{ContextWindow: 8192, MaxOutput: 8192, Output: "json_schema", Slots: 2, CachePrompt: true, Temperature: &zero}
+	zero, blind := 0.0, false
+	judgeCaps := Capabilities{ContextWindow: 8192, MaxOutput: 8192, Output: "json_schema", Slots: 2, CachePrompt: true, Temperature: &zero, ImageInput: &blind}
 	judgeCapsAt20s := judgeCaps
 	judgeCapsAt20s.Timeout = 20 * time.Second
 	want := &Config{
@@ -76,14 +76,14 @@ func TestExample(t *testing.T) {
 		}},
 		Providers: []Provider{
 			{ID: "local", BaseURL: "http://127.0.0.1:8080/v1", Kind: KindLlamaSwap, Load: LoadWhenIdle, Models: []Model{
-				{ID: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}},
+				{ID: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true, ImageInput: &blind}},
 				{ID: "qwen3-judge", Served: "Qwen3-32B-Q4_K_M", Base: "qwen3-32b", Capabilities: judgeCaps},
 			}},
 			{ID: "proxy", Kind: KindOpenAI, BaseURL: "https://llm.example.net/v1", APIKey: secret, Models: []Model{
 				{ID: "gpt-5.5", Served: "gpt-5.5", Capabilities: Capabilities{ContextWindow: 128000, Output: "response_format"}}}},
 		},
 		Agent: &Agent{
-			Models:  Chain{{Provider: "local", Model: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}}},
+			Models:  Chain{{Provider: "local", Model: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true, ImageInput: &blind}}},
 			Model:   ModelRef{Provider: "local", Model: "qwen3-32b"},
 			Budget:  Budget{MaxTurns: 8, MaxTokens: 200000},
 			Rate:    Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute, Owners: &GroupRate{PerUser: 30, PerChannel: 20}},

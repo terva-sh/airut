@@ -149,6 +149,32 @@ commented `recovery_key`, lets the bot sign itself at start instead.
 Uncomment both only if you accept the key living on the host, and comment
 both out again afterwards.
 
+## Cross-sign sibling bots
+
+Bots of one owner can sign each other's Matrix identities, so each trusts
+the others' devices. Cross-sign each bot's device first, as above. Then:
+
+1. Make the coordination room in your client: invite-only, encrypted, with
+   you and every sibling invited. The bot joins only if its invite rules
+   accept your invite.
+2. Make the fleet secret once, and encrypt it on each sibling's host:
+
+   ```sh
+   openssl rand -base64 48 \
+     | systemd-creds encrypt --name=matrix-fleet-secret - /etc/credstore.encrypted/airut-example-matrix-fleet-secret
+   ```
+
+   Carry it to the other hosts the way you carry other secrets, never in
+   chat or a ticket.
+3. Uncomment the `[matrix.siblings]` table in each bot's configuration,
+   with `secret`, and the unit's `matrix-fleet-secret` line. Restart.
+
+Each bot posts a proof in the room at start and signs the siblings that
+answer. To rotate the secret, encrypt the old one as
+`matrix-fleet-secret-previous` beside the new one, uncomment
+`previous_secret` and its unit line, and restart each bot in turn. Remove
+both once every sibling has the new secret.
+
 ## Back it up
 
 Back up `/var/lib/airut-example`. Its Matrix crypto store cannot be
