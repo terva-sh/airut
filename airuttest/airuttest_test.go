@@ -2,6 +2,7 @@ package airuttest_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -322,5 +323,110 @@ func TestDirectMessages(t *testing.T) {
 	a.SetDirect("dm-1", airut.User{})
 	if _, ok, _ := conn.Direct(context.Background(), ch); ok {
 		t.Error("Direct still reports a channel SetDirect cleared")
+	}
+}
+
+// viewTool is an airut.ImageTool that returns one picture.
+type viewTool struct{}
+
+func (viewTool) Name() string                                     { return "view" }
+func (viewTool) Description() string                              { return "View a picture" }
+func (viewTool) Schema() json.RawMessage                          { return json.RawMessage(`{"type":"object"}`) }
+func (viewTool) Call(*airut.Ctx, json.RawMessage) (string, error) { return "text only", nil }
+func (viewTool) CallImages(*airut.Ctx, json.RawMessage) (airut.ToolOutput, error) {
+	return airut.ToolOutput{Text: "picture 1", Images: []airut.Image{{Data: []byte("png bytes"), Type: "image/png"}}}, nil
+}
+
+// textTool is a plain airut.Tool.
+type textTool struct{}
+
+func (textTool) Name() string                                     { return "say" }
+func (textTool) Description() string                              { return "Say something" }
+func (textTool) Schema() json.RawMessage                          { return json.RawMessage(`{"type":"object"}`) }
+func (textTool) Call(*airut.Ctx, json.RawMessage) (string, error) { return "said", nil }
+
+func TestAgentRecordsTheImagesAnImageToolReturns(t *testing.T) {
+	agent := &airuttest.Agent{Steps: []airuttest.Step{{Call: "say", Args: `{}`}, {Call: "view", Args: `{}`}}}
+	// The gate admits the default caller, user-1, to agent turns.
+	gate := airut.Gate{Access: map[airut.Platform]airut.Access{airuttest.Platform: {Users: []string{"user-1"}}}}
+	b := airut.New(airut.Config{Prefix: "!", Gate: gate, Agent: agent})
+	prompt := airut.Image{Data: []byte("prompt bytes")}
+	b.Command("ask", "Ask the agent", func(c *airut.Ctx) error {
+		return c.Agent(airut.Turn{Images: []airut.Image{prompt}, Tools: []airut.Tool{textTool{}, viewTool{}}}).StreamTo(c)
+	})
+	a := airuttest.Start(t, b)
+	a.Text("!ask")
+
+	if got := agent.Results(); len(got) != 2 || got[0] != "said" || got[1] != "picture 1" {
+		t.Fatalf("Results() = %q, want the plain tool's text and CallImages' text", got)
+	}
+	imgs := agent.Images()
+	if len(imgs) != 2 || imgs[0] != nil || len(imgs[1]) != 1 {
+		t.Fatalf("Images() = %+v, want none for the plain tool and one for the image tool", imgs)
+	}
+	if im := imgs[1][0]; string(im.Data) != "png bytes" || im.Type != "image/png" {
+		t.Errorf("the image tool's image was recorded as %q, %q", im.Data, im.Type)
+	}
+	imgs[1][0].Data[0] = 'X'
+	if again := agent.Images(); string(again[1][0].Data) != "png bytes" {
+		t.Error("changing what Images returned changed the record")
+	}
+	if turns := agent.Turns(); len(turns) != 1 || len(turns[0].Images) != 1 || string(turns[0].Images[0].Data) != "prompt bytes" {
+		t.Errorf("Turns() does not show the prompt's image: %+v", turns)
+	}
+}
+
+func TestConnOpenDirect(t *testing.T) {
+	b := airut.New(airut.Config{})
+	// tell opens a direct channel with the caller and sends them a line
+	// there, as a bot tells someone later that their feedback closed.
+	b.Command("tell", "Tell someone privately", func(c *airut.Ctx) error {
+		conn, err := c.Conn()
+		if err != nil {
+			return err
+		}
+		ch, err := conn.OpenDirect(c.Context(), c.Caller())
+		if err != nil {
+			_, rerr := c.Reply("could not open: " + err.Error())
+			return rerr
+		}
+		_, err = conn.Send(c.Context(), ch, airut.Message{Text: "your feedback was closed"})
+		return err
+	})
+	a := airuttest.Start(t, b)
+	alice := airut.User{Platform: airuttest.Platform, ID: "alice"}
+	bob := airut.User{Platform: airuttest.Platform, ID: "bob"}
+	evs := a.Text("!tell", airuttest.As(alice))
+	if len(evs) != 1 || evs[0].Kind != "send" || evs[0].Channel != airuttest.DirectID("alice") || evs[0].Text != "your feedback was closed" {
+		t.Fatalf("tell alice = %+v", evs)
+	}
+
+	ctx := context.Background()
+	conn := a.Conn()
+	ch, err := conn.OpenDirect(ctx, alice)
+	if err != nil || ch != (airut.Channel{Platform: airuttest.Platform, ID: "dm-alice"}) {
+		t.Fatalf("OpenDirect(alice) again = %v, %v", ch, err)
+	}
+	if who, ok, err := conn.Direct(ctx, ch); !ok || err != nil || who != alice {
+		t.Errorf("Direct(the opened channel) = %v, %v, %v", who, ok, err)
+	}
+
+	refused := errors.New("refuses direct messages")
+	a.FailOpenDirect("bob", refused)
+	if evs := a.Text("!tell", airuttest.As(bob)); len(evs) != 1 || evs[0].Kind != "reply" || !strings.Contains(evs[0].Text, "refuses direct messages") {
+		t.Errorf("tell bob, who cannot be reached = %+v", evs)
+	}
+	if _, ok, _ := conn.Direct(ctx, airut.Channel{Platform: airuttest.Platform, ID: airuttest.DirectID("bob")}); ok {
+		t.Error("a failed OpenDirect made the channel direct")
+	}
+	a.FailOpenDirect("bob", nil)
+	if _, err := conn.OpenDirect(ctx, bob); err != nil {
+		t.Errorf("OpenDirect(bob) after the failure was undone: %v", err)
+	}
+
+	for _, u := range []airut.User{{Platform: "elsewhere", ID: "alice"}, {Platform: airuttest.Platform}} {
+		if _, err := conn.OpenDirect(ctx, u); err == nil {
+			t.Errorf("OpenDirect(%+v) succeeded", u)
+		}
 	}
 }

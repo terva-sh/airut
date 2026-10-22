@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -705,5 +706,46 @@ func TestTheTokenRunsOutBeforeTheFirstPart(t *testing.T) {
 	x.call("whisper", nil, nil)
 	if err := <-errs; errKind(err) != "discord_50007" {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestOpenDirect(t *testing.T) {
+	x := start(t, airut.New(airut.Config{}))
+	x.s.me = "bot"
+	var logs bytes.Buffer
+	x.s.log = slog.New(slog.NewTextHandler(&logs, nil))
+	ctx := context.Background()
+	x.f.on("POST", "/users/@me/channels", 200, `{"id": "dm1", "type": 1, "recipients": [{"id": "u1", "username": "ada"}]}`)
+	ch, err := x.s.OpenDirect(ctx, airut.User{Platform: airut.Discord, ID: "u1", Name: "Ada"})
+	if err != nil || ch != (airut.Channel{Platform: airut.Discord, ID: "dm1"}) {
+		t.Fatalf("OpenDirect = %v, %v", ch, err)
+	}
+	if r := x.f.waitFor(t, "POST", "/users/@me/channels"); !strings.Contains(r.Body, `"recipient_id":"u1"`) {
+		t.Errorf("the request opened a DM with %s", r.Body)
+	}
+	if got := logs.String(); !strings.Contains(got, "user=u1") || !strings.Contains(got, "channel=dm1") || strings.Contains(got, "Ada") {
+		t.Errorf("logged %q", got)
+	}
+
+	// Discord's refusal reaches the caller, and the log has its kind.
+	logs.Reset()
+	x.f.on("POST", "/users/@me/channels", 400, `{"message": "Cannot send messages to this user", "code": 50007}`)
+	if _, err := x.s.OpenDirect(ctx, airut.User{Platform: airut.Discord, ID: "u2"}); errKind(err) != "discord_50007" {
+		t.Errorf("OpenDirect refused by Discord = %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "user=u2") || !strings.Contains(got, "error_kind=discord_50007") || strings.Contains(got, "Cannot send") {
+		t.Errorf("logged %q", got)
+	}
+
+	// Another platform's user, no user, and the bot itself are refused
+	// before any request.
+	before := len(x.f.sent())
+	for _, u := range []airut.User{{Platform: airut.Matrix, ID: "u1"}, {Platform: airut.Discord}, {Platform: airut.Discord, ID: "bot"}} {
+		if _, err := x.s.OpenDirect(ctx, u); err == nil {
+			t.Errorf("OpenDirect(%+v) succeeded", u)
+		}
+	}
+	if n := len(x.f.sent()) - before; n != 0 {
+		t.Errorf("%d requests for refused users: %v", n, x.f.sent()[before:])
 	}
 }

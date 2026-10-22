@@ -349,7 +349,7 @@ func startBotIn(t *testing.T, ctx context.Context, hs, localpart string, o matri
 		s.stop()
 		logMu.Lock()
 		defer logMu.Unlock()
-		for _, leak := range []string{"pw-" + localpart, "just for you", "final words", "hello there", "Proceed?", "final post", "which post?"} {
+		for _, leak := range []string{"pw-" + localpart, "just for you", "final words", "hello there", "Proceed?", "final post", "which post?", "your feedback closed"} {
 			if strings.Contains(logs.String(), leak) {
 				t.Errorf("the bot's log holds %q:\n%s", leak, logs.String())
 			}
@@ -898,6 +898,114 @@ func TestE2EDirectRoom(t *testing.T) {
 	s.mu.Unlock()
 	if _, ok, err := conn.Direct(ctx, airut.Channel{Platform: airut.Matrix, ID: string(dm)}); err != nil || ok {
 		t.Errorf("Conn.Direct after a third person was invited = %v, %v", ok, err)
+	}
+}
+
+// readDirect reads the bot account's m.direct from a second device.
+func readDirect(t *testing.T, ctx context.Context, hs, localpart string) event.DirectChatsEventContent {
+	t.Helper()
+	cli, err := mautrix.NewClient(hs, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.Login(ctx, &mautrix.ReqLogin{
+		Type:             mautrix.AuthTypePassword,
+		Identifier:       mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: localpart},
+		Password:         "pw-" + localpart,
+		StoreCredentials: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Logout(ctx)
+	direct := event.DirectChatsEventContent{}
+	if err := cli.GetAccountData(ctx, event.AccountDataDirectChats.Type, &direct); err != nil && !errors.Is(err, mautrix.MNotFound) {
+		t.Fatal(err)
+	}
+	return direct
+}
+
+// A bot opens a direct room with someone who never wrote to it, and
+// reuses it only while it stays private to the two of them.
+func TestE2EOpenDirect(t *testing.T) {
+	hs := homeserver(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	tg := tag()
+	botName, aliceName, carolName := "bot-"+tg, "alice-"+tg, "carol-"+tg
+	for _, n := range []string{botName, aliceName, carolName} {
+		register(t, ctx, hs, n)
+	}
+	botID := id.UserID("@" + botName + ":localhost")
+	// Direct reads m.direct from the homeserver each time, so what it
+	// reports is what the account records.
+	t.Cleanup(matrix.SetDirectReload(0))
+	s := startBot(t, ctx, hs, botName, matrix.Options{})
+	alice := openHuman(t, ctx, hs, aliceName)
+	s.wait(t, ctx, "the Conn", func(s *seen) bool { return s.conn != nil })
+	conn := s.conn
+	aliceUser := airut.User{Platform: airut.Matrix, ID: string(alice.UserID)}
+
+	ch, err := conn.OpenDirect(ctx, aliceUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	room := id.RoomID(ch.ID)
+	if ch.Platform != airut.Matrix || room == "" {
+		t.Fatalf("OpenDirect = %+v", ch)
+	}
+	// Sent at once, before Alice has joined, and she still reads it.
+	if _, err := conn.Send(ctx, ch, airut.Message{Text: "your feedback closed"}); err != nil {
+		t.Fatal(err)
+	}
+	invite := alice.waitFor(t, ctx, "the invite to the direct room", func(evt *event.Event) bool {
+		return evt.Type == event.StateMember && evt.RoomID == room
+	})
+	if !invite.Content.AsMember().IsDirect {
+		t.Error("the invite to the opened room is not marked direct")
+	}
+	alice.waitFor(t, ctx, "the message in the direct room", func(evt *event.Event) bool {
+		return bodyIs("your feedback closed")(evt) && evt.RoomID == room
+	})
+	if enc, err := alice.StateStore.IsEncrypted(ctx, room); err != nil || !enc {
+		t.Errorf("the opened room is encrypted: %v, %v", enc, err)
+	}
+	if jr, err := alice.StateStore.GetJoinRules(ctx, room); err != nil || jr == nil || jr.JoinRule != event.JoinRuleInvite {
+		t.Errorf("the opened room's join rule is %+v, %v", jr, err)
+	}
+	if rooms := readDirect(t, ctx, hs, botName)[alice.UserID]; !slices.Contains(rooms, room) {
+		t.Errorf("m.direct lists %v for Alice, without the opened room", rooms)
+	}
+	if who, ok, err := conn.Direct(ctx, ch); err != nil || !ok || who.ID != aliceUser.ID {
+		t.Errorf("Conn.Direct(the opened room) = %v, %v, %v", who, ok, err)
+	}
+	if again, err := conn.OpenDirect(ctx, aliceUser); err != nil || again != ch {
+		t.Errorf("OpenDirect again = %v, %v, want %v", again, err, ch)
+	}
+
+	// Once a third person is invited, the room is not reused.
+	if _, err := alice.InviteUser(ctx, room, &mautrix.ReqInviteUser{UserID: id.UserID("@" + carolName + ":localhost")}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, ok, _ := conn.Direct(ctx, ch); !ok {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("the bot never saw the third person's invite")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	fresh, err := conn.OpenDirect(ctx, aliceUser)
+	if err != nil || fresh == ch {
+		t.Errorf("OpenDirect after a third person was invited = %v, %v", fresh, err)
+	}
+	if rooms := readDirect(t, ctx, hs, botName)[alice.UserID]; !slices.Contains(rooms, id.RoomID(fresh.ID)) {
+		t.Errorf("m.direct lists %v for Alice, without the new room", rooms)
+	}
+
+	if _, err := conn.OpenDirect(ctx, airut.User{Platform: airut.Matrix, ID: string(botID)}); err == nil {
+		t.Error("OpenDirect with the bot itself succeeded")
 	}
 }
 

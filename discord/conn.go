@@ -150,6 +150,30 @@ func (s *session) Direct(ctx context.Context, ch airut.Channel) (airut.User, boo
 	return user(c.Recipients[0], nil), true, nil
 }
 
+// OpenDirect returns the DM channel with u, which Discord creates on the
+// first request and returns again after. Discord lets a bot open one
+// only with a user who shares a server with it. A user whose privacy
+// settings refuse DMs makes the Send that follows fail, with Discord's
+// error 50007, even when opening succeeded.
+func (s *session) OpenDirect(ctx context.Context, u airut.User) (airut.Channel, error) {
+	if u.Platform != airut.Discord {
+		return airut.Channel{}, errors.New("discord: OpenDirect needs a Discord user")
+	}
+	if u.ID == "" {
+		return airut.Channel{}, errors.New("discord: OpenDirect needs a user id")
+	}
+	if u.ID == s.self() {
+		return airut.Channel{}, errors.New("discord: the bot cannot open a DM with itself")
+	}
+	ch, err := s.dg.UserChannelCreate(u.ID, discordgo.WithContext(ctx))
+	if err != nil {
+		s.log.Warn("could not open a DM", "user", u.ID, "error_kind", errKind(err))
+		return airut.Channel{}, err
+	}
+	s.log.Info("opened a DM", "user", u.ID, "channel", ch.ID)
+	return airut.Channel{Platform: airut.Discord, ID: ch.ID}, nil
+}
+
 // Member reports whether u is in ch: in its guild, for a guild channel,
 // or among its recipients, for a direct message. Membership of a guild
 // says nothing of whether u may read a channel in it.

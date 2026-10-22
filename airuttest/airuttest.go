@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -79,6 +80,8 @@ type Adapter struct {
 	// direct maps a channel id to the person Conn.Direct reports it as
 	// private to.
 	direct map[string]airut.User
+	// openErrs maps a user id to the error Conn.OpenDirect fails with.
+	openErrs map[string]error
 	// profile is the bot's profile, as SetProfile left it.
 	profile airut.Profile
 }
@@ -523,7 +526,10 @@ type Step struct {
 }
 
 // Agent is a scripted agent. It plays Steps in order, may call only the
-// tools its Turn names, and records each Turn and tool result.
+// tools its Turn names, and records each Turn and tool result. A tool
+// that is an airut.ImageTool is called with CallImages, as the agent
+// package calls it, and the images it returns are recorded beside its
+// text. The images a Turn carries with its prompt are in Turns.
 //
 // Under Turn.FinalOnly it holds text back, as the agent package does:
 // the text before each call is dropped, and the text after the last one
@@ -536,6 +542,7 @@ type Agent struct {
 	mu      sync.Mutex
 	turns   []airut.Turn
 	results []string
+	images  [][]airut.Image
 }
 
 // Run plays the script.
@@ -557,6 +564,7 @@ func (g *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		}
 		held.Reset()
 		var res string
+		var imgs []airut.Image
 		var tool airut.Tool
 		for _, tl := range t.Tools {
 			if tl.Name() == s.Call {
@@ -568,13 +576,20 @@ func (g *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		} else {
 			out.ToolCall(s.Call)
 			var err error
-			res, err = tool.Call(c, json.RawMessage(s.Args))
+			if it, ok := tool.(airut.ImageTool); ok {
+				var o airut.ToolOutput
+				o, err = it.CallImages(c, json.RawMessage(s.Args))
+				res, imgs = o.Text, o.Images
+			} else {
+				res, err = tool.Call(c, json.RawMessage(s.Args))
+			}
 			if err != nil {
 				res = strings.TrimSpace(res + "\nerror: " + err.Error())
 			}
 		}
 		g.mu.Lock()
 		g.results = append(g.results, res)
+		g.images = append(g.images, copyImages(imgs))
 		g.mu.Unlock()
 	}
 	if held.Len() > 0 {
@@ -595,6 +610,33 @@ func (g *Agent) Results() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]string(nil), g.results...)
+}
+
+// Images returns the images each tool call returned, in the order of
+// Results: Images()[i] is what the call whose text is Results()[i]
+// handed the model. A call to a tool that is not an airut.ImageTool, or
+// one that returned none, has no images.
+func (g *Agent) Images() [][]airut.Image {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([][]airut.Image, len(g.images))
+	for i, imgs := range g.images {
+		out[i] = copyImages(imgs)
+	}
+	return out
+}
+
+// copyImages copies imgs and their bytes, so a test cannot change what
+// was recorded.
+func copyImages(imgs []airut.Image) []airut.Image {
+	if len(imgs) == 0 {
+		return nil
+	}
+	out := make([]airut.Image, len(imgs))
+	for i, im := range imgs {
+		out[i] = airut.Image{Data: append([]byte(nil), im.Data...), Type: im.Type}
+	}
+	return out
 }
 
 var _ airut.Agent = (*Agent)(nil)
@@ -844,6 +886,50 @@ func (a *Adapter) SetDirect(channel string, u airut.User) {
 		return
 	}
 	a.direct[channel] = u
+}
+
+// DirectID is the id of the direct channel Conn.OpenDirect opens with
+// the user with this id: "dm-" and the user id.
+func DirectID(user string) string { return "dm-" + user }
+
+// OpenDirect returns the channel with id DirectID(u.ID) on the adapter's
+// platform, and makes Direct report it as direct to u, as SetDirect does.
+// It fails as FailOpenDirect set for the user, and refuses a user of
+// another platform or with no id, changing nothing. The fake gives the
+// bot no user of its own, so it has no self to refuse. What the bot sends
+// there is recorded as a "send" event with the channel's id. Opening is
+// not an event, since the platforms show nothing for it either.
+func (c conn) OpenDirect(_ context.Context, u airut.User) (airut.Channel, error) {
+	a := c.Adapter
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if u.Platform != a.platform {
+		return airut.Channel{}, fmt.Errorf("airuttest: OpenDirect needs a user of platform %s", a.platform)
+	}
+	if u.ID == "" {
+		return airut.Channel{}, errors.New("airuttest: OpenDirect needs a user id")
+	}
+	if err := a.openErrs[u.ID]; err != nil {
+		return airut.Channel{}, err
+	}
+	ch := airut.Channel{Platform: a.platform, ID: DirectID(u.ID)}
+	if a.direct == nil {
+		a.direct = map[string]airut.User{}
+	}
+	a.direct[ch.ID] = u
+	return ch, nil
+}
+
+// FailOpenDirect makes Conn.OpenDirect fail with err for the user with
+// this id, as a platform that will not open a channel with them does. A
+// nil err undoes it.
+func (a *Adapter) FailOpenDirect(user string, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.openErrs == nil {
+		a.openErrs = map[string]error{}
+	}
+	a.openErrs[user] = err
 }
 
 // Direct reports what SetDirect set for the channel.

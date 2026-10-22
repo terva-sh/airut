@@ -13,10 +13,10 @@ import (
 // outside any one invocation: posting to another channel, reading an
 // attachment, walking a channel's history, checking membership, adding
 // and retracting the bot's own reactions, checking whether a channel
-// is private to one person, and reading and changing the bot's own
-// profile. An
-// adapter announces its Conn through Host.Ready once it is connected.
-// Its methods must be safe for concurrent use.
+// is private to one person, opening a channel private to one person,
+// and reading and changing the bot's own profile. An adapter announces
+// its Conn through Host.Ready once it is connected. Its methods must be
+// safe for concurrent use.
 type Conn interface {
 	Platform() Platform
 	// Send posts m to ch. Message.ReplyTo makes it a reply.
@@ -53,6 +53,15 @@ type Conn interface {
 	// It checks the channel as it is now, so a bot can check again just
 	// before it sends something meant for that person alone.
 	Direct(ctx context.Context, ch Channel) (User, bool, error)
+	// OpenDirect returns the bot's direct channel with u, opening one
+	// when there is none, so a bot can reach someone who has not written
+	// to it. It is the channel a private reply to u goes to. It refuses a user of another platform, and the bot itself, before
+	// asking the platform. Opening a channel does not promise that a
+	// message gets through: on Discord the user must share a server with
+	// the bot, and one whose settings refuse direct messages makes the
+	// later Send fail. Nothing limits whom a bot opens a channel with or
+	// how often; whom it messages unprompted is the app's decision.
+	OpenDirect(ctx context.Context, u User) (Channel, error)
 	// Profile reads the bot's own profile as it is now.
 	Profile(ctx context.Context) (Profile, error)
 	// SetProfile changes the fields of the bot's own profile that p

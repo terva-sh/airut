@@ -235,6 +235,36 @@ func (s *session) Direct(ctx context.Context, ch airut.Channel) (airut.User, boo
 	return s.user(ctx, room, other), true, nil
 }
 
+// OpenDirect returns the direct room with u that a private reply would
+// use: one the account's m.direct names that is still encrypted,
+// joinable only by invitation, and holds nobody but the bot and u, or
+// else a new one. A new room is created encrypted and invite-only, with
+// u invited and is_direct set, and recorded in m.direct, so Direct
+// reports it at once. A message can be sent there before u joins; u
+// reads it on joining, since the room's keys are shared with invitees.
+func (s *session) OpenDirect(ctx context.Context, u airut.User) (airut.Channel, error) {
+	if u.Platform != airut.Matrix {
+		return airut.Channel{}, errors.New("matrix: OpenDirect needs a Matrix user")
+	}
+	who := id.UserID(u.ID)
+	if _, _, err := who.Parse(); err != nil {
+		return airut.Channel{}, errors.New("matrix: OpenDirect needs a Matrix user id")
+	}
+	if who == s.c.UserID {
+		return airut.Channel{}, errors.New("matrix: the bot cannot open a direct room with itself")
+	}
+	if err := s.c.Connect(ctx); err != nil {
+		return airut.Channel{}, err
+	}
+	room, err := s.direct(ctx, who)
+	if err != nil {
+		s.log.Warn("could not open a direct room", "user", u.ID, "error_kind", errKind(err))
+		return airut.Channel{}, err
+	}
+	s.log.Info("opened a direct room", "user", u.ID, "room", string(room))
+	return channel(room), nil
+}
+
 // Profile reads the bot's global display name and avatar. Matrix has no
 // description, so About is always empty.
 func (s *session) Profile(ctx context.Context) (airut.Profile, error) {

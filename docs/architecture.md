@@ -133,6 +133,18 @@ registers one for reactions, with the message they target. Adapters
 deliver both through `Host.Deliver`, never for the bot's own messages
 or reactions.
 
+`bot.OnReactionTo` registers a reaction handler for a list of emoji, the
+aliases it answers to, such as `❓` and `❔`. It runs among the
+`OnReaction` handlers in registration order and is skipped for any
+other emoji, while `OnReaction` handlers still see every reaction. The
+core passes every reaction's emoji through `airut.NormalizeEmoji` before
+any handler sees it, and the registered list too. That drops the
+variation selector U+FE0F, which some clients append and others leave
+off, and nothing else, so skin tones and joined sequences stay
+distinct. Doing it once in `Host.Deliver` rather than in each adapter
+means every adapter, `airuttest` included, delivers the same spelling.
+A Discord custom emoji arrives, and matches, as `name:id`.
+
 A handler gets an ordinary `Ctx`: its caller is the event's sender, and
 `Reply`, `React`, `SessionKey`, and `Agent` work as for a command, the
 gate included. Handlers run in registration order. One that fails is
@@ -168,7 +180,12 @@ person joins arrives without it. Everything said in a direct channel
 addresses the bot: a message there arrives with `Mentioned` set and its
 text as `Request`. `Conn.Direct` checks a channel as it is now, and
 names the person it is private to, so a bot can check again just before
-it sends something meant for that person alone.
+it sends something meant for that person alone. `Conn.OpenDirect`
+returns the bot's direct channel with a user, opening one when there
+is none, so a bot can reach someone who has not written to it, such as
+to tell a member their report was closed. It refuses a user of another
+platform and the bot itself. Nothing limits whom a bot opens a channel
+with or how often: whom it messages unprompted is the app's decision.
 
 ## The connection
 
@@ -188,6 +205,9 @@ announces a `Conn` through `Host.Ready` once it is connected:
 - `Fetch` reads one message of a channel by its ref, as it reads now,
   the bot's own included;
 - `Member` reports whether a user is joined to a channel;
+- `Direct` reports whether a channel is private to the bot and one
+  person, and `OpenDirect` returns the bot's direct channel with a
+  user, opening one when there is none;
 - `React` adds the bot's reaction to a message and returns a ref for
   the reaction, and `Unreact` retracts one. Together they let a bot swap
   a status reaction as work moves on. `Unreact` refuses anything that
@@ -378,6 +398,13 @@ encrypted history it could read before.
     through the relations API.
   - `Unreact` fetches the event and redacts it only when it is an
     `m.reaction` the bot sent. The redaction stays on record.
+  - `OpenDirect` returns the room a private reply would use: one the
+    account's `m.direct` names while it is encrypted, joinable only by
+    invitation, and holds nobody but the bot and the user, or else a
+    new room created that way, with the user invited and `is_direct`
+    set, and recorded in `m.direct`. A message sent before the user
+    joins is still theirs to read, because the room's keys are shared
+    with invitees.
   - `SetProfile` sets the global display name and avatar, which the
     homeserver carries into every room the bot is in. A picture is
     uploaded as plain media, because a profile is public. Matrix has no
@@ -454,6 +481,10 @@ it uses: guilds, messages, and reactions, in guilds and direct messages.
   - `Member` checks membership of the channel's guild, or a direct
     message's recipients. It says nothing of whether a member may read
     the channel.
+  - `OpenDirect` opens, or returns again, the DM with a user. Discord
+    allows it only for a user who shares a server with the bot, and a
+    user whose settings refuse DMs makes the `Send` that follows fail
+    with Discord's error 50007.
   - `React` returns the message id and the emoji as the reaction's ref,
     because Discord gives a reaction no id of its own. `Unreact` calls
     the endpoint that removes only the bot's own reaction, and refuses a
