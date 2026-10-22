@@ -8,9 +8,9 @@ import (
 )
 
 // Gate turns the agent guards in c into the core's Gate: the access lists
-// by platform, the rate limit, and the budget of a turn that sets none. A
-// file with no [agent] table gives the zero Gate, which refuses every
-// turn.
+// by platform, the rate limit with the owners' rate and whether a refused
+// turn waits, and the budget of a turn that sets none. A file with no
+// [agent] table gives the zero Gate, which refuses every turn.
 func Gate(c *config.Config) airut.Gate {
 	if c.Agent == nil {
 		return airut.Gate{}
@@ -21,7 +21,11 @@ func Gate(c *config.Config) airut.Gate {
 		PerUser:    a.Rate.PerUser,
 		PerChannel: a.Rate.PerChannel,
 		Window:     a.Rate.Window,
+		Wait:       a.Rate.Wait,
 		Budget:     airut.Budget{Turns: a.Budget.MaxTurns, Tokens: a.Budget.MaxTokens},
+	}
+	if o := a.Rate.Owners; o != nil {
+		g.Owners = &airut.GroupRate{PerUser: o.PerUser, PerChannel: o.PerChannel}
 	}
 	for p, acc := range a.Access {
 		g.Access[airut.Platform(p)] = airut.Access{

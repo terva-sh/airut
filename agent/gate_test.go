@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -62,6 +63,61 @@ path = "/var/lib/example/sessions.db"
 	}
 	// The gate it builds is one the core accepts.
 	airut.New(airut.Config{Gate: Gate(c)})
+}
+
+// TestGateOwners: [agent.rate.for.owners] becomes Gate.Owners, with a
+// field it leaves out holding the members' value.
+func TestGateOwners(t *testing.T) {
+	c := load(t, `
+[providers.local]
+base_url = "https://models.example.com/v1"
+models = [{ id = "m" }]
+
+[agent]
+model = "local/m"
+budget = { max_turns = 8, max_tokens = 200000 }
+
+[agent.rate]
+per_channel = 9
+
+[agent.rate.for.owners]
+per_user = 0
+
+[store]
+path = "/var/lib/example/sessions.db"
+`)
+	g := Gate(c)
+	if want := (&airut.GroupRate{PerUser: 0, PerChannel: 9}); !reflect.DeepEqual(g.Owners, want) {
+		t.Fatalf("Gate.Owners = %+v, want %+v", g.Owners, want)
+	}
+	airut.New(airut.Config{Gate: g})
+}
+
+// TestGateWait: [agent.rate] wait becomes Gate.Wait, and is off when
+// the file leaves it out.
+func TestGateWait(t *testing.T) {
+	const file = `
+[providers.local]
+base_url = "https://models.example.com/v1"
+models = [{ id = "m" }]
+
+[agent]
+model = "local/m"
+budget = { max_turns = 8, max_tokens = 200000 }
+
+[agent.rate]
+per_user = 3
+%s
+
+[store]
+path = "/var/lib/example/sessions.db"
+`
+	if g := Gate(load(t, fmt.Sprintf(file, "wait = true"))); !g.Wait {
+		t.Error("wait = true gave a Gate that does not wait")
+	}
+	if g := Gate(load(t, fmt.Sprintf(file, ""))); g.Wait {
+		t.Error("a file without wait gave a Gate that waits")
+	}
 }
 
 func TestGateWithoutAgent(t *testing.T) {
