@@ -1,17 +1,43 @@
 # An airut bot's configuration, showing every key config.Load reads.
 #
-# Secrets are never written here. A key that holds one takes a reference
-# to where the deployment put it, as exactly one of:
+# Secrets are never written here as plaintext. A key that holds one
+# takes exactly one of:
 #
 #   { env = "NAME" }         an environment variable
 #   { credential = "NAME" }  a systemd credential: $CREDENTIALS_DIRECTORY/NAME,
 #                            from LoadCredential= or SetCredentialEncrypted=
 #   { file = "PATH" }        a file; a relative path is relative to this file
+#   { sealed = "enc:age:v2:..." }
+#                            the value itself, sealed to an age recipient
+#                            and bound to this key, opened with [secrets] key
 #
 # A file or credential has one line ending (LF or CRLF) trimmed. A
 # plain string where a secret belongs is refused.
 #
 # Relative paths elsewhere are relative to this file too.
+
+# The key that opens sealed values: an age identity, the AGE-SECRET-KEY-1
+# line age-keygen writes, named as an env, credential, or file reference,
+# never sealed itself. A systemd unit loads it as a credential, named here
+# as { credential = "airut-age-key" }.
+# Without this table a sealed value anywhere in the file is a problem.
+#
+# Seal a value with the airut command, which needs only the recipient
+# (the age1... public key), and reads the value from stdin:
+#
+#   airut seal --recipient age1... --at providers.proxy.api_key < key.txt
+#
+# It prints the field to write there as api_key = { sealed = "..." }. The
+# value opens only at the key path it was sealed for, so a sealed value
+# moved to another key is refused rather than sent somewhere else. Keys
+# under [app] are sealed by their own path, such as app.booru.token. A
+# key path joins keys with dots, as problems name them: a key that is not
+# only A-Z, a-z, 0-9, _ and - is quoted as a TOML string, as in
+# app.tokens."a.b", and an array index is bracketed, as in
+# app.mirrors[0].key, so no two places share a path.
+#
+# [secrets]
+# key = { env = "AIRUT_AGE_KEY" }
 
 [bot]
 # Starts a text command, as in "!roll 2d6". Defaults to "!".

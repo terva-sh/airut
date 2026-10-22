@@ -31,6 +31,10 @@ err := bot.Run(ctx, discord.New(cfg.Discord, discord.Options{}), matrix.New(cfg.
 bot: a dice command and an `ask` command whose agent may roll, served on
 Discord, Matrix, or both, as its configuration file says.
 
+[cmd/airut](cmd/airut) seals a secret for a bot's configuration file:
+`airut seal --recipient age1... --at discord.token` reads the value from
+stdin and prints the sealed field, without needing the key that opens it.
+
 **Status: early.** The core is in place: commands, `Ctx`, routing, and
 the gate on agent turns, tested through the in-process fake adapter in
 `airuttest`. So are the agent package with its SQLite session store, and
@@ -54,7 +58,7 @@ model.
 | `terva.sh/airut/discord` | the Discord adapter | discordgo |
 | `terva.sh/airut/matrix` | the Matrix adapter | [rihma](https://github.com/terva-sh/rihma) |
 | `terva.sh/airut/agent` | `c.Agent(...)` on terva's engine | terva |
-| `terva.sh/airut/config` | the bot's TOML file: providers, platforms, agent guards; secrets by reference ([example](docs/config.example.toml)) | go-toml |
+| `terva.sh/airut/config` | the bot's TOML file: providers, platforms, agent guards; secrets by reference or sealed with age ([example](docs/config.example.toml)) | go-toml, seal |
 | `terva.sh/airut/changelog` | a bot's user-facing changelog, by version, and semver order | the standard library |
 
 A test keeps the core package free of terva and of every platform, so a

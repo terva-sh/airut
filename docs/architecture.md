@@ -1330,15 +1330,47 @@ as they set the judge's one model before chains. Each judge entry's
 the model a call lands on. `Agent.Model` and `Judge.Model` name the
 first entry.
 
-Secrets are never in the file. A key that holds one names where the
-deployment put it: an environment variable, a systemd credential, or a
-file. `config.Load` reads them, and returns every problem in the file
-at once, each named by its key and never quoting a value.
+Secrets are never in the file as plaintext. A key that holds one names
+where the deployment put it: an environment variable, a systemd
+credential, or a file. Or it holds the value sealed, as
+`{ sealed = "enc:age:v2:..." }`: encrypted with age to the bot's
+recipient and bound to its own key path, in the format the
+`terva.sh/seal` module specifies. `config.Load` reads them, and returns
+every problem in the file at once, each named by its key and never
+quoting a value.
+
+A sealed value opens with the age identity `[secrets] key` names, as an
+env, credential, or file reference; the key cannot itself be sealed. The
+binding is `airut|` and the TOML key path, such as
+`airut|providers.cpa.api_key` or `airut|app.booru.token`, so a person who
+can edit the file but cannot open its values still cannot move a sealed
+API key to a key whose value goes somewhere they control: the value
+refuses to open anywhere but where it was sealed for. A key path is
+written one way, so that no two places share one: keys join with dots,
+a key that is not only `A-Z`, `a-z`, `0-9`, `_` and `-` is quoted as a
+TOML basic string (`app.tokens."a.b".key`), and an array index is
+bracketed (`app.mirrors[0].key`), apart from a table key `0`
+(`app.by_name.0.key`). Problems name keys in the same form. The scope is
+`airut` for every bot. A bot name in the binding would come from the
+same file, so it would not stop that person; giving each bot its own key
+is what keeps one bot's values out of another's file. A sealed value
+with no `[secrets] key`, sealed for another key, sealed to another
+recipient, or damaged is a problem at its key that says which, and never
+carries the value or the key.
+
+`airut seal --recipient age1... --at KEY` (in `cmd/airut`) reads a value
+from stdin, without echo on a terminal, and prints the field. It needs
+only the recipient, which is public, so whoever holds a secret seals it
+and no program or agent that runs the bot has to see it. `--recipient`
+may repeat, so a value opens with either of two keys while one replaces
+the other. It refuses a key path no secret is read from. Programs that
+seal values themselves call `config.Seal` and `config.SealBinding`.
 
 A bot's own configuration goes in the same file, under an `[app]` table, and
 `config.LoadApp(path, &settings)` decodes them into the bot's struct by
 toml tags. A field of type `config.Secret` takes a secret reference,
-exactly as airut's own secrets do. Unknown keys and wrong types in
+exactly as airut's own secrets do, and a sealed one is bound to its key
+path under `app`. Unknown keys and wrong types in
 `[app]` are reported with the rest. `config.Load` refuses an `[app]`
 table, because a program that calls it has no settings to receive one.
 
