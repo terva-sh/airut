@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -79,6 +81,9 @@ type ReactionEvent struct {
 	// stays the same across restarts, so a bot can match a reaction to a
 	// message it posted long before.
 	Target MessageRef
+	// Emoji is the reaction's emoji as NormalizeEmoji leaves it, so it
+	// reads the same on every platform and from every client. A Discord
+	// custom emoji is "name:id".
 	Emoji  string
 	Native any
 }
@@ -101,6 +106,44 @@ func (b *Bot) OnMessage(h func(*Ctx, MessageEvent) error) {
 // answers.
 func (b *Bot) OnReaction(h func(*Ctx, ReactionEvent) error) {
 	b.on("OnReaction", func(c *Ctx, ev Event) error { return h(c, ev.(ReactionEvent)) }, &b.onReaction)
+}
+
+// OnReactionTo registers a handler for reactions with one of emojis,
+// which is the alias set: []string{"❓", "❔"} registers both. Emoji
+// compare after NormalizeEmoji, so "✔️" and "✔" in the list or on the
+// reaction match each other; a Discord custom emoji matches by the
+// "name:id" that ReactionEvent.Emoji carries for it. The handler runs
+// among those OnReaction registered, in registration order, and is
+// logged as they are. OnReactionTo panics on an empty list, an entry
+// that is empty once normalized, or once the bot is running.
+func (b *Bot) OnReactionTo(emojis []string, h func(*Ctx, ReactionEvent) error) {
+	if len(emojis) == 0 {
+		panic("airut: OnReactionTo called with no emoji")
+	}
+	want := make([]string, 0, len(emojis))
+	for _, e := range emojis {
+		n := NormalizeEmoji(e)
+		if n == "" {
+			panic("airut: OnReactionTo called with an empty emoji")
+		}
+		want = append(want, n)
+	}
+	b.on("OnReactionTo", func(c *Ctx, ev Event) error {
+		r := ev.(ReactionEvent)
+		if !slices.Contains(want, r.Emoji) {
+			return nil
+		}
+		return h(c, r)
+	}, &b.onReaction)
+}
+
+// NormalizeEmoji drops the variation selector U+FE0F, which some clients
+// append to an emoji and others leave off, so "✔️" and "✔" compare equal.
+// It changes nothing else: skin tones and joined sequences stay
+// distinct. The core applies it to every ReactionEvent's Emoji before a
+// handler sees it.
+func NormalizeEmoji(emoji string) string {
+	return strings.ReplaceAll(emoji, "\uFE0F", "")
 }
 
 type eventHandler func(*Ctx, Event) error
@@ -132,7 +175,8 @@ func eventInvocation(ev Event, r Responder) (Invocation, string) {
 }
 
 // normalize turns a pointer to an event into the event, so an adapter
-// may deliver either. It reports false for a nil pointer.
+// may deliver either, and normalizes a reaction's emoji, so every
+// adapter's reactions read alike. It reports false for a nil pointer.
 func normalize(ev Event) (Event, bool) {
 	switch e := ev.(type) {
 	case *MessageEvent:
@@ -144,7 +188,12 @@ func normalize(ev Event) (Event, bool) {
 		if e == nil {
 			return nil, false
 		}
-		return *e, true
+		r := *e
+		r.Emoji = NormalizeEmoji(r.Emoji)
+		return r, true
+	case ReactionEvent:
+		e.Emoji = NormalizeEmoji(e.Emoji)
+		return e, true
 	case nil:
 		return nil, false
 	}

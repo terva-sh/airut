@@ -84,8 +84,8 @@ type ChimeOptions struct {
 	// is never answered.
 	StayOut bool
 	// Misses are the reactions that mark a reply Handler sent as a miss,
-	// such as "👎". airut_chime_misses_total counts each message marked
-	// once.
+	// such as "👎", compared after NormalizeEmoji.
+	// airut_chime_misses_total counts each message marked once.
 	Misses []string
 	// Settings, when set, declares the listener's limits as settings under
 	// it, as PREFIX.cooldown, PREFIX.max_per_hour, PREFIX.engaged_for, and
@@ -921,7 +921,7 @@ func (k *chime) sentBy(p Platform, ref MessageRef) {
 // reaction counts a miss: a reaction among Misses on a reply Handler
 // sent, once for each reply.
 func (k *chime) reaction(ev ReactionEvent) {
-	if !slices.Contains(k.o.Misses, ev.Emoji) {
+	if !slices.ContainsFunc(k.o.Misses, func(m string) bool { return NormalizeEmoji(m) == ev.Emoji }) {
 		return
 	}
 	id := string(ev.Channel.Platform) + "/" + ev.Target.ID

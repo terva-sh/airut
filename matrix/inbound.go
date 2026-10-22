@@ -220,12 +220,6 @@ func attachment(c *event.MessageEventContent) (airut.Attachment, bool) {
 	return a, true
 }
 
-// normalizeEmoji drops the variation selector that some clients append
-// to an emoji and others leave off, so "✔️" and "✔" compare equal.
-func normalizeEmoji(key string) string {
-	return strings.ReplaceAll(key, "️", "")
-}
-
 // errKind names what kind of error err is, for a log line: a Matrix
 // error code where the server sent one, never the error's text.
 func errKind(err error) string {

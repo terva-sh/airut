@@ -175,12 +175,90 @@ func TestACommandKnowsWhatItRepliesTo(t *testing.T) {
 	}
 }
 
+func TestNormalizeEmoji(t *testing.T) {
+	for in, want := range map[string]string{
+		"✔\uFE0F":                  "✔",
+		"✔":                        "✔",
+		"✅":                        "✅",
+		"❤\uFE0F\u200D🔥":           "❤\u200D🔥",
+		"👍🏽":                       "👍🏽",
+		"👨\u200D👩\u200D👧":          "👨\u200D👩\u200D👧",
+		"party:123456789012345678": "party:123456789012345678",
+		"\uFE0F":                   "",
+	} {
+		if got := airut.NormalizeEmoji(in); got != want {
+			t.Errorf("NormalizeEmoji(%+q) = %+q, want %+q", in, got, want)
+		}
+	}
+}
+
+func TestOnReactionTo(t *testing.T) {
+	b, _ := newBot(airut.Config{})
+	var s seen
+	b.OnReaction(func(c *airut.Ctx, r airut.ReactionEvent) error { s.add("all " + r.Emoji); return nil })
+	b.OnReactionTo([]string{"❓", "❔"}, func(c *airut.Ctx, r airut.ReactionEvent) error {
+		if c.Message() != r.Target {
+			t.Errorf("the handler's Ctx does not match its reaction")
+		}
+		s.add("question " + r.Emoji)
+		return nil
+	})
+	// Registered with the variation selector, matched without it, and
+	// the other way round.
+	b.OnReactionTo([]string{"✔\uFE0F"}, func(c *airut.Ctx, r airut.ReactionEvent) error { s.add("check " + r.Emoji); return nil })
+	b.OnReactionTo([]string{"✖"}, func(c *airut.Ctx, r airut.ReactionEvent) error { s.add("cross " + r.Emoji); return nil })
+	b.OnReactionTo([]string{"party:123"}, func(c *airut.Ctx, r airut.ReactionEvent) error { s.add("custom " + r.Emoji); return nil })
+	b.OnReaction(func(c *airut.Ctx, r airut.ReactionEvent) error { s.add("last " + r.Emoji); return nil })
+	a := airuttest.Start(t, b)
+
+	msg := airut.MessageRef{ID: "msg-1"}
+	for _, e := range []string{"❓", "❔", "✔", "✔\uFE0F", "✖\uFE0F", "👍", "party:123", "party:999"} {
+		a.React(msg, e)
+	}
+	want := []string{
+		"all ❓", "question ❓", "last ❓",
+		"all ❔", "question ❔", "last ❔",
+		"all ✔", "check ✔", "last ✔",
+		"all ✔", "check ✔", "last ✔",
+		"all ✖", "cross ✖", "last ✖",
+		"all 👍", "last 👍",
+		"all party:123", "custom party:123", "last party:123",
+		"all party:999", "last party:999",
+	}
+	if got := s.list(); !reflect.DeepEqual(got, want) {
+		t.Errorf("handlers saw %q,\nwant %q", got, want)
+	}
+}
+
+func TestOnReactionToChecksItsList(t *testing.T) {
+	b, _ := newBot(airut.Config{})
+	h := func(*airut.Ctx, airut.ReactionEvent) error { return nil }
+	for name, list := range map[string][]string{
+		"no list":         nil,
+		"an empty list":   {},
+		"an empty entry":  {"❓", ""},
+		"only a selector": {"\uFE0F"},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("OnReactionTo with %s did not panic", name)
+				}
+			}()
+			b.OnReactionTo(list, h)
+		}()
+	}
+}
+
 func TestHandlersCannotBeAddedWhileRunning(t *testing.T) {
 	b, _ := newBot(airut.Config{})
 	airuttest.Start(t, b)
 	for name, add := range map[string]func(){
 		"OnMessage":  func() { b.OnMessage(func(*airut.Ctx, airut.MessageEvent) error { return nil }) },
 		"OnReaction": func() { b.OnReaction(func(*airut.Ctx, airut.ReactionEvent) error { return nil }) },
+		"OnReactionTo": func() {
+			b.OnReactionTo([]string{"❓"}, func(*airut.Ctx, airut.ReactionEvent) error { return nil })
+		},
 	} {
 		func() {
 			defer func() {
@@ -235,13 +313,14 @@ func TestPointerEventsAreDelivered(t *testing.T) {
 	err := b.Run(context.Background(), pointerAdapter{events: []airut.Event{
 		&airut.MessageEvent{ID: "e1", Text: "hi"},
 		&airut.ReactionEvent{ID: "e2", Emoji: "✅"},
+		&airut.ReactionEvent{ID: "e3", Emoji: "✔\uFE0F"},
 		nilMsg,
 		nil,
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.list(); !reflect.DeepEqual(got, []string{"message hi", "reaction ✅"}) {
+	if got := s.list(); !reflect.DeepEqual(got, []string{"message hi", "reaction ✅", "reaction ✔"}) {
 		t.Errorf("handlers saw %q", got)
 	}
 	if n := strings.Count(logs.String(), "an adapter delivered an event the core does not know"); n != 2 {

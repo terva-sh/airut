@@ -386,7 +386,7 @@ func (s *session) onReaction(ctx context.Context, evt *event.Event) {
 		Thread:  string(thread),
 		Direct:  s.isDirect(ctx, evt.RoomID, evt.Sender),
 		Target:  airut.MessageRef{ID: string(rel.EventID)},
-		Emoji:   normalizeEmoji(rel.Key),
+		Emoji:   rel.Key, // the core normalizes it
 		Native:  evt,
 	}
 	resp := s.responder(evt.RoomID, thread, rel.EventID, evt.Sender)

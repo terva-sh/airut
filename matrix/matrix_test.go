@@ -207,12 +207,6 @@ func TestInvocationAndEvent(t *testing.T) {
 	}
 }
 
-func TestNormalizeEmoji(t *testing.T) {
-	if normalizeEmoji("✔️") != "✔" || normalizeEmoji("✅") != "✅" {
-		t.Errorf("normalizeEmoji: %q, %q", normalizeEmoji("✔️"), normalizeEmoji("✅"))
-	}
-}
-
 func TestSplit(t *testing.T) {
 	if got := split("", 10); len(got) != 0 {
 		t.Errorf("split of nothing = %q", got)

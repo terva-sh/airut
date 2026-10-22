@@ -502,7 +502,7 @@ func TestChimeAnchorsItsContext(t *testing.T) {
 
 func TestChimeCountsMisses(t *testing.T) {
 	var reply airut.MessageRef
-	a, j, ran, b, _ := startChime(t, airut.Config{}, airut.ChimeOptions{Misses: []string{"👎"}, Handler: func(c *airut.Ctx, _ airut.Chimed) error {
+	a, j, ran, b, _ := startChime(t, airut.Config{}, airut.ChimeOptions{Misses: []string{"👎\uFE0F"}, Handler: func(c *airut.Ctx, _ airut.Chimed) error {
 		var err error
 		reply, err = c.Reply("chiming in")
 		return err
