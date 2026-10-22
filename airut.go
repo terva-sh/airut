@@ -76,7 +76,7 @@ type Config struct {
 	// RestrictTo check: a turn whose caller it refuses is not offered the
 	// tool. Nil lets everyone, and a check that refuses everyone shuts
 	// the commands. Restrict them where what a member writes should not
-	// reach the turns of people who act on it.
+	// reach the turns of people who act on it, as with airut.Owner.
 	MemoryAccess AccessCheck
 	// OnPendingMemory is told of each bot memory that waits for
 	// approval, so the app can route it to an approver. It runs on the
@@ -90,13 +90,20 @@ type Config struct {
 	Settings Settings
 	// ProfileEditors decides who may use the built-in profile command,
 	// which changes the bot's name, description, and picture on the
-	// platform it is used on. Nil registers no profile command. The
-	// command takes an attachment, so it is never a tool.
+	// platform it is used on, usually airut.Owner. Nil registers no
+	// profile command. The command takes an attachment, so it is never a
+	// tool.
 	ProfileEditors AccessCheck
 	// Version is the version of the bot that is running, such as the
 	// output of git describe --tags set at build time. With it set, the
 	// bot has a built-in version command that answers with it.
 	Version string
+	// Owners lists the bot's owners, by platform: user ids, as a config
+	// file's [bot] owners gives them. Owner admits them, and the built-in
+	// status command tells anyone whether the bot has one. A bot with no
+	// owner on any platform it serves warns at every start, and answers a
+	// direct message with how to claim it.
+	Owners map[Platform][]string
 	// Changelog is the bot's user-facing release notes. With it set, the
 	// bot has a built-in changelog command that shows, privately, the
 	// notes for a version: by default the release Version is or was
@@ -133,6 +140,11 @@ type Bot struct {
 	// during one does not race it.
 	changelog  *changelog.Log
 	announceMu sync.Mutex
+	// owners is where Owner and HasOwner read the bot's owners.
+	owners *owners
+	// claimTold holds the senders, by platform and id, told in a direct
+	// message during this Run that the bot has no owner.
+	claimTold map[string]bool
 }
 
 // New returns a Bot with no commands. It panics on a Gate whose limits
@@ -166,7 +178,7 @@ func New(cfg Config) *Bot {
 		}
 	}
 	b := &Bot{cfg: cfg, commands: map[string]*Command{}, gate: newGate(cfg.Gate), metrics: newMetrics(),
-		judged: &limiter{now: time.Now, seen: map[string][]time.Time{}}}
+		judged: &limiter{now: time.Now, seen: map[string][]time.Time{}}, owners: newOwners(cfg.Owners, claimsOf(cfg.Agent), cfg.Logger)}
 	if cfg.Agent != nil {
 		b.gate.knobs = b.declareGateSettings(cfg.Gate)
 	}
@@ -325,6 +337,10 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 	if b.changelog != nil && b.commands["changelog"] == nil {
 		b.commands["changelog"] = changelogCommand(b)
 	}
+	if b.commands["status"] == nil {
+		b.commands["status"] = statusCommand(b)
+	}
+	b.claimTold = map[string]bool{}
 	b.mu.Unlock()
 
 	// stopped lets the bot be run again when Run fails before anything
@@ -338,6 +354,11 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 	if err := b.startSettings(ctx); err != nil {
 		return stopped(err)
 	}
+	platforms := make([]Platform, len(adapters))
+	for i, a := range adapters {
+		platforms[i] = a.Platform()
+	}
+	b.warnUnowned(ctx, platforms)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup

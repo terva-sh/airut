@@ -71,6 +71,10 @@ type Bot struct {
 	// ReplyDepth is how far up a reply chain the adapters resolve. Zero
 	// leaves their default; -1 resolves none.
 	ReplyDepth int
+	// Owners are the bot's owners, by platform ("matrix", "discord"):
+	// user ids, checked for the platform's form. airut.ByPlatform turns
+	// it into airut.Config's Owners.
+	Owners map[string][]string
 }
 
 // Agent is how agent turns run and who may start them.
@@ -175,6 +179,20 @@ type Rate struct {
 	PerUser    int
 	PerChannel int
 	Window     time.Duration
+	// Owners is [agent.rate.for.owners], or nil when the file has none
+	// and owners take the members' rate. A field the file leaves out
+	// holds the members' value.
+	Owners *GroupRate
+	// Wait lets a turn the rate refuses wait for its slot, as
+	// airut.Gate.Wait describes. Off by default.
+	Wait bool
+}
+
+// GroupRate is the rate of a group of callers with caps of their own,
+// counted in the Rate's Window. Zero means no cap of that kind.
+type GroupRate struct {
+	PerUser    int
+	PerChannel int
 }
 
 // Access lists platform user and role ids, and the rooms whose members
@@ -248,8 +266,9 @@ type fileSecrets struct {
 }
 
 type fileBot struct {
-	Prefix     string `toml:"prefix"`
-	ReplyDepth *int   `toml:"reply_depth"`
+	Prefix     string              `toml:"prefix"`
+	ReplyDepth *int                `toml:"reply_depth"`
+	Owners     map[string][]string `toml:"owners"`
 }
 
 type fileAgent struct {
@@ -305,6 +324,15 @@ type fileRate struct {
 	PerUser    *int   `toml:"per_user"`
 	PerChannel *int   `toml:"per_channel"`
 	Window     string `toml:"window"`
+	Wait       bool   `toml:"wait"`
+	// For is any, not a table of groups, so that a key other than owners
+	// is a problem saying so, even one shaped for a later release.
+	For any `toml:"for"`
+}
+
+type fileGroupRate struct {
+	PerUser    *int `toml:"per_user"`
+	PerChannel *int `toml:"per_channel"`
 }
 
 type fileAccess struct {
@@ -417,6 +445,7 @@ func build(p *problems, f *fileConfig, src *secretSource) *Config {
 			c.Bot.ReplyDepth = *d
 		}
 	}
+	c.Bot.Owners = buildOwners(p, f.Bot.Owners)
 
 	if m := f.Metrics; m != nil {
 		c.Metrics.Listen = m.Listen
@@ -470,6 +499,68 @@ func build(p *problems, f *fileConfig, src *secretSource) *Config {
 		p.add("(file)", "no platform is configured; add a [discord] or [matrix] table")
 	}
 	return c
+}
+
+// buildRateFor checks [agent.rate.for]: owners is the only group with a
+// rate of its own, and a field it leaves out inherits members'. It is
+// accepted without [bot] owners, since a claimed owner takes it too.
+func buildRateFor(p *problems, raw any, members Rate) *GroupRate {
+	table, ok := raw.(map[string]any)
+	if !ok {
+		p.add("agent.rate.for", "the value is not a table")
+		return nil
+	}
+	var owners *GroupRate
+	for _, k := range slices.Sorted(maps.Keys(table)) {
+		key := "agent.rate.for." + k
+		if k != "owners" {
+			p.add(key, "only owners has its own rate")
+			continue
+		}
+		var f fileGroupRate
+		decodeValue(p, key, table[k], reflect.ValueOf(&f).Elem(), nil)
+		g := GroupRate{PerUser: members.PerUser, PerChannel: members.PerChannel}
+		if f.PerUser != nil {
+			g.PerUser = *f.PerUser
+			if g.PerUser < 0 {
+				p.add(key+".per_user", "must not be negative")
+			}
+		}
+		if f.PerChannel != nil {
+			g.PerChannel = *f.PerChannel
+			if g.PerChannel < 0 {
+				p.add(key+".per_channel", "must not be negative")
+			}
+		}
+		owners = &g
+	}
+	return owners
+}
+
+// buildOwners checks [bot] owners: each key a platform, each id in its
+// platform's form. A problem names the key and the index, never the id.
+// A platform the file has no table for is accepted, so a deployment can
+// turn a platform off without losing its owners.
+func buildOwners(p *problems, f map[string][]string) map[string][]string {
+	if len(f) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(f))
+	for _, platform := range slices.Sorted(maps.Keys(f)) {
+		ids := f[platform]
+		key := "bot.owners." + platform
+		if platform != "matrix" && platform != "discord" {
+			p.add(key, `not a platform: use "matrix" or "discord"`)
+			continue
+		}
+		for i, id := range ids {
+			if err := CheckOwnerID(platform, id); err != nil {
+				p.add(fmt.Sprintf("%s.%d", key, i), err.Error())
+			}
+		}
+		out[platform] = slices.Clone(ids)
+	}
+	return out
 }
 
 func buildJudge(p *problems, f *fileJudge, providers []Provider) *Judge {
@@ -568,6 +659,10 @@ func buildAgent(p *problems, f *fileAgent, providers []Provider) *Agent {
 		}
 		if r.Window != "" {
 			a.Rate.Window = duration(p, "agent.rate.window", r.Window)
+		}
+		a.Rate.Wait = r.Wait
+		if r.For != nil {
+			a.Rate.Owners = buildRateFor(p, r.For, a.Rate)
 		}
 	}
 

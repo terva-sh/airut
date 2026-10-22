@@ -171,6 +171,9 @@ func (b *Bot) deliver(ctx context.Context, ev Event, r Responder) {
 		handlers = b.onReaction
 	}
 	b.mu.Unlock()
+	if m, isMessage := ev.(MessageEvent); isMessage {
+		b.answerUnclaimed(ctx, m, &Ctx{ctx: ctx, bot: b, inv: inv, resp: r})
+	}
 	if len(handlers) == 0 {
 		return
 	}

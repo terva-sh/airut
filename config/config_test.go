@@ -71,7 +71,9 @@ func TestExample(t *testing.T) {
 	judgeCapsAt20s := judgeCaps
 	judgeCapsAt20s.Timeout = 20 * time.Second
 	want := &Config{
-		Bot: Bot{Prefix: "!", ReplyDepth: 3},
+		Bot: Bot{Prefix: "!", ReplyDepth: 3, Owners: map[string][]string{
+			"discord": {"123456789012345678"}, "matrix": {"@owner:example.org"},
+		}},
 		Providers: []Provider{
 			{ID: "local", BaseURL: "http://127.0.0.1:8080/v1", Kind: KindLlamaSwap, Load: LoadWhenIdle, Models: []Model{
 				{ID: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}},
@@ -84,7 +86,7 @@ func TestExample(t *testing.T) {
 			Models:  Chain{{Provider: "local", Model: "qwen3-32b", Served: "Qwen3-32B-Q4_K_M", Capabilities: Capabilities{ContextWindow: 32768, MaxOutput: 8192, Reasoning: true}}},
 			Model:   ModelRef{Provider: "local", Model: "qwen3-32b"},
 			Budget:  Budget{MaxTurns: 8, MaxTokens: 200000},
-			Rate:    Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute},
+			Rate:    Rate{PerUser: 5, PerChannel: 20, Window: 10 * time.Minute, Owners: &GroupRate{PerUser: 30, PerChannel: 20}},
 			History: History{MaxMessages: 200, MaxTokens: 60000, MaxAge: 168 * time.Hour, Compaction: "summarize", RoomMessages: 10, FollowWithin: 15 * time.Minute},
 			Access: map[string]Access{
 				"discord": {Users: []string{"123456789012345678"}, Roles: []string{"234567890123456789"}},
@@ -291,6 +293,9 @@ func TestProblems(t *testing.T) {
 		{"unknown keys", "colour = \"blue\"\n" + minimal + "[discord.extra]\nx = 1\n", []string{"colour", "discord.extra"}},
 		{"a wrong type", minimal + "[bot]\nprefix = 3\n", []string{"bot.prefix"}},
 		{"a deep reply chain", minimal + "[bot]\nreply_depth = 11\n", []string{"bot.reply_depth"}},
+		{"bad owners", minimal + "[bot]\nowners = { matrix = [\"@ok:example.org\", \"" + sentinel + "\"], discord = [\"12\", \"@x:example.org\"], irc = [\"x\"] }\n",
+			[]string{"bot.owners.discord.1", "bot.owners.irc", "bot.owners.matrix.1"}},
+		{"owners not a table", minimal + "[bot]\nowners = [\"@a:example.org\"]\n", []string{"bot.owners"}},
 		{"a plain recovery key", minimal + "[matrix]\nhomeserver = \"https://m.example.org\"\nuser_id = \"@b:example.org\"\nstate_dir = \"m\"\nrecovery_key = \"" + sentinel + "\"\n",
 			[]string{"matrix.recovery_key"}},
 		{"bad syntax", minimal + "[bot]\nprefix = \"" + sentinel + "\n", []string{"(file)"}},
@@ -396,6 +401,34 @@ budget = { max_turns = 1, max_tokens = 1 }
 [store]
 path = "s"
 `, []string{"agent.model"}},
+		{"a rate for another group", minimal + `
+[providers.p]
+base_url = "http://localhost/v1"
+models = [{ id = "m" }]
+[agent]
+model = "p/m"
+budget = { max_turns = 1, max_tokens = 1 }
+[agent.rate.for.owners]
+per_user = -1
+per_channel = -2
+window = "1m"
+[agent.rate.for.mods]
+per_user = 10
+users = ["@mod:example.org"]
+[store]
+path = "s"
+`, []string{"agent.rate.for.mods", "agent.rate.for.owners.per_channel", "agent.rate.for.owners.per_user", "agent.rate.for.owners.window"}},
+		{"a rate for that is not a table", minimal + `
+[providers.p]
+base_url = "http://localhost/v1"
+models = [{ id = "m" }]
+[agent]
+model = "p/m"
+budget = { max_turns = 1, max_tokens = 1 }
+rate = { for = 3 }
+[store]
+path = "s"
+`, []string{"agent.rate.for"}},
 		{"bad metrics", minimal + "[metrics]\nlisten = \"" + sentinel + "\"\nsummary_every = \"0s\"\n", []string{"metrics.listen", "metrics.summary_every"}},
 		{"a store without an agent", minimal + "[store]\npath = \"s\"\n", []string{"store"}},
 		{"bad platforms", "[discord]\nguilds = [\"general\"]\n[bot]\nprefix = \"! \"\n[matrix]\nhomeserver = \"example.org\"\n", []string{
@@ -453,5 +486,85 @@ func TestSyntaxErrorInMultilineString(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), sentinel) {
 		t.Errorf("the error quotes the secret: %v", err)
+	}
+}
+
+func TestOwners(t *testing.T) {
+	t.Setenv("AIRUT_TEST_TOKEN", sentinel)
+	c, err := load(t, minimal+"[bot]\nowners = { matrix = [\"@you:example.org\"], discord = [\"123456789012345678\", \"234567890123456789\"] }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{"matrix": {"@you:example.org"}, "discord": {"123456789012345678", "234567890123456789"}}
+	if !reflect.DeepEqual(c.Bot.Owners, want) {
+		t.Errorf("owners = %q, want %q", c.Bot.Owners, want)
+	}
+	// Owners on a platform the file has no table for are kept, and a
+	// file without owners has none.
+	c, err = load(t, minimal+"[bot]\nowners = { matrix = [\"@you:example.org\"] }\n")
+	if err != nil || !reflect.DeepEqual(c.Bot.Owners, map[string][]string{"matrix": {"@you:example.org"}}) {
+		t.Errorf("matrix owners on a Discord bot = %q, %v", c.Bot.Owners, err)
+	}
+	if c, err := load(t, minimal); err != nil || c.Bot.Owners != nil {
+		t.Errorf("no owners = %q, %v", c.Bot.Owners, err)
+	}
+}
+
+// TestOwnersRate: [agent.rate.for.owners] takes the owners' caps, 0 for
+// none, and a field it leaves out inherits [agent] rate's.
+func TestOwnersRate(t *testing.T) {
+	t.Setenv("AIRUT_TEST_TOKEN", sentinel)
+	const agent = `
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+models = [{ id = "m" }]
+[store]
+path = "sessions.db"
+[agent]
+model = "local/m"
+budget = { max_turns = 1, max_tokens = 1 }
+`
+	for _, c := range []struct {
+		name, src string
+		want      *GroupRate
+	}{
+		{"none", "", nil},
+		{"both set", "[agent.rate]\nper_user = 3\n[agent.rate.for.owners]\nper_user = 30\nper_channel = 0\n", &GroupRate{PerUser: 30, PerChannel: 0}},
+		{"per_channel inherited", "[agent.rate]\nper_channel = 7\n[agent.rate.for.owners]\nper_user = 0\n", &GroupRate{PerUser: 0, PerChannel: 7}},
+		{"both inherited from the defaults", "[agent.rate.for.owners]\n", &GroupRate{PerUser: DefaultPerUser, PerChannel: DefaultPerChannel}},
+		{"written inline", "[agent.rate]\nfor = { owners = { per_user = 12 } }\n", &GroupRate{PerUser: 12, PerChannel: DefaultPerChannel}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := load(t, minimal+agent+c.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Agent.Rate.Owners; !reflect.DeepEqual(got, c.want) {
+				t.Errorf("owners' rate = %+v, want %+v", got, c.want)
+			}
+			// The owners' rate never changes the members'.
+			if r := cfg.Agent.Rate; r.Window != DefaultWindow {
+				t.Errorf("window = %v, want the members' %v", r.Window, DefaultWindow)
+			}
+		})
+	}
+}
+
+func TestOwnersRateOtherGroup(t *testing.T) {
+	t.Setenv("AIRUT_TEST_TOKEN", sentinel)
+	_, err := load(t, minimal+`
+[providers.local]
+base_url = "http://127.0.0.1:8000/v1"
+models = [{ id = "m" }]
+[store]
+path = "sessions.db"
+[agent]
+model = "local/m"
+budget = { max_turns = 1, max_tokens = 1 }
+[agent.rate.for.mods]
+per_user = 10
+`)
+	if err == nil || !strings.Contains(err.Error(), "agent.rate.for.mods") || !strings.Contains(err.Error(), "only owners has its own rate") {
+		t.Errorf("another group under for: %v", err)
 	}
 }

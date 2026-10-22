@@ -49,7 +49,8 @@ func TestCommands(t *testing.T) {
 		`{"type":8,"name":"group","description":"Which role","required":true},` +
 		`{"type":11,"name":"image","description":"An image","required":true},` +
 		`{"type":3,"name":"note","description":"A note","min_length":0,"max_length":200}]},` +
-		`{"type":1,"name":"ping","description":"Answer pong"}]`
+		`{"type":1,"name":"ping","description":"Answer pong"},` +
+		`{"type":1,"name":"status","description":"Show the bot's version, its platforms, and whether it has an owner"}]`
 	if string(got) != want {
 		t.Errorf("commands =\n%s\nwant\n%s", got, want)
 	}

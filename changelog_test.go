@@ -36,7 +36,7 @@ func specNames(a *airuttest.Adapter) []string {
 func TestVersionCommand(t *testing.T) {
 	b, _ := newBot(airut.Config{Version: "v1.3.0-4-gabc1234-dirty"})
 	a := airuttest.Start(t, b)
-	if got := specNames(a); !slices.Equal(got, []string{"roll", "version"}) {
+	if got := specNames(a); !slices.Equal(got, []string{"roll", "status", "version"}) {
 		t.Fatalf("specs = %q; a Version brings a version command and nothing else", got)
 	}
 	wantEvents(t, a.Text("!version"), "reply:Running v1.3.0-4-gabc1234-dirty.")
@@ -45,7 +45,7 @@ func TestVersionCommand(t *testing.T) {
 	}
 
 	b, _ = newBot(airut.Config{})
-	if got := specNames(airuttest.Start(t, b)); !slices.Equal(got, []string{"roll"}) {
+	if got := specNames(airuttest.Start(t, b)); !slices.Equal(got, []string{"roll", "status"}) {
 		t.Fatalf("specs = %q; with no Version and no Changelog there are no such commands", got)
 	}
 }
@@ -53,7 +53,7 @@ func TestVersionCommand(t *testing.T) {
 func TestChangelogCommand(t *testing.T) {
 	b, logs := newBot(airut.Config{Version: "v1.3.0", Changelog: &airut.Changelog{Notes: notes, Heading: "📚 New in the archive ({version}):"}})
 	a := airuttest.Start(t, b)
-	if got := specNames(a); !slices.Equal(got, []string{"changelog", "roll", "version"}) {
+	if got := specNames(a); !slices.Equal(got, []string{"changelog", "roll", "status", "version"}) {
 		t.Fatalf("specs = %q", got)
 	}
 
@@ -86,7 +86,7 @@ func TestChangelogCommandDefaults(t *testing.T) {
 	// Without a Version, the newest; and no version command.
 	b, _ = newBot(airut.Config{Changelog: &airut.Changelog{Notes: notes}})
 	a := airuttest.Start(t, b)
-	if got := specNames(a); !slices.Equal(got, []string{"changelog", "roll"}) {
+	if got := specNames(a); !slices.Equal(got, []string{"changelog", "roll", "status"}) {
 		t.Fatalf("specs = %q", got)
 	}
 	wantEvents(t, a.Text("!changelog"), "reply:New in v1.3.0:\n- The archive keeps your place.")

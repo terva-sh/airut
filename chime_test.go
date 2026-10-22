@@ -248,7 +248,9 @@ func TestChimeJudgesOneBatchAtATimePerChannel(t *testing.T) {
 }
 
 func TestChimeJudgesOnlyWhatItShould(t *testing.T) {
-	a, j, ran, b, _ := startChime(t, airut.Config{}, airut.ChimeOptions{})
+	// The bot has an owner, so the direct message, which the fake adapter
+	// posts in the watched channel, is not answered with the claim line.
+	a, j, ran, b, _ := startChime(t, airut.Config{Owners: map[airut.Platform][]string{"test": {"owner"}}}, airut.ChimeOptions{})
 	a.Text("!roll 1d6", airuttest.As(alice))
 	a.Text("!nosuch", airuttest.As(alice))
 	a.Text("missed", airuttest.As(alice), airuttest.SentAt(time.Now().Add(-time.Hour)))

@@ -20,8 +20,8 @@ import (
 // commands.
 type Settings struct {
 	// Owner decides who may change a setting that names no Change check
-	// of its own. airut has no roles, so the bot supplies it, as a list
-	// of owners. Nil lets nobody change such a setting from chat.
+	// of its own, usually airut.Owner, which admits the bot's owners. Nil
+	// lets nobody change such a setting from chat.
 	Owner AccessCheck
 	// Values is the config layer, by setting name, as the config file's
 	// [settings] table gives it. Run fails on a name no setting declares
