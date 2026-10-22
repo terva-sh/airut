@@ -55,6 +55,7 @@ model.
 | `terva.sh/airut/matrix` | the Matrix adapter | [rihma](https://github.com/terva-sh/rihma) |
 | `terva.sh/airut/agent` | `c.Agent(...)` on terva's engine | terva |
 | `terva.sh/airut/config` | the bot's TOML file: providers, platforms, agent guards; secrets by reference ([example](docs/config.example.toml)) | go-toml |
+| `terva.sh/airut/changelog` | a bot's user-facing changelog, by version, and semver order | the standard library |
 
 A test keeps the core package free of terva and of every platform, so a
 bot that only has plain commands never builds either.

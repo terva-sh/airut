@@ -8,8 +8,11 @@ import (
 	"reflect"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"terva.sh/airut/changelog"
 )
 
 // Config configures a Bot.
@@ -85,6 +88,20 @@ type Config struct {
 	// hears of a change. A bot with an Agent has the Gate's limits as
 	// settings, and the config file's values cap them.
 	Settings Settings
+	// ProfileEditors decides who may use the built-in profile command,
+	// which changes the bot's name, description, and picture on the
+	// platform it is used on. Nil registers no profile command. The
+	// command takes an attachment, so it is never a tool.
+	ProfileEditors AccessCheck
+	// Version is the version of the bot that is running, such as the
+	// output of git describe --tags set at build time. With it set, the
+	// bot has a built-in version command that answers with it.
+	Version string
+	// Changelog is the bot's user-facing release notes. With it set, the
+	// bot has a built-in changelog command that shows, privately, the
+	// notes for a version: by default the release Version is or was
+	// built from.
+	Changelog *Changelog
 }
 
 // Bot holds a set of commands and serves them through adapters.
@@ -111,6 +128,8 @@ type Bot struct {
 	// serialises their changes, since one can be checked against another.
 	settings   map[string]*setting
 	settingsMu sync.Mutex
+	// changelog is Config.Changelog's notes, which Run parses.
+	changelog *changelog.Log
 }
 
 // New returns a Bot with no commands. It panics on a Gate whose limits
@@ -262,6 +281,10 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 		b.mu.Unlock()
 		return errors.New("airut: Run called twice")
 	}
+	if err := b.parseChangelog(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	b.running = true
 	if f, ok := b.cfg.Agent.(SessionForgetter); ok && b.commands["forget"] == nil {
 		b.commands["forget"] = forgetCommand(b, f)
@@ -286,6 +309,18 @@ func (b *Bot) Run(ctx context.Context, adapters ...Adapter) error {
 				b.commands[name] = mk(b)
 			}
 		}
+	}
+	if b.cfg.ProfileEditors != nil && b.commands["profile"] == nil {
+		c := profileCommand(b)
+		// b.mu is held, so the field is set as RestrictTo would.
+		c.restrict = b.cfg.ProfileEditors
+		b.commands["profile"] = c
+	}
+	if strings.TrimSpace(b.cfg.Version) != "" && b.commands["version"] == nil {
+		b.commands["version"] = versionCommand(b)
+	}
+	if b.changelog != nil && b.commands["changelog"] == nil {
+		b.commands["changelog"] = changelogCommand(b)
 	}
 	b.mu.Unlock()
 

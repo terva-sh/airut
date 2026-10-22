@@ -194,7 +194,14 @@ announces a `Conn` through `Host.Ready` once it is connected:
   is not the bot's own reaction, with `ErrNotOwnReaction`, so it cannot
   remove a message or someone else's reaction. Reacting again with the
   same emoji returns the standing reaction's ref, so a bot that
-  restarted before recording a ref can recover it.
+  restarted before recording a ref can recover it;
+- `Profile` reads the bot's own name, description, and picture, and
+  `SetProfile` changes the ones a `ProfileChange` sets. Each adapter
+  first checks the change against the bounds every platform accepts
+  (`ProfileChange.Check`): a name of 1 to 32 characters, a description
+  of at most 400, and a PNG, JPEG, GIF, or WebP picture of at most
+  8 MiB whose bytes match the type it claims. A field the platform
+  lacks fails with `ErrUnsupported` before anything changes.
 
 `bot.OnReady` runs each time an adapter announces its `Conn`, on a
 goroutine of its own that `Run` waits for, which is where a bot resumes
@@ -308,6 +315,10 @@ encrypted history it could read before.
     through the relations API.
   - `Unreact` fetches the event and redacts it only when it is an
     `m.reaction` the bot sent. The redaction stays on record.
+  - `SetProfile` sets the global display name and avatar, which the
+    homeserver carries into every room the bot is in. A picture is
+    uploaded as plain media, because a profile is public. Matrix has no
+    description, so a change that sets one fails with `ErrUnsupported`.
   - The adapter announces the `Conn` once a sync has been fully
     processed. On a first connect that is the second sync, so `OnReady`
     can wait up to the sync timeout of thirty seconds.
@@ -384,6 +395,12 @@ it uses: guilds, messages, and reactions, in guilds and direct messages.
     because Discord gives a reaction no id of its own. `Unreact` calls
     the endpoint that removes only the bot's own reaction, and refuses a
     ref whose parts are not an id and an emoji before any request.
+  - `SetProfile` changes the bot user's name and avatar, and the
+    description of its application, which Discord shows on the bot's
+    profile as "About me". Discord allows two name changes an hour, so
+    a name or description the bot already has is not sent again. A
+    picture is always sent, since Discord's avatar hash cannot be
+    checked against the bytes.
 - **Logs.** discordgo's own logging is off, because its errors can
   quote gateway payloads, which hold message text. The adapter logs
   ids and error kinds.
@@ -406,8 +423,11 @@ each turn, `core.New(client, model, ...)`, with:
 - `core.WithGate`: a gate that asks the caller in the chat before each
   call to a tool registered with `RequireApproval`, and tells the model
   the call was refused on a no or when no answer comes in time.
-- `core.WithAssembler`: the system prompt of the turn's persona, from
-  the personas the bot gives `agent.New`, and the chat the turn is
+- `core.WithAssembler`: the system prompt, which is the bot's character
+  (`Options.Character`, or `agent.WithCharacter` for `agent.Open`)
+  followed by the prompt of the turn's persona, from the personas the
+  bot gives `agent.New`. The character is the bot's voice in every turn,
+  and the persona's rules and tools come last. Then the chat the turn is
   shown, described below.
 - `core.WithTranscriptStore`: the session for the turn's session key,
   resumed before the turn. Turns in one session run one at a time.
@@ -929,6 +949,89 @@ set first. The access lists stay out of settings for the reason owners
 do: a list someone can edit from chat lets them grant themselves
 access.
 
+## Profile
+
+`Config.ProfileEditors` registers the built-in `profile` command for
+the callers it allows; nil registers none. `profile` alone shows the
+bot's profile on that platform, privately. `profile name TEXT`,
+`profile about TEXT`, and `profile avatar` with a picture attached each
+change one field, on the platform the command was used on. The
+picture's type is read from its bytes, not from what the platform
+reported.
+
+The command takes an attachment, so it can never be a tool: no agent
+turn can rename the bot or change its face, however it is asked. A bot
+that wants a profile kept in code can call `Conn.SetProfile` from
+`OnReady`. The platform keeps the profile, so airut stores no copy of
+it. The log names the field and the picture's size, never the name or
+the description.
+
+## Version and changelog
+
+A bot tells people which version runs and what changed in it with two
+built-in commands, from notes it ships with itself.
+
+```go
+//go:embed CHANGELOG.md
+var notes string
+
+b := airut.New(airut.Config{
+	Version: version, // set at build time from git describe --tags
+	Changelog: &airut.Changelog{
+		Notes:   notes,
+		Heading: "📚 New in the archive ({version}):",
+	},
+})
+```
+
+- **`version`.** `Config.Version` brings a `version` command that
+  answers in the channel with the version as it was set, a build's
+  suffix included.
+- **`changelog [version]`.** `Config.Changelog` brings a `changelog`
+  command that answers privately with one version's notes under the
+  `Heading`, in which `{version}` is the version. With no version it
+  shows the release `Config.Version` is, or the one a build such as
+  `v1.3.0-4-gabc1234-dirty` was built from. Without a `Version` it
+  shows the newest. For a version the notes do not cover, the answer
+  says so and names the newest they do.
+- **Who.** Both are open to everyone, and both are tools an app may name
+  in a Turn. A bot command of the same name replaces either.
+
+The notes are posted word for word. They are written for the rooms, in
+the bot's own voice, when the release is prepared, and reviewed with
+it. Commit subjects are written for developers, release notes fetched
+from a forge would need network access and a token, and a model
+rewriting the notes at runtime would cost a call and put text no person
+reviewed in front of every room.
+
+`terva.sh/airut/changelog` reads the notes and imports only the
+standard library. A level-2 heading names a version, in Keep a
+Changelog's form, `## [1.2.0] - 2026-10-22`, or plainly, as `## v1.2.0`
+or `## 1.2.0`. A version's notes run to the next level-2 heading; a
+`## ` line in a code fence does not end them. `## Unreleased` is
+skipped with its notes, and so is the text above the first heading and
+Keep a Changelog's link definitions, which chat would show raw. Any
+other level-2 heading is an error, as is a version with two sections,
+and `Run` fails on either before it starts an adapter, so a typo cannot
+silently lose a release's notes.
+
+Versions are semver 2.0.0, the leading `v` optional, and order by its
+precedence, so `v1.10.0` is above `v1.2.0` and `v1.3.0-rc.1` below
+`v1.3.0`. The package compares them itself rather than adding a module
+for it. Its other helpers:
+
+- `Covers(notes, version)` reports whether the notes have a section with
+  text for a version, so a bot's release check or test can refuse to tag
+  a release that has none.
+- `Log.Between(after, upTo)` returns the sections above one version up
+  to and including another, newest first: what an update from one to
+  the other changed.
+- `IsRelease` tells a release tag, prerelease included, from a build
+  that git describe names after a tag, as `v1.3.0-4-gabc1234` or
+  `v1.3.0-dirty`. Semver reads such a suffix as a prerelease, so this is
+  the check that separates them. `Base` returns the tag a build was made
+  from.
+
 ## Metrics
 
 Every bot keeps metrics in memory, which `Bot.Metrics()` and
@@ -954,6 +1057,7 @@ Every bot keeps metrics in memory, which `Bot.Metrics()` and
 | `airut_chime_total` | `persona`, `outcome`, `engaged` | Chime batches, by how each ended |
 | `airut_chime_misses_total` | `persona` | Chime replies marked as a miss |
 | `airut_memory_writes_total` | `scope`, `source`, `status` | memories saved, by how they were saved |
+| `airut_profile_changes_total` | `platform`, `field` | changes made with the profile command |
 | `airut_memory_consents_total` | `answer` | answers to a pending memory's question |
 | `airut_setting_changes_total` | `setting`, `source` | settings changed from chat, by a command or the agent |
 | `airut_adapter_up` | `platform` | 1 while the adapter runs |
