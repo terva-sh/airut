@@ -44,6 +44,13 @@ type Memory struct {
 	LastUsed   int64
 }
 
+type OwnerClaim struct {
+	Platform  string
+	UserID    string
+	ClaimedAt int64
+	Actor     string
+}
+
 type SchemaMigration struct {
 	Version   int64
 	Name      string

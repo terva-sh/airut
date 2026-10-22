@@ -34,6 +34,9 @@ Discord, Matrix, or both, as its configuration file says.
 [cmd/airut](cmd/airut) seals a secret for a bot's configuration file:
 `airut seal --recipient age1... --at discord.token` reads the value from
 stdin and prints the sealed field, without needing the key that opens it.
+`airut claim -config FILE @you:example.org` makes someone an owner of a
+running bot from its host, and a bot can mount the same command as its
+own subcommand.
 
 **Status: early.** The core is in place: commands, `Ctx`, routing, and
 the gate on agent turns, tested through the in-process fake adapter in

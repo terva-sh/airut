@@ -6,8 +6,10 @@
 //
 // It serves each platform whose table the file has. roll rolls dice, and
 // is also a tool the agent may call. Its roll.max_dice setting is listed
-// by settings, and the owners the file's [app] table names may change it
-// with set. ask puts a question to the agent,
+// by settings, and the owners [bot] owners names may change it with set,
+// and the bot's name, description, and picture with profile. status
+// tells anyone whether the bot has an owner. ask puts a question to the
+// agent,
 // which may roll dice to answer it; it needs the file's [agent] table,
 // and only the users and roles its access tables name may use it. On
 // Matrix the bot joins a room only when one of the users named in
@@ -24,6 +26,13 @@
 // bot's device, and prints the recovery key to the terminal, once. For one
 // that has an identity it asks for the recovery key, read without echo,
 // and signs the device with it.
+//
+// claim and unclaim add and remove an owner from the host, as airut
+// claim and airut unclaim do, on the same configuration, which the bot
+// reads again within a minute:
+//
+//	airut-example claim @you:example.org
+//	airut-example unclaim -config /etc/airut-example/airut.toml @you:example.org
 package main
 
 import (
@@ -43,13 +52,20 @@ import (
 
 	"terva.sh/airut"
 	"terva.sh/airut/agent"
+	"terva.sh/airut/agent/claim"
 	"terva.sh/airut/config"
 	"terva.sh/airut/discord"
 	"terva.sh/airut/matrix"
 )
 
+// defaultConfig is the configuration file -config defaults to.
+const defaultConfig = "/etc/airut-example/airut.toml"
+
 func main() {
-	path := flag.String("config", "/etc/airut-example/airut.toml", "the configuration file")
+	if code, ok := subcommand(os.Args[1:], os.Stdout, os.Stderr); ok {
+		os.Exit(code)
+	}
+	path := flag.String("config", defaultConfig, "the configuration file")
 	crossSign := flag.Bool("cross-sign", false, "run the Matrix cross-signing setup, with the bot stopped, and exit")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -65,6 +81,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "airut-example:", err)
 		os.Exit(1)
 	}
+}
+
+// subcommand runs claim or unclaim when args name one, and reports
+// whether they did. Each takes its own -config, defaulting to the bot's.
+func subcommand(args []string, stdout, stderr io.Writer) (int, bool) {
+	if len(args) == 0 || args[0] != "claim" && args[0] != "unclaim" {
+		return 0, false
+	}
+	return claim.Command{Prog: "airut-example", Config: defaultConfig}.Run(args, stdout, stderr), true
 }
 
 // crossSignSetup runs matrix.CrossSign for the file's [matrix] table, on
@@ -134,37 +159,14 @@ func readKey(ctx context.Context, in *os.File, out io.Writer, prompt string) (st
 	}
 }
 
-// app is the example's own [app] table.
-type app struct {
-	// Owners may change the bot's settings from chat: the user ids of
-	// each platform, as owners = { matrix = ["@you:example.org"] }.
-	Owners map[string][]string `toml:"owners"`
-}
-
-// owners is the access check of a.Owners.
-func (a app) owners() airut.AccessCheck {
-	access := map[airut.Platform]airut.Access{}
-	for p, users := range a.Owners {
-		access[airut.Platform(p)] = airut.Access{Users: users}
-	}
-	return airut.Listed(access)
-}
-
 func run(path string, log *slog.Logger) error {
-	var own app
-	cfg, err := config.LoadApp(path, &own)
+	cfg, err := config.Load(path)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	bc := airut.Config{
-		Prefix:       cfg.Bot.Prefix,
-		Logger:       log,
-		MetricsAddr:  cfg.Metrics.Listen,
-		SummaryEvery: cfg.Metrics.SummaryEvery,
-		Settings:     airut.Settings{Owner: own.owners(), Values: cfg.Settings},
-	}
+	bc := botConfig(cfg, log)
 	// Without an [agent] table, ask answers that it has no agent.
 	if cfg.Agent != nil {
 		ag, err := agent.Open(ctx, cfg, personas, log, agent.WithCharacter(character))
@@ -203,4 +205,19 @@ func inviters(cfg *config.Config) func(matrix.Invite) bool {
 		}
 	}
 	return func(inv matrix.Invite) bool { return allowed[inv.Inviter] }
+}
+
+// botConfig is the core's configuration from the file's. The owners
+// [bot] owners names may change the settings and the bot's profile from
+// chat; neither built-in is open to anyone else.
+func botConfig(cfg *config.Config, log *slog.Logger) airut.Config {
+	return airut.Config{
+		Prefix:         cfg.Bot.Prefix,
+		Logger:         log,
+		MetricsAddr:    cfg.Metrics.Listen,
+		SummaryEvery:   cfg.Metrics.SummaryEvery,
+		Owners:         airut.ByPlatform(cfg.Bot.Owners),
+		Settings:       airut.Settings{Owner: airut.Owner, Values: cfg.Settings},
+		ProfileEditors: airut.Owner,
+	}
 }

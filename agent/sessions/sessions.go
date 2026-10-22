@@ -48,6 +48,11 @@ type Options struct {
 	Logger *slog.Logger
 	// Now is the clock, for tests. Nil means time.Now.
 	Now func() time.Time
+	// NoSweep opens the database without deleting anything, at Open or
+	// hourly, for a short-lived process beside the bot, such as airut
+	// claim, which must change nothing but what it was run to change.
+	// The bot's own sweep, by its own retention, still runs.
+	NoSweep bool
 }
 
 // DB is one bot's session database.
@@ -65,7 +70,7 @@ type DB struct {
 
 // Open opens or creates the database at path, brings its schema up to
 // date, deletes the sessions that have expired, and keeps deleting them
-// hourly until Close.
+// hourly until Close, unless opts.NoSweep.
 func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	if opts.Retention < 0 {
 		return nil, fmt.Errorf("sessions: retention %s is negative", opts.Retention)
@@ -98,6 +103,10 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		now:       opts.Now,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+	}
+	if opts.NoSweep {
+		close(d.done)
+		return d, nil
 	}
 	if _, err := d.Sweep(ctx); err != nil {
 		pool.Close()

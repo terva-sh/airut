@@ -54,8 +54,10 @@ uses.
 - **Secrets.** Write each secret as a credential reference, such as
   `token = { credential = "discord-token" }`. The id is the name before
   the colon on the unit's `LoadCredentialEncrypted=` line.
-- **Owners.** List who may change the bot's settings from chat in
-  `[app] owners`.
+- **Owners.** List who owns the bot in `[bot] owners`, or claim it once
+  it runs, as [Claim the bot](#claim-the-bot) shows. Owners may change
+  the bot's settings and profile from chat. Without one, the bot warns at
+  every start, and anyone can run `status` to see that it has no owner.
 - **No recovery key.** Leave `[matrix] recovery_key` commented out, as
   the example does. The bot refuses to start on a credential it cannot
   read, and the unit does not load the recovery key.
@@ -97,6 +99,22 @@ journalctl -u airut-example -f
 The log holds ids, kinds, and sizes, and never a token or message text.
 On its first start the Matrix adapter logs in with the password and
 stores its session and crypto keys in the state directory.
+
+## Claim the bot
+
+To make someone an owner without editing the configuration, claim the
+bot on the host. Run the command as the service's user, so the session
+database's files stay the service's. It reads no credential, and the bot
+can keep running:
+
+```sh
+runuser -u airut-example -- /usr/local/lib/airut-example/airut-example \
+  claim -config /etc/airut-example/airut.toml @you:example.org
+```
+
+The running bot honours the claim within a minute. `unclaim` in place of
+`claim` removes it. `status`, run by an owner, lists each claimed owner
+with the time of the claim.
 
 ## Cross-sign the Matrix device
 

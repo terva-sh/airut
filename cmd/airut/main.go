@@ -11,6 +11,15 @@
 // trailing line ending is trimmed, as Load trims a file's. --recipient
 // may be repeated, so a value opens with either key while one replaces
 // the other.
+//
+//	airut claim -config /etc/mybot/bot.toml @you:example.org
+//	airut unclaim -config /etc/mybot/bot.toml @you:example.org
+//
+// claim makes a user an owner of the bot the config file describes, and
+// unclaim removes a claim. They record it in the file's [store] session
+// database, which the running bot reads again within a minute. Package
+// terva.sh/airut/agent/claim documents them, and a bot can mount them as
+// its own subcommands from there.
 package main
 
 import (
@@ -25,6 +34,7 @@ import (
 	"filippo.io/age"
 	"golang.org/x/term"
 
+	"terva.sh/airut/agent/claim"
 	"terva.sh/airut/config"
 	"terva.sh/seal"
 )
@@ -34,17 +44,25 @@ func main() {
 }
 
 const usage = `usage: airut seal --recipient age1... --at KEY < value
+       airut claim -config FILE [PLATFORM] USER
+       airut unclaim -config FILE [PLATFORM] USER
 
 seal reads a secret from stdin and prints it sealed for KEY, a key path
 in the configuration file such as providers.ID.api_key, discord.token,
 or app.booru.token. A key that is not only A-Z, a-z, 0-9, _ and - is
 quoted, as in app.tokens."a.b", and an array index is bracketed, as in
 app.mirrors[0].key. Write the output there as { sealed = "..." }.
+
+claim and unclaim add and remove an owner of the bot the config file
+describes; airut claim -h says more.
 `
 
 // run is the command, with its streams, and returns the exit status:
-// 0 on success, 1 when sealing fails, 2 for a usage mistake.
+// 0 on success, 1 when the command fails, 2 for a usage mistake.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && (args[0] == "claim" || args[0] == "unclaim") {
+		return claim.Main(args, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] != "seal" {
 		fmt.Fprint(stderr, usage)
 		return 2

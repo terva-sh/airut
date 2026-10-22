@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"terva.sh/airut"
+	"terva.sh/airut/agent/sessions"
 	"terva.sh/airut/airuttest"
 	"terva.sh/airut/config"
 	"terva.sh/airut/matrix"
@@ -201,9 +204,19 @@ func TestMaxDiceSetting(t *testing.T) {
 }
 
 func TestOwners(t *testing.T) {
-	check := app{Owners: map[string][]string{string(airuttest.Platform): {"owner"}}}.owners()
-	b := newBot(airut.Config{Settings: airut.Settings{Owner: check}}, threes)
+	// The file's [bot] owners reach the core through botConfig. The fake
+	// adapter's platform is not one a file may name, so the test sets it
+	// the way ByPlatform would.
+	cfg := &config.Config{Bot: config.Bot{Owners: map[string][]string{string(airuttest.Platform): {"owner"}}}}
+	bc := botConfig(cfg, slog.New(slog.DiscardHandler))
+	if !reflect.DeepEqual(bc.Owners, map[airut.Platform][]string{airuttest.Platform: {"owner"}}) || bc.ProfileEditors == nil || bc.Settings.Owner == nil {
+		t.Fatalf("botConfig = owners %q, profile editors set %v, settings owner set %v", bc.Owners, bc.ProfileEditors != nil, bc.Settings.Owner != nil)
+	}
+	b := newBot(bc, threes)
 	a := airuttest.Start(t, b)
+	if got := texts(a.Text("!profile name Mallory")); !reflect.DeepEqual(got, []string{"reply:You are not allowed to use !profile."}) {
+		t.Errorf("someone else's profile = %q", got)
+	}
 	// Nobody may change a setting without a store, but the refusal tells
 	// an owner from anyone else.
 	if got := texts(a.Text("!set roll.max_dice 3", airuttest.As(airut.User{Platform: airuttest.Platform, ID: "owner"}))); !reflect.DeepEqual(got,
@@ -212,5 +225,46 @@ func TestOwners(t *testing.T) {
 	}
 	if got := texts(a.Text("!set roll.max_dice 3")); !reflect.DeepEqual(got, []string{"reply:You are not allowed to change roll.max_dice."}) {
 		t.Errorf("someone else's set = %q", got)
+	}
+}
+
+// The example mounts claim and unclaim as its own subcommands, which
+// record the claim in the session store the file names.
+func TestClaimSubcommand(t *testing.T) {
+	if _, ok := subcommand([]string{"-config", "x"}, io.Discard, io.Discard); ok {
+		t.Error("a flag was taken for a subcommand")
+	}
+	if _, ok := subcommand(nil, io.Discard, io.Discard); ok {
+		t.Error("no arguments were taken for a subcommand")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "airut.toml")
+	src := "[discord]\ntoken = { env = \"NO_SUCH_TOKEN\" }\n[agent]\nmodel = \"local/m\"\n[store]\npath = \"sessions.db\"\n"
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	code, ok := subcommand([]string{"claim", "-config", path, "-actor", "ops", "123"}, &out, &errOut)
+	if !ok || code != 0 || !strings.Contains(out.String(), "claimed discord 123") {
+		t.Fatalf("airut-example claim = %d, %v, %q %q", code, ok, out.String(), errOut.String())
+	}
+	errOut.Reset()
+	if code, _ := subcommand([]string{"claim"}, io.Discard, &errOut); code != 2 ||
+		!strings.Contains(errOut.String(), "usage: airut-example claim") || !strings.Contains(errOut.String(), defaultConfig) {
+		t.Errorf("airut-example claim with no user = %d, %q", code, errOut.String())
+	}
+
+	db, err := sessions.Open(context.Background(), filepath.Join(dir, "sessions.db"), sessions.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	list, err := db.OwnerClaims(context.Background())
+	if err != nil || len(list) != 1 || list[0].Platform != "discord" || list[0].ID != "123" || list[0].Actor != "ops" {
+		t.Errorf("the store's claims = %+v, %v", list, err)
+	}
+	out.Reset()
+	if code, _ := subcommand([]string{"unclaim", "-config", path, "discord", "123"}, &out, io.Discard); code != 0 || !strings.Contains(out.String(), "unclaimed discord 123") {
+		t.Errorf("airut-example unclaim = %d, %q", code, out.String())
 	}
 }
