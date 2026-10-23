@@ -123,10 +123,13 @@ func TestReadMessage(t *testing.T) {
 		t.Errorf("encrypted attachment URL %q", in.files[0].URL)
 	}
 
-	// Edits and redacted messages are not acted on.
+	// Edits, redacted messages, and in-room verification requests are not
+	// acted on. A request's body is a fallback addressed to clients.
 	edit := &event.MessageEventContent{MsgType: event.MsgText, Body: "* !roll"}
 	edit.SetEdit("$m0")
-	for name, c := range map[string]*event.MessageEventContent{"an edit": edit, "a redacted message": {}} {
+	verify := &event.MessageEventContent{MsgType: event.MsgVerificationRequest,
+		Body: "@alice:example.org is requesting to verify your key, but your client does not support in-chat key verification."}
+	for name, c := range map[string]*event.MessageEventContent{"an edit": edit, "a redacted message": {}, "a verification request": verify} {
 		if _, ok := readMessage(message(c)); ok {
 			t.Errorf("%s was read as a message", name)
 		}

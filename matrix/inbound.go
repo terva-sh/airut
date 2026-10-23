@@ -92,9 +92,13 @@ func (s *session) parse(evt *event.Event) (inbound, bool) {
 	return in, true
 }
 
+// readMessage reads a message the bot may act on. Edits, redacted
+// messages, and in-room verification requests are not: a request's body
+// is a fallback telling clients without in-room verification to use
+// another kind, and a handler or an agent turn would answer it as chat.
 func readMessage(evt *event.Event) (inbound, bool) {
 	c := evt.Content.AsMessage()
-	if c == nil || c.MsgType == "" || c.RelatesTo.GetReplaceID() != "" {
+	if c == nil || c.MsgType == "" || c.MsgType == event.MsgVerificationRequest || c.RelatesTo.GetReplaceID() != "" {
 		return inbound{}, false
 	}
 	in := inbound{
