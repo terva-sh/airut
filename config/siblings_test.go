@@ -98,3 +98,18 @@ func TestSealSiblingSecrets(t *testing.T) {
 		t.Error("CheckSealKey accepted matrix.siblings.room")
 	}
 }
+
+// verify_in_chat is off unless the file turns it on.
+func TestVerifyInChat(t *testing.T) {
+	c, err := load(t, siblingsBase)
+	if err != nil || c.Matrix.VerifyInChat {
+		t.Fatalf("without the key: %v, %v", c.Matrix.VerifyInChat, err)
+	}
+	c, err = load(t, siblingsBase+"verify_in_chat = true\n")
+	if err != nil || !c.Matrix.VerifyInChat {
+		t.Fatalf("with the key: %v, %v", c.Matrix.VerifyInChat, err)
+	}
+	if _, err := load(t, siblingsBase+"verify_in_chat = \"yes\"\n"); err == nil {
+		t.Error("a string was taken for verify_in_chat")
+	}
+}

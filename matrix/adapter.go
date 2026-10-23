@@ -73,6 +73,18 @@ type Options struct {
 	ReplyDepth int
 	// Logger receives the adapter's logs. Nil means the Host's.
 	Logger *slog.Logger
+	// Owners lists the bot's owners on Matrix, as user ids, for
+	// in-chat verification, which [matrix] verify_in_chat turns on. Run
+	// reads it once before the first sync, and only those owners'
+	// requests reach the bot, so an owner claimed later is admitted
+	// after a restart. Each request is checked against it again, so an
+	// owner removed meanwhile is refused. With verify_in_chat on and
+	// Owners nil, Run refuses to start. airut.Bot.Owners gives it:
+	//
+	//	Owners: func(ctx context.Context) ([]string, error) { return b.Owners(ctx, airut.Matrix) },
+	//
+	// It must be safe for concurrent use.
+	Owners func(ctx context.Context) ([]string, error)
 }
 
 // Invite is an invitation to a room, for Options.AcceptInvite and
@@ -123,6 +135,9 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 	if a.opts.AcceptInvite != nil && a.opts.CheckInvite != nil {
 		return errBothInviteChecks
 	}
+	if a.cfg.VerifyInChat && a.opts.Owners == nil {
+		return errNoOwnersFunc
+	}
 	log := a.opts.Logger
 	if log == nil {
 		log = h.Logger()
@@ -139,6 +154,13 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 		return err
 	}
 	checkCrossSigning(ctx, c, a.cfg.RecoveryKey, log)
+	// rihma takes the verification options only before the first sync.
+	ctl, err := enableChatVerify(ctx, a.cfg.VerifyInChat, a.opts.Owners, c.UserID,
+		func(o rihma.SASOptions) (sasControl, error) { return c.EnableSASWith(o) }, log)
+	if err != nil {
+		c.Close()
+		return err
+	}
 	a.mu.Lock()
 	a.client = c
 	a.mu.Unlock()
@@ -155,8 +177,15 @@ func (a *Adapter) Run(ctx context.Context, h airut.Host) error {
 	if dn, err := c.GetOwnDisplayName(ctx); err == nil {
 		s.me.display = dn.DisplayName
 	}
+	if ctl != nil {
+		s.verify = s.chatVerify(ctl)
+		s.spawn(func() { s.verify.watch(s.ctx) })
+	}
 	s.register()
 	err = c.Sync(ctx)
+	if s.verify != nil {
+		s.verify.shutdown()
+	}
 	s.stop()
 	c.Close()
 	if ctx.Err() != nil {
@@ -229,6 +258,9 @@ type session struct {
 	bundles bundles
 	// sib runs sibling cross-signing, or is nil without [matrix.siblings].
 	sib *siblings
+	// verify runs in-chat verification, or is nil without
+	// [matrix] verify_in_chat.
+	verify *chatVerify
 
 	mu      sync.Mutex
 	stopped bool
@@ -339,6 +371,11 @@ func (s *session) onMessage(ctx context.Context, evt *event.Event) {
 		// message there is a command or reaches the bot's handlers.
 		raw := evt.Content.VeryRaw
 		s.spawn(func() { s.sib.handle(s.ctx, evt.Sender, raw) })
+		return
+	}
+	if s.verify != nil && s.verify.answer(evt) {
+		// The owner's yes or no to the emoji, which is the verification's
+		// alone: no command, handler, or agent sees it.
 		return
 	}
 	in, ok := s.parse(evt)

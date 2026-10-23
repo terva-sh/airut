@@ -458,3 +458,26 @@ func TestIsOwnerRefusesWhenTheClaimsWereNeverRead(t *testing.T) {
 	clock.advance(time.Minute)
 	isOwnerAgrees(t, b, a, claimed, true)
 }
+
+// Owners lists one platform's owners from the config and the claims,
+// each once and sorted, for a Matrix adapter that admits them to
+// verify the bot from chat.
+func TestOwnersListsConfiguredAndClaimed(t *testing.T) {
+	ag := &claimsAgent{claims: []airut.Claim{
+		{Platform: airut.Matrix, ID: "@claimed:example.org", At: time.Unix(1, 0)},
+		{Platform: airut.Matrix, ID: "@listed:example.org", At: time.Unix(2, 0)},
+		{Platform: airut.Discord, ID: "123", At: time.Unix(3, 0)},
+	}}
+	b := airut.New(airut.Config{
+		Agent:  ag,
+		Owners: map[airut.Platform][]string{airut.Matrix: {"@listed:example.org", "@another:example.org"}, airut.Discord: {"456"}},
+	})
+	got, err := b.Owners(context.Background(), airut.Matrix)
+	want := []string{"@another:example.org", "@claimed:example.org", "@listed:example.org"}
+	if err != nil || strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("Owners(matrix) = %v, %v; want %v", got, err, want)
+	}
+	if got, _ := b.Owners(context.Background(), airut.Platform("irc")); len(got) != 0 {
+		t.Errorf("Owners(irc) = %v", got)
+	}
+}

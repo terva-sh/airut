@@ -35,6 +35,26 @@ func (b *Bot) IsOwner(ctx context.Context, u User) (bool, error) {
 	return b.owners.is(ctx, u)
 }
 
+// Owners lists the ids of the bot's owners on platform p, those
+// Config.Owners lists and those claimed with airut claim, each once and
+// sorted. It reads the claims as IsOwner does, so a claim made within
+// the last minute may be missing, and a claims read that fails keeps the
+// claims last read. A Matrix adapter that lets owners verify the bot
+// from chat lists them through it.
+func (b *Bot) Owners(ctx context.Context, p Platform) ([]string, error) {
+	all, err := b.owners.all(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range all {
+		if e.Platform == p && !slices.Contains(out, e.ID) {
+			out = append(out, e.ID)
+		}
+	}
+	return out, nil
+}
+
 // HasOwner reports whether the bot has an owner on platform p, from
 // Config.Owners or a claim.
 func (b *Bot) HasOwner(ctx context.Context, p Platform) (bool, error) {

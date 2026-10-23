@@ -343,8 +343,41 @@ encrypted history it could read before.
     the emoji did not match, the request was cancelled or timed out, or
     the owner's identity changed during the exchange. `Verify` logs
     nothing.
-  - An in-chat option, which trusts the homeserver and is off by
-    default, waits on incoming and in-room SAS in rihma.
+  - In-chat verification, `[matrix] verify_in_chat`, is the running
+    bot's counterpart, and off by default because it trusts the
+    homeserver, for the reason above. With it on, Run reads the owners
+    from `Options.Owners` (`airut.Bot.Owners`) before the first sync. It
+    skips the bot itself and any malformed id, and enables rihma's SAS
+    controller with them as peers, in-room. rihma fixes peers before the
+    first sync, so an owner claimed later is admitted after a restart.
+    With it off, the adapter enables no SAS controller at all.
+    - One goroutine reads the controller's snapshots, and each request
+      runs on a goroutine of its own. The bot cancels a request from
+      its own account, from a user `Options.Owners` no longer lists, or
+      from outside a direct room with the owner as `isDirect` defines it.
+      A to-device request is outside one. Outside the direct room it
+      posts a fixed note there, never in a shared room. rihma admits one
+      attempt at a time, and a newer request ends the old one's
+      goroutine.
+    - The bot accepts, and posts the emoji in the direct room, with a
+      line saying the check trusts the homeserver and `-verify` is
+      stronger. It confirms only on the owner's reply there: an
+      encrypted text message from that owner, in that room, while the
+      emoji are shown, whose body is yes, y, no, or n. `onMessage`
+      hands such a reply to the verification before parsing, so no
+      command, handler, or agent sees it. Only the first reply is
+      taken: the check and the claim happen in one locked step, so
+      racing replies cannot confirm twice. Any other message passes
+      through, a later yes or no among them. After ten minutes the bot
+      cancels.
+    - The room's privacy is checked again before each post into it,
+      the emoji included, and before Confirm. If someone has joined, or
+      the join rule has changed, the bot cancels and posts nothing in
+      that room.
+    - The outcome is posted as fixed text: the signed master key in
+      groups of four, or one text for each of rihma's fixed reasons,
+      never a reason from the server. Logs carry the room, user,
+      transaction, and outcome, never the emoji or message text.
 - **Sibling cross-signing.** Bots of one owner, each listing the others
   in `[matrix.siblings]`, sign each other's master keys with their
   user-signing keys, so each trusts the others' devices without a

@@ -267,7 +267,10 @@ func adapters(cfg *config.Config, log *slog.Logger, b *airut.Bot) []airut.Adapte
 		as = append(as, discord.New(cfg.Discord, discord.Options{Logger: log, ReplyDepth: cfg.Bot.ReplyDepth}))
 	}
 	if cfg.Matrix != nil {
-		as = append(as, matrix.New(cfg.Matrix, matrix.Options{Logger: log, CheckInvite: inviters(cfg, b), ReplyDepth: cfg.Bot.ReplyDepth}))
+		// Owners lets [matrix] verify_in_chat, when it is on, admit the
+		// owners' verification requests; it is read only then.
+		owners := func(ctx context.Context) ([]string, error) { return b.Owners(ctx, airut.Matrix) }
+		as = append(as, matrix.New(cfg.Matrix, matrix.Options{Logger: log, CheckInvite: inviters(cfg, b), ReplyDepth: cfg.Bot.ReplyDepth, Owners: owners}))
 	}
 	return as
 }

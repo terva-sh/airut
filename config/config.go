@@ -233,6 +233,13 @@ type Matrix struct {
 	RecoveryKey Secret
 	// Siblings is the [matrix.siblings] table, or nil without one.
 	Siblings *Siblings
+	// VerifyInChat, verify_in_chat in the file, lets the bot's owners
+	// verify the running bot from Element: the bot answers their
+	// request in their direct chat with it, posts the emoji there, and
+	// confirms when the owner replies yes. It is off by default because
+	// it trusts the homeserver, which could rewrite the chat as well as
+	// forge the exchange. The terminal flow, matrix.Verify, does not.
+	VerifyInChat bool
 }
 
 // MinFleetSecret is the fewest bytes a fleet secret may have. Every
@@ -395,13 +402,14 @@ type fileMetrics struct {
 }
 
 type fileMatrix struct {
-	Homeserver  string        `toml:"homeserver"`
-	UserID      string        `toml:"user_id"`
-	Password    any           `toml:"password"`
-	StateDir    string        `toml:"state_dir"`
-	DeviceName  string        `toml:"device_name"`
-	RecoveryKey any           `toml:"recovery_key"`
-	Siblings    *fileSiblings `toml:"siblings"`
+	Homeserver   string        `toml:"homeserver"`
+	UserID       string        `toml:"user_id"`
+	Password     any           `toml:"password"`
+	StateDir     string        `toml:"state_dir"`
+	DeviceName   string        `toml:"device_name"`
+	RecoveryKey  any           `toml:"recovery_key"`
+	Siblings     *fileSiblings `toml:"siblings"`
+	VerifyInChat bool          `toml:"verify_in_chat"`
 }
 
 type fileSiblings struct {
@@ -775,7 +783,7 @@ func buildStore(p *problems, f *fileStore, dir string) Store {
 }
 
 func buildMatrix(p *problems, f *fileMatrix, src *secretSource) *Matrix {
-	m := &Matrix{Homeserver: f.Homeserver, UserID: f.UserID, StateDir: f.StateDir, DeviceName: f.DeviceName}
+	m := &Matrix{Homeserver: f.Homeserver, UserID: f.UserID, StateDir: f.StateDir, DeviceName: f.DeviceName, VerifyInChat: f.VerifyInChat}
 	checkURL(p, "matrix.homeserver", f.Homeserver)
 	if !validMXID(f.UserID) {
 		p.add("matrix.user_id", "required: the bot's Matrix user id, such as @bot:example.org")

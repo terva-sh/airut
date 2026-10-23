@@ -198,6 +198,43 @@ signed, and Element shows the bot as verified. If Element never shows the
 request, the verification ends after ten minutes. The likely cause is
 the direct chat: check that it is encrypted and that you are in it.
 
+### Verify from chat instead (off by default)
+
+**This option trusts your homeserver.** The bot shows the emoji in your
+direct chat with it, before it has verified any of your devices. A
+homeserver that forges the key exchange can also add a device to your
+account and rewrite that chat, so the emoji it shows would match the
+forgery. Turn it on only for a bot whose homeserver you run and trust.
+Otherwise use `-verify` on the host, as above, which a homeserver cannot
+fool this way.
+
+It needs what the terminal flow needs: a cross-signed device, and an
+encrypted direct chat between you and the bot. The bot answers only its
+owners, from `[bot] owners` or a claim, and only in that direct chat.
+It reads the owners when it starts, so an owner claimed later can verify
+after the bot restarts.
+
+1. Add `verify_in_chat = true` to the `[matrix]` table, above any
+   `[matrix.siblings]` table, and restart the bot.
+2. In Element, open the direct chat with the bot, open the bot's profile,
+   and choose **Verify**. Choose to compare emoji.
+3. The bot posts seven emoji with their names in the chat. Compare them
+   with the ones Element shows, in order.
+4. If they are the same, reply `yes` in the chat, and confirm in Element.
+   If they differ, reply `no`, and cancel in Element. Nothing is signed,
+   and someone may be interfering with the exchange.
+
+The bot answers `yes`, `y`, `no`, or `n`, in any case, and takes only
+your first reply in that chat. That reply goes to the verification and
+to nothing else in the bot. Any other message, a later yes or no among
+them, reaches the bot as usual. If the chat stops being private to you
+and the bot before you answer, because someone joins or its join rule
+changes, the bot cancels and posts nothing more there. On
+success the bot posts your master key, which it has now signed. Without
+an answer the verification is cancelled after ten minutes. A request
+from anyone but an owner, or from outside your direct chat, is
+cancelled. The bot never confirms by itself.
+
 ## Cross-sign sibling bots
 
 Bots of one owner can sign each other's Matrix identities, so each trusts

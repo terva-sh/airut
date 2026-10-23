@@ -12,7 +12,7 @@ require (
 	golang.org/x/term v0.46.0
 	maunium.net/go/mautrix v0.31.0
 	modernc.org/sqlite v1.60.1
-	terva.sh/rihma v0.1.11
+	terva.sh/rihma v0.1.12
 	terva.sh/seal v0.1.0
 	terva.sh/terva v0.141.5
 )

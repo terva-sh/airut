@@ -247,6 +247,14 @@ device_name = "airut sample"
 # never rests on the host. Guard it like the password: it can sign any
 # device as the bot's.
 # recovery_key = { credential = "matrix-recovery-key" }
+# Optional, and off by default. Lets an owner verify the running bot
+# from Element: the bot posts the emoji in the owner's encrypted direct
+# chat with it, and confirms when the owner replies yes there. This
+# trusts the homeserver, which could forge the exchange and rewrite the
+# chat to match, so turn it on only for a homeserver you run and trust,
+# and otherwise verify with -verify on the host. Owners claimed after
+# the bot starts can use it once the bot restarts.
+# verify_in_chat = true
 
 # Optional. Sibling bots: other airut bots of the same owner, which sign
 # each other's cross-signing identities once each proves, with a fleet
