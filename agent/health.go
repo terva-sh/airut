@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,9 +27,9 @@ const (
 	// DefaultBreakerCoolOff is how long an open breaker skips its model
 	// before it lets one request through to try it again.
 	DefaultBreakerCoolOff = 30 * time.Second
-	// DefaultNotLoadedFor is how long a llama-swap answer that made a
-	// model unavailable is kept. An answer that made it available is
-	// never kept.
+	// DefaultNotLoadedFor is retained for source compatibility. Negative
+	// observations are no longer cached.
+	// Deprecated: fresh selection ignores NotLoadedFor.
 	DefaultNotLoadedFor = 30 * time.Second
 	// DefaultRunningTimeout bounds one request to a llama-swap
 	// provider's /running.
@@ -41,16 +42,28 @@ var ErrNoModel = errors.New("agent: no model of the chain is available")
 
 // HealthOptions configure NewHealth.
 type HealthOptions struct {
-	// Providers are the configured providers. A llama-swap provider's
-	// models are available as its /running list and load policy say. A
-	// provider not listed here, or of any other kind, is always
-	// available.
+	// Discovery supplies application-owned routing and residency. Nil uses
+	// llama-swap discovery and treats other providers as unmanaged/available.
+	Discovery Discovery
+	// DiscoveryProviders scopes Discovery to these provider IDs. Empty means
+	// all providers. Others retain native llama-swap/unmanaged discovery.
+	DiscoveryProviders []string
+	// BackendLoads explicitly permits cold loads on application backend IDs.
+	// Unlisted backends default to never. Provider load=never always wins.
+	BackendLoads map[string]string
+	// DiscoveryTimeout bounds each complete lookup; default 3s, maximum 30s.
+	DiscoveryTimeout time.Duration
+	// HTTPClients are pooled clients by provider, shared with inference where
+	// routing and authentication match. HTTP is the fallback.
+	HTTPClients map[string]*http.Client
+	// Providers supplies native llama-swap discovery and load restrictions.
+	// Without an application adapter, other providers remain unmanaged.
 	Providers []config.Provider
-	// HTTP is the client for /running. Nil means one that gives up after
-	// DefaultRunningTimeout.
+	// HTTP is the fallback pooled client for /running. DiscoveryTimeout
+	// bounds each lookup even when a supplied client has no timeout.
 	HTTP *http.Client
-	// Failures and CoolOff tune the breakers, and NotLoadedFor the
-	// llama-swap cache. Zero takes the Default constants.
+	// Failures and CoolOff tune the breakers. Zero takes the defaults.
+	// Deprecated: NotLoadedFor is ignored; every observation is fresh.
 	Failures     int
 	CoolOff      time.Duration
 	NotLoadedFor time.Duration
@@ -69,30 +82,23 @@ type HealthOptions struct {
 // variant of the model. An Agent and a Judge may share one, so that a
 // failure one sees the other skips. It is safe for concurrent use.
 type Health struct {
-	providers    map[string]config.Provider
-	http         *http.Client
-	failures     int
-	coolOff      time.Duration
-	notLoadedFor time.Duration
-	now          func() time.Time
-	log          *slog.Logger
+	discoveryProviders map[string]bool
+	discovery          Discovery
+	backendLoads       map[string]string
+	discoveryTimeout   time.Duration
+	httpClients        map[string]*http.Client
+	providers          map[string]config.Provider
+	http               *http.Client
+	failures           int
+	coolOff            time.Duration
+	now                func() time.Time
+	log                *slog.Logger
 
-	mu sync.Mutex
-	// absent is each llama-swap provider's last answer that made a model
-	// unavailable, by provider id.
-	absent   map[string]runningAnswer
+	mu       sync.Mutex
 	breakers map[servedModel]*breaker
 }
 
 type servedModel struct{ provider, served string }
-
-// runningAnswer is one answer from /running: the models it listed, or
-// that it could not be read.
-type runningAnswer struct {
-	at          time.Time
-	running     []string
-	unreachable bool
-}
 
 // breaker is one served model's circuit breaker. It is closed while
 // openedAt is zero, open until the cool-off has passed, and half-open
@@ -107,24 +113,40 @@ type breaker struct {
 func NewHealth(o HealthOptions) *Health {
 	h := &Health{
 		providers: map[string]config.Provider{}, http: o.HTTP,
-		failures: o.Failures, coolOff: o.CoolOff, notLoadedFor: o.NotLoadedFor,
+		discovery: o.Discovery, discoveryProviders: map[string]bool{}, backendLoads: map[string]string{}, discoveryTimeout: discoveryDeadline(o.DiscoveryTimeout), httpClients: map[string]*http.Client{},
+		failures: o.Failures, coolOff: o.CoolOff,
 		now: o.Now, log: o.Logger,
-		absent: map[string]runningAnswer{}, breakers: map[servedModel]*breaker{},
+		breakers: map[servedModel]*breaker{},
+	}
+	for _, id := range o.DiscoveryProviders {
+		h.discoveryProviders[id] = true
+	}
+	for k, v := range o.BackendLoads {
+		h.backendLoads[k] = v
+	}
+	for k, v := range o.HTTPClients {
+		h.httpClients[k] = v
 	}
 	for _, p := range o.Providers {
 		h.providers[p.ID] = p
 	}
 	if h.http == nil {
-		h.http = &http.Client{Timeout: DefaultRunningTimeout}
+		h.http = providerHTTP()
+	}
+	for _, p := range o.Providers {
+		if h.httpClients[p.ID] == nil {
+			if o.HTTP != nil {
+				h.httpClients[p.ID] = o.HTTP
+			} else {
+				h.httpClients[p.ID] = providerHTTP()
+			}
+		}
 	}
 	if h.failures <= 0 {
 		h.failures = DefaultBreakerFailures
 	}
 	if h.coolOff <= 0 {
 		h.coolOff = DefaultBreakerCoolOff
-	}
-	if h.notLoadedFor <= 0 {
-		h.notLoadedFor = DefaultNotLoadedFor
 	}
 	if h.now == nil {
 		h.now = time.Now
@@ -170,33 +192,36 @@ func fallsThrough(class string) bool {
 // request now, or "" when it can. A half-open breaker lets this caller's
 // request through as its probe, which done ends.
 func (h *Health) usable(ctx context.Context, providerID, served string) string {
-	key := servedModel{providerID, served}
-	// shut reports whether the breaker refuses a request now: open and
-	// cooling off, or open with its one probe already out. h.mu is held.
-	shut := func() bool {
-		b := h.breakers[key]
-		return b != nil && !b.openedAt.IsZero() && (b.probing || h.now().Sub(b.openedAt) < h.coolOff)
-	}
-	h.mu.Lock()
-	if shut() {
-		h.mu.Unlock()
+	k := ModelKey{providerID, served}
+	if !h.breakerAllows(k, false) {
 		return reasonBreakerOpen
 	}
-	h.mu.Unlock()
 	if !h.available(ctx, providerID, served) {
+		if !h.breakerAllows(k, false) {
+			return reasonBreakerOpen
+		}
 		return reasonUnavailable
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	// The breaker may have opened, or its probe been taken, while
-	// /running was asked, so admit by the same rule again.
-	if shut() {
+	if !h.breakerAllows(k, true) {
 		return reasonBreakerOpen
 	}
-	if b := h.breakers[key]; b != nil && !b.openedAt.IsZero() {
+	return ""
+}
+
+func (h *Health) breakerAllows(k ModelKey, reserve bool) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	b := h.breakers[servedModel{k.Provider, k.Served}]
+	if b == nil || b.openedAt.IsZero() {
+		return true
+	}
+	if b.probing || h.now().Sub(b.openedAt) < h.coolOff {
+		return false
+	}
+	if reserve {
 		b.probing = true
 	}
-	return ""
+	return true
 }
 
 // done records how a request to served on providerID ended, by its
@@ -235,32 +260,29 @@ func (h *Health) done(providerID, served, class string) {
 
 // available reports whether providerID says it can serve served now.
 func (h *Health) available(ctx context.Context, providerID, served string) bool {
-	p, ok := h.providers[providerID]
-	if !ok || p.Kind != config.KindLlamaSwap {
-		return true
-	}
-	h.mu.Lock()
-	cached, have := h.absent[providerID]
-	h.mu.Unlock()
-	if have && h.now().Sub(cached.at) < h.notLoadedFor {
-		// A kept answer only ever says no: one that would now say yes, as
-		// for a model with another policy, is asked again.
-		if ok, kind := decide(p.Load, served, cached); !ok {
-			h.log.Debug("model availability", "provider", providerID, "served", served, "decision", kind, "cached", true)
-			return false
+	k := ModelKey{providerID, served}
+	s := h.snapshot(ctx, []ModelKey{k})
+	ok := ctx.Err() == nil && h.choose(s, []ModelKey{k}, []bool{false}) == 0
+	kind := decisionUnreachable
+	if ready(s, k) {
+		kind = decisionLoaded
+	} else if routes := s.Routes[k]; len(routes) > 0 {
+		b := s.Backends[routes[0].Backend]
+		if b.Models[routes[0].Served] == StateUnloaded {
+			kind = decisionNotLoaded
+			p := h.providers[providerID]
+			if p.Load == config.LoadWhenIdle {
+				kind = decisionBusyOtherModel
+				if ok {
+					kind = decisionLoadingWhenIdle
+				}
+			}
+			if ok && p.Load == config.LoadAlways {
+				kind = decisionLoadingAlways
+			}
 		}
 	}
-	answer := runningAnswer{at: h.now()}
-	answer.running, answer.unreachable = h.running(ctx, p.RunningURL())
-	ok, kind := decide(p.Load, served, answer)
-	h.log.Debug("model availability", "provider", providerID, "served", served, "decision", kind, "cached", false)
-	h.mu.Lock()
-	if ok {
-		delete(h.absent, providerID)
-	} else {
-		h.absent[providerID] = answer
-	}
-	h.mu.Unlock()
+	h.log.Debug("model availability", "provider", providerID, "served", served, "decision", kind, "best_effort", true)
 	return ok
 }
 
@@ -274,71 +296,115 @@ const (
 	decisionUnreachable     = "unreachable"
 )
 
-// decide applies a load policy to one answer from /running.
-func decide(load, served string, a runningAnswer) (bool, string) {
-	switch {
-	case a.unreachable:
-		return false, decisionUnreachable
-	case containsString(a.running, served):
-		return true, decisionLoaded
-	case load == config.LoadAlways:
-		return true, decisionLoadingAlways
-	case load == config.LoadWhenIdle && len(a.running) == 0:
-		return true, decisionLoadingWhenIdle
-	case load == config.LoadWhenIdle:
-		return false, decisionBusyOtherModel
-	}
-	return false, decisionNotLoaded
-}
-
-func containsString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
-
-// running reads llama-swap's /running: the served ids it lists, or that
-// it could not be read. An answer that is not a JSON object whose
-// "running" is an array, as {}, null, or {"running":null}, could not be
-// read, and is logged as unreachable.
-func (h *Health) running(ctx context.Context, url string) ([]string, bool) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// runningState reads an entire bounded llama-swap inventory. A missing,
+// malformed or non-ready process state never establishes ready or idle.
+func (h *Health) runningState(ctx context.Context, p config.Provider) BackendState {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.RunningURL(), nil)
 	if err != nil {
-		return nil, true
+		return BackendState{}
 	}
-	resp, err := h.http.Do(req)
+	req.Header.Set("Cache-Control", "no-cache, no-store")
+	client := h.httpClients[p.ID]
+	if client == nil {
+		client = h.http
+	}
+	// Discovery never follows redirects, including on a supplied client.
+	copyClient := *client
+	copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := copyClient.Do(req)
 	if err != nil {
-		return nil, true
+		return BackendState{}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, true
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(data) > 1<<20 || resp.StatusCode/100 != 2 {
+		return BackendState{}
 	}
-	// Running is a pointer so that a body without the list, or with null
-	// for it, is told apart from an empty list: read as idle, it would let
-	// when_idle load a model over whatever is running.
 	var out struct {
 		Running *[]struct {
 			Model string `json:"model"`
+			State string `json:"state"`
 		} `json:"running"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil || out.Running == nil {
-		return nil, true
+	if json.Unmarshal(data, &out) != nil || out.Running == nil || duplicateFields(data) {
+		return BackendState{}
 	}
-	ids := make([]string, 0, len(*out.Running))
+	b := BackendState{Models: map[string]ModelState{}, Idle: len(*out.Running) == 0}
 	for _, m := range *out.Running {
-		ids = append(ids, m.Model)
+		if m.Model == "" {
+			return BackendState{}
+		}
+		if _, exists := b.Models[m.Model]; exists {
+			return BackendState{}
+		}
+		state := StateUnknown
+		switch m.State {
+		case "ready":
+			state = StateReady
+		case "starting":
+			state = StateLoading
+		}
+		b.Models[m.Model] = state
 	}
-	return ids, false
+	return b
+}
+
+// Reject duplicate keys (including case aliases accepted by encoding/json),
+// trailing values and deeply nested JSON instead of accepting a last-key win.
+func duplicateFields(data []byte) bool {
+	d := json.NewDecoder(bytes.NewReader(data))
+	var value func(int) bool
+	value = func(depth int) bool {
+		if depth > 32 {
+			return false
+		}
+		t, err := d.Token()
+		if err != nil {
+			return false
+		}
+		delim, ok := t.(json.Delim)
+		if !ok {
+			return true
+		}
+		if delim != '{' && delim != '[' {
+			return false
+		}
+		seen := map[string]bool{}
+		for d.More() {
+			if delim == '{' {
+				key, err := d.Token()
+				if err != nil {
+					return false
+				}
+				k, ok := key.(string)
+				if !ok {
+					return false
+				}
+				k = strings.ToLower(k)
+				if seen[k] {
+					return false
+				}
+				seen[k] = true
+			}
+			if !value(depth + 1) {
+				return false
+			}
+		}
+		_, err = d.Token()
+		return err == nil
+	}
+	if !value(0) {
+		return true
+	}
+	_, err := d.Token()
+	return err != io.EOF
 }
 
 // classify names the class of a failed model request. parent is the
 // caller's context: a request it ended was canceled, while one that ran
 // out its own time timed out.
 func classify(parent context.Context, err error) string {
+	var physical *physicalFailure
 	var se *statusError
 	var pe *provider.ProviderError
 	var ne net.Error
@@ -347,6 +413,8 @@ func classify(parent context.Context, err error) string {
 		return ""
 	case parent.Err() != nil:
 		return classCanceled
+	case errors.As(err, &physical):
+		return physical.class
 	case errors.As(err, &se):
 		return statusClass(se.code, se.notFound)
 	case errors.As(err, &pe) && pe.Status != 0:

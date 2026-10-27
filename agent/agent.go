@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -21,17 +22,24 @@ import (
 
 // Options configure New.
 type Options struct {
+	resolvedModels bool
+	// ClientFor optionally constructs a client once per candidate, before any
+	// request, using that candidate's effective catalog. Use it when clients
+	// read capabilities internally; instances must share long-lived HTTP pools.
+	// Nil uses Clients, whose implementations must honor request limits.
+	ClientFor func(config.ChainEntry, provider.ModelCatalog) provider.Client
+	// HTTPClients supplies pooled clients to Open, shared with discovery and
+	// OpenJudge when given the same map. New uses Clients/ClientFor instead.
+	HTTPClients map[string]*http.Client
 	// Clients are the model clients by provider id, and Catalog holds the
 	// models they serve, as Providers builds them.
 	Clients map[string]provider.Client
 	Catalog provider.ModelCatalog
-	// Models is the chain of models a turn walks, as config.Load resolves
-	// one. A turn starts on the first entry Health finds usable, and
-	// falls through to the next usable one when its first request fails
-	// before anything streamed, by a connect error, a 5xx, a 429, a
-	// timeout, or a missing model. Each entry runs under its served id,
-	// with its MaxOutput, Temperature, and Timeout. Empty means Model
-	// alone.
+	// Models lists acceptable candidates in tie-breaking order. Every physical
+	// attempt prefers a ready candidate across the whole list before a cold
+	// load is considered. Tool follow-ups and retries reselect independently;
+	// an already-streaming response stays on its selected model. Empty means
+	// Model alone. Each attempt uses the selected entry's own metadata.
 	Models config.Chain
 	// Model is the model every turn uses when Models is empty.
 	Model config.ModelRef
@@ -72,11 +80,13 @@ type Options struct {
 // Agent runs airut's agent turns on terva's engine. It implements
 // airut.Agent and airut.SessionPrefixForgetter.
 type Agent struct {
-	clients  map[string]provider.Client
-	catalog  provider.ModelCatalog
-	chain    config.Chain
-	health   *Health
-	personas map[string]string
+	clients      map[string]provider.Client
+	entryClients []provider.Client
+	entryModels  []provider.Model
+	catalog      provider.ModelCatalog
+	chain        config.Chain
+	health       *Health
+	personas     map[string]string
 	// character opens every turn's system prompt.
 	character string
 	notices   Notices
@@ -111,6 +121,8 @@ func New(o Options) (*Agent, error) {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
 	clients := map[string]provider.Client{}
+	entryClients := make([]provider.Client, len(chain))
+	entryModels := make([]provider.Model, len(chain))
 	for i := range chain {
 		e := &chain[i]
 		if e.Served == "" {
@@ -125,6 +137,19 @@ func New(o Options) (*Agent, error) {
 		m, err := o.Catalog.FindModel(e.Provider, e.Served)
 		if err != nil {
 			return nil, fmt.Errorf("agent: model %s: %w", ref, err)
+		}
+		if o.resolvedModels {
+			m = catalogModel(e.Provider, e.Served, e.Capabilities)
+		} else {
+			m = effectiveModel(m, *e)
+		}
+		entryModels[i] = m
+		entryClients[i] = client
+		if o.ClientFor != nil {
+			entryClients[i] = o.ClientFor(*e, selectedCatalog{o.Catalog, m})
+			if entryClients[i] == nil {
+				return nil, errors.New("agent: ClientFor returned nil")
+			}
 		}
 		if e.MaxOutput == 0 && m.MaxOutput == 0 {
 			// No max_tokens is sent, so the server's own default caps
@@ -160,7 +185,7 @@ func New(o Options) (*Agent, error) {
 		personas[k] = v
 	}
 	return &Agent{
-		clients: clients, catalog: o.Catalog, chain: chain, health: o.Health, personas: personas, character: o.Character,
+		clients: clients, entryClients: entryClients, entryModels: entryModels, catalog: o.Catalog, chain: chain, health: o.Health, personas: personas, character: o.Character,
 		db: o.Sessions, history: o.History, caps: caps, now: o.Now, log: o.Logger, notices: o.Notices.withDefaults(),
 	}, nil
 }
@@ -178,8 +203,12 @@ func WithNotices(n Notices) OpenOption {
 	return func(o *Options) { o.Notices = n }
 }
 
-// WithHealth sets Options.Health, so that the agent shares h with a judge
-// and each skips a model the other saw fail.
+// WithHTTPClients shares per-provider pools when using Open.
+func WithHTTPClients(clients map[string]*http.Client) OpenOption {
+	return func(o *Options) { o.HTTPClients = clients }
+}
+
+// WithHealth shares discovery and breakers with a judge.
 func WithHealth(h *Health) OpenOption {
 	return func(o *Options) { o.Health = h }
 }
@@ -196,7 +225,9 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 	if err != nil {
 		return nil, err
 	}
+	var pools map[string]*http.Client
 	clients, catalog := Providers(c)
+	defaultHealth := NewHealth(HealthOptions{Providers: c.Providers, Logger: log})
 	// Each entry is described to the engine as the entry describes it.
 	// The last registered wins, so where entries share a served model,
 	// the earliest describes it.
@@ -204,8 +235,12 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 		catalog.RegisterExtraModel(catalogModel(e.Provider, e.Served, e.Capabilities))
 	}
 	o := Options{
-		Clients: clients, Catalog: catalog, Models: c.Agent.Models, Model: c.Agent.Model,
-		Health:   NewHealth(HealthOptions{Providers: c.Providers, Logger: log}),
+		Clients: clients, Catalog: catalog, Models: c.Agent.Models, Model: c.Agent.Model, resolvedModels: true,
+		ClientFor: func(e config.ChainEntry, cat provider.ModelCatalog) provider.Client {
+			p, _ := c.Provider(e.Provider)
+			return provider.WithCatalog(guardedProvider(provider.NewOpenAICompatibleAs(p.ID, p.APIKey.Value(), p.BaseURL), pools[p.ID]), cat)
+		},
+		Health:   defaultHealth,
 		Personas: personas, Sessions: db, Logger: log,
 		MemoryCaps: MemoryCaps{User: c.Agent.Memory.MaxUser, Channel: c.Agent.Memory.MaxChannel, Bot: c.Agent.Memory.MaxBot},
 		History: airut.History{
@@ -219,6 +254,16 @@ func Open(ctx context.Context, c *config.Config, personas map[string]string, log
 	}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	pools = map[string]*http.Client{}
+	for _, p := range c.Providers {
+		pools[p.ID] = o.HTTPClients[p.ID]
+		if pools[p.ID] == nil {
+			pools[p.ID] = providerHTTP()
+		}
+	}
+	if o.Health == defaultHealth {
+		o.Health = NewHealth(HealthOptions{Providers: c.Providers, Logger: log, HTTPClients: pools})
 	}
 	a, err := New(o)
 	if err != nil {
@@ -314,7 +359,6 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	began := time.Now()
 	tm := &timing{c: c, log: a.log}
 	tm.on(a.chain[0], 0)
-	tc := &turnClient{c: c, health: a.health, chain: a.chain, clients: a.clients, tm: tm}
 	maxSide := t.ImageMaxSide
 	switch {
 	case maxSide < 0:
@@ -335,19 +379,7 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		return fmt.Errorf("agent: the turn's History: %w", err)
 	}
 	budget := &budget{turns: t.Budget.Turns, tokens: t.Budget.Tokens}
-	if !tc.start(ctx) {
-		a.finished(c, tm, began, 0, budget, "", ErrNoModel)
-		return ErrNoModel
-	}
-	first := a.chain[tc.cur]
-	defer tc.finish()
-	opts := []core.Option{
-		core.WithGate(gate{c: c}),
-		core.WithTools(tools),
-		core.WithCatalog(a.catalog),
-		core.WithProvider(first.Provider),
-		core.WithComponent(budget),
-	}
+	opts := []core.Option{core.WithGate(gate{c: c}), core.WithTools(tools), core.WithRetries(0, 0), core.WithComponent(oneStep{})}
 	h := history(t.History, a.history)
 	stable, volatile := a.memories(c, t.Prompt)
 	opts = append(opts, core.WithAssembler(assembler{system: system, stable: stable,
@@ -377,16 +409,15 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		opts = append(opts, core.WithTranscriptStore(imageless{s}),
 			core.WithCompactionPolicy(policy{due: due, keep: keepTail(tr.Messages, h)}))
 	}
-	eng, err := core.New(tc, first.Served, opts...)
-	if err != nil {
-		return err
-	}
+	memory := core.NewMemoryTranscriptStore()
 	if resume != nil {
-		eng.Resume(*resume)
+		for _, m := range resume.Messages {
+			_ = memory.AppendMessage(m)
+		}
+		_ = memory.AppendUsage(core.UsageRecord{Usage: resume.Cumulative, Cumulative: resume.Cumulative})
 	}
-	base := tokens(eng.Cost())
-	budget.used = func() int { return tokens(eng.Cost()) - base }
-
+	baseline := tokens(memory.Transcript().Cumulative)
+	budget.used = func() int { return tokens(memory.Transcript().Cumulative) - baseline }
 	steps := 0
 	// last is the stop of the last request that ended without failing,
 	// and said whether the turn has passed on any text.
@@ -403,11 +434,10 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 	// its text as narration even when the output limit cut the call off.
 	var held strings.Builder
 	called := false
-	err = eng.Run(ctx, a.prompt(c, t, maxSide), func(e core.AgentEvent) {
+	sink := func(e core.AgentEvent) {
 		switch e := e.(type) {
 		case core.EvTurnStart:
-			steps = e.Step
-			tm.begin(e.Step)
+			tm.begin(steps)
 		case core.EvTextDelta:
 			tm.first()
 			if t.FinalOnly {
@@ -421,7 +451,6 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		case core.EvUsage:
 			tm.usage(e.Usage)
 		case core.EvTurnEnd:
-			tm.end(e.Stop)
 			if e.Err == nil {
 				last = e.Stop
 			}
@@ -435,7 +464,9 @@ func (a *Agent) Run(c *airut.Ctx, t airut.Turn, out airut.TurnOutput) error {
 		case core.EvToolCall:
 			out.ToolCall(e.Name)
 		}
-	})
+	}
+	err := a.runRequests(c, ctx, t, maxSide, opts, memory, budget, tm, &steps, sink)
+
 	stop := a.finished(c, tm, began, steps, budget, last, err)
 	if err != nil {
 		return err

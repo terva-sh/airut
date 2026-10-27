@@ -209,55 +209,31 @@ func TestLlamaSwapAvailability(t *testing.T) {
 	}
 }
 
-func TestLlamaSwapCachesOnlyNo(t *testing.T) {
+func TestLlamaSwapNeverCachesState(t *testing.T) {
 	ctx := context.Background()
-	clk := &testClock{t: time.Unix(1000, 0)}
 	ls := newLlamaSwap(t, "m")
-	h := NewHealth(HealthOptions{Providers: []config.Provider{ls.provider("ls", config.LoadNever)}, Now: clk.now})
-
-	// A yes is never kept: each check asks again.
-	h.available(ctx, "ls", "m")
-	h.available(ctx, "ls", "m")
-	if ls.requests() != 2 {
-		t.Errorf("two checks of a loaded model asked %d times", ls.requests())
+	h := NewHealth(HealthOptions{Providers: []config.Provider{ls.provider("ls", config.LoadNever)}})
+	if !h.available(ctx, "ls", "m") {
+		t.Fatal("not ready")
 	}
-
-	// A no is kept for 30 seconds, for that provider.
 	ls.set("other")
 	if h.available(ctx, "ls", "m") {
-		t.Fatal("a model that is not loaded is available")
+		t.Fatal("stale ready")
 	}
 	ls.set("m")
-	clk.advance(29 * time.Second)
-	if h.available(ctx, "ls", "m") || ls.requests() != 3 {
-		t.Errorf("within 30s the kept no was not used: asked %d times", ls.requests())
+	if !h.available(ctx, "ls", "m") {
+		t.Fatal("stale negative")
 	}
-	// A kept answer that would say yes for another model is asked again,
-	// and a fresh yes drops it.
-	ls.set("other")
-	if !h.available(ctx, "ls", "other") || ls.requests() != 4 {
-		t.Errorf("a kept no answered for a model it lists, after %d requests", ls.requests())
+	ls.status = 503
+	if h.available(ctx, "ls", "m") {
+		t.Fatal("failed discovery")
 	}
-	if h.available(ctx, "ls", "m") || ls.requests() != 5 {
-		t.Errorf("after a yes the old no was kept: asked %d times", ls.requests())
-	}
-	// Past 30 seconds the no is asked again.
-	ls.set("m")
-	clk.advance(31 * time.Second)
-	if !h.available(ctx, "ls", "m") || ls.requests() != 6 {
-		t.Errorf("after 30s the no was kept: asked %d times", ls.requests())
-	}
-
-	// Unreachable is kept as a no too.
-	ls.mu.Lock()
-	ls.status = http.StatusBadGateway
-	ls.mu.Unlock()
-	h.available(ctx, "ls", "m")
-	ls.mu.Lock()
 	ls.status = 0
-	ls.mu.Unlock()
-	if h.available(ctx, "ls", "m") || ls.requests() != 7 {
-		t.Errorf("an unreachable answer was not kept: asked %d times", ls.requests())
+	if !h.available(ctx, "ls", "m") {
+		t.Fatal("cached failure")
+	}
+	if ls.requests() != 5 {
+		t.Fatalf("got %d reads", ls.requests())
 	}
 }
 
@@ -561,8 +537,8 @@ func TestAgentFallsThroughBeforeOutput(t *testing.T) {
 			req := e.logs.lines("agent request")
 			fin := e.logs.lines("agent turn finished")
 			fell := e.logs.lines("model fell through")
-			if len(req) != 1 || !strings.Contains(req[0], "model=two") || !strings.Contains(req[0], "served=m2") ||
-				!strings.Contains(req[0], "provider=b") || !strings.Contains(req[0], "fell_through=1") {
+			if len(req) != 2 || !strings.Contains(req[1], "model=two") || !strings.Contains(req[1], "served=m2") ||
+				!strings.Contains(req[1], "provider=b") || !strings.Contains(req[1], "fell_through=1") {
 				t.Errorf("the request lines: %v", req)
 			}
 			if len(fin) != 1 || !strings.Contains(fin[0], "model=two") || !strings.Contains(fin[0], "served=m2") ||
@@ -607,7 +583,7 @@ func TestAgentDoesNotFallThroughAfterOutput(t *testing.T) {
 		t.Errorf("the finished lines: %v", fin)
 	}
 
-	// Nor after a tool ran: the turn's later request fails on its entry.
+	// A completed tool batch is now a fresh request and may fall through.
 	e2 := newChainEnv(t, nil, airut.Turn{Prompt: "p", Tools: nil})
 	e2.bot.Command("roll", "Roll", func(c *airut.Ctx) error { _, err := c.Reply("rolled"); return err }).AsTool()
 	e2.bot.Command("askroll", "Ask", func(c *airut.Ctx) error {
@@ -619,7 +595,7 @@ func TestAgentDoesNotFallThroughAfterOutput(t *testing.T) {
 		return e2.a.fake.Stream(context.Background(), req)
 	}, refuse(provider.NewHTTPError("a", 404, "", "")))
 	airuttest.Start(t, e2.bot).Text("!askroll")
-	if a, b := e2.a.requests(), e2.b.requests(); len(a) != 2 || len(b) != 0 {
+	if a, b := e2.a.requests(), e2.b.requests(); len(a) != 2 || len(b) != 1 {
 		t.Errorf("after a tool ran: a %v, b %v", a, b)
 	}
 }
@@ -737,7 +713,7 @@ func TestAgentStreamTheEngineAbandons(t *testing.T) {
 	if why := h.usable(ctx, "a", "m1"); why != "" {
 		t.Fatalf("no probe: %s", why)
 	}
-	out, err := tc.Stream(ctx, provider.Request{})
+	out, err := tc.attempt(ctx, chain[0], provider.Request{Model: "m1"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +770,7 @@ func TestAgentStreamTimesOutAfterOutput(t *testing.T) {
 	chain := config.Chain{{Provider: "a", Model: "one", Served: "m1", Capabilities: config.Capabilities{Timeout: 20 * time.Millisecond}}}
 	for i := range DefaultBreakerFailures {
 		tc := &turnClient{health: h, chain: chain, clients: map[string]provider.Client{"a": stalls{}}, tm: &timing{}}
-		out, err := tc.Stream(context.Background(), provider.Request{})
+		out, err := tc.attempt(context.Background(), chain[0], provider.Request{Model: "m1"}, true)
 		if err != nil {
 			t.Fatal(err)
 		}

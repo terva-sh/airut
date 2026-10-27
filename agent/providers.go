@@ -3,10 +3,15 @@
 package agent
 
 import (
+	"net/http"
+
 	"terva.sh/terva/packages/provider"
 
 	"terva.sh/airut/config"
 )
+
+// ProviderOptions permits sharing HTTP pools with discovery and judge calls.
+type ProviderOptions struct{ HTTPClients map[string]*http.Client }
 
 // Providers builds a terva client for each provider in c, named by the
 // provider's id, and a model catalog holding every model c lists. Each
@@ -16,6 +21,11 @@ import (
 // The catalog lists a model by its served id, the id a request carries.
 // Where variants serve one model, the first listed describes it.
 func Providers(c *config.Config) (map[string]provider.Client, *provider.Registry) {
+	return ProvidersWithOptions(c, ProviderOptions{})
+}
+
+// ProvidersWithOptions builds clients using the supplied per-provider pools.
+func ProvidersWithOptions(c *config.Config, o ProviderOptions) (map[string]provider.Client, *provider.Registry) {
 	reg := provider.NewRegistry()
 	clients := make(map[string]provider.Client, len(c.Providers))
 	for _, p := range c.Providers {
@@ -30,7 +40,11 @@ func Providers(c *config.Config) (map[string]provider.Client, *provider.Registry
 				reg.RegisterExtraModel(catalogModel(p.ID, served, m.Capabilities))
 			}
 		}
-		clients[p.ID] = provider.WithCatalog(provider.NewOpenAICompatibleAs(p.ID, p.APIKey.Value(), p.BaseURL), reg)
+		httpClient := o.HTTPClients[p.ID]
+		if httpClient == nil {
+			httpClient = providerHTTP()
+		}
+		clients[p.ID] = provider.WithCatalog(guardedProvider(provider.NewOpenAICompatibleAs(p.ID, p.APIKey.Value(), p.BaseURL), httpClient), reg)
 	}
 	return clients, reg
 }

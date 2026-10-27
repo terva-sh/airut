@@ -195,16 +195,11 @@ func TestJudgeSkipsUnavailableAndOpenBreakers(t *testing.T) {
 	if n := jc.fellThrough(jb, "gemma-judge", reasonUnavailable); n != 1 {
 		t.Errorf("unavailable counted %v", n)
 	}
-	// Idle, it is used, once the kept busy answer has run out.
+	// An idle first backend does not outrank an already-ready second.
 	ls.set()
 	jb.a.Text("!judge")
-	if len(jc.s1.requests()) != 0 {
-		t.Error("the kept busy answer was not used")
-	}
-	jc.clk.advance(DefaultNotLoadedFor)
-	jb.a.Text("!judge")
-	if len(jc.s1.requests()) != 1 {
-		t.Errorf("an idle llama-swap under when_idle was not used")
+	if len(jc.s1.requests()) != 0 || len(jc.s2.requests()) != 2 {
+		t.Fatal("cold first candidate outranked ready second")
 	}
 
 	// Nothing available abstains with ErrNoModel.

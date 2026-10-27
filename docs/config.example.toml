@@ -111,8 +111,8 @@ models = [{ id = "gpt-5.5", context_window = 128000, output = "response_format" 
 # Agent turns. Without this table the bot runs plain commands only.
 [agent]
 # The model a turn uses when it names none, as "provider/model". Set
-# either model or models, a chain tried in order: a turn starts on the
-# first entry that is available. An entry is "provider/model" or a
+# either model or models. Each request scans the whole list for a ready
+# candidate before a permitted cold load. An entry is "provider/model" or a
 # table naming one as model, with any of the model's keys to override
 # them here, such as { model = "proxy/gpt-5.5", timeout = "2m" }.
 model = "local/qwen3-32b"

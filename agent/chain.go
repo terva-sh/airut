@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"sync"
 
 	"terva.sh/terva/packages/provider"
@@ -10,119 +12,72 @@ import (
 	"terva.sh/airut/config"
 )
 
-// turnClient is the provider client one agent turn runs on. It walks the
-// agent's chain: at the turn's start it takes the first entry that is
-// available and whose breaker is closed. Until that entry's first
-// request has streamed something, a failure that falls through moves the
-// turn to the next usable entry, inside the same Stream call, so the
-// engine sees one request and its transcript holds the prompt once. Once
-// a request has streamed anything the turn is committed to its entry,
-// and a failure fails the request, as without a chain.
+// turnClient guards one selected request. The engine is configured for this
+// entry; a changed selection returns before dispatch and rebuilds the engine.
 type turnClient struct {
-	c       *airut.Ctx
-	health  *Health
-	chain   config.Chain
-	clients map[string]provider.Client
-	tm      *timing
-
-	mu        sync.Mutex
-	cur       int
-	fell      int
-	committed bool
-	sent      bool
+	c              *airut.Ctx
+	health         *Health
+	chain          config.Chain
+	clients        map[string]provider.Client
+	tm             *timing
+	model          provider.Model
+	cur            int
+	keys           []ModelKey
+	excluded       []bool
+	mu             sync.Mutex
+	sent, streamed bool
 }
 
-func (t *turnClient) Name() string { return "airut-chain" }
-
-// Unwrap is the entry the turn started on, so that terva reads that
-// client's capabilities through this one.
-func (t *turnClient) Unwrap() provider.Client {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.clients[t.chain[t.cur].Provider]
-}
-
-// start picks the turn's first entry, from the chain's start. It reports
-// false when no entry is usable.
-func (t *turnClient) start(ctx context.Context) bool {
-	return t.moveFrom(ctx, 0, "")
-}
-
-// moveFrom makes the first usable entry from i the turn's. why is the
-// reason the turn leaves its entry, or "" at the start. Each entry
-// passed over is counted when the walk goes on to the next; the last
-// one, with nothing after it, is not. It reports false, leaving the
-// turn's entry as it was, when no entry from i is usable.
-func (t *turnClient) moveFrom(ctx context.Context, i int, why string) bool {
-	t.mu.Lock()
-	from := t.cur
-	t.mu.Unlock()
-	for ; i < len(t.chain); i++ {
-		e := t.chain[i]
-		reason := t.health.usable(ctx, e.Provider, e.Served)
-		if why != "" {
-			left := t.chain[from]
-			skipped(t.c, t.tm.log, "agent", left.Provider, left.Model, left.Served, why)
-			t.mu.Lock()
-			t.fell++
-			t.mu.Unlock()
-		}
-		if reason == "" {
-			t.mu.Lock()
-			t.cur = i
-			fell := t.fell
-			t.mu.Unlock()
-			t.tm.on(e, fell)
-			return true
-		}
-		from, why = i, reason
-	}
-	return false
-}
-
-// finish ends a turn that may never have sent its entry a request, as
-// when the engine failed to start: the probe start may have taken from a
-// half-open breaker is handed back, so the breaker does not stay open.
-func (t *turnClient) finish() {
-	t.mu.Lock()
-	sent, e := t.sent, t.chain[t.cur]
-	t.mu.Unlock()
-	if !sent {
-		t.health.done(e.Provider, e.Served, classCanceled)
-	}
-}
-
-// Stream sends req to the turn's entry, under its served id.
+func (t *turnClient) Name() string            { return t.chain[t.cur].Provider }
+func (t *turnClient) Unwrap() provider.Client { return t.clients[t.chain[t.cur].Provider] }
 func (t *turnClient) Stream(ctx context.Context, req provider.Request) (<-chan provider.Event, error) {
+	e := t.chain[t.cur]
 	t.mu.Lock()
-	committed := t.committed
-	t.sent = true
+	t.sent = false
+	t.streamed = false
 	t.mu.Unlock()
-	for {
-		t.mu.Lock()
-		i := t.cur
-		t.mu.Unlock()
-		e := t.chain[i]
-		events, err := t.attempt(ctx, e, req, !committed)
-		if err == nil {
-			t.mu.Lock()
-			t.committed = true
-			t.mu.Unlock()
-			return events, nil
-		}
-		class := classify(ctx, err)
-		t.health.done(e.Provider, e.Served, class)
-		if committed || !fallsThrough(class) || !t.moveFrom(ctx, i+1, class) {
+	if !t.model.Has(provider.CapImageInput) {
+		req.Messages = requestWithoutImages(req.Messages)
+	}
+	if t.model.ContextWindow > 0 {
+		raw, err := json.Marshal(req)
+		if err != nil {
 			return nil, err
 		}
+		// Conservative estimate, including framing and the reserved reply. A
+		// tokenizer is not available at this boundary; never silently truncate.
+		if (len(raw)+2)/3+req.MaxTokens > t.model.ContextWindow {
+			return nil, ErrRequestTooLarge
+		}
 	}
+	guard := func(checkCtx context.Context) error {
+		if err := t.health.dispatch(checkCtx, t.keys, t.excluded, t.cur); err != nil {
+			return err
+		}
+		t.mu.Lock()
+		t.sent = true
+		t.mu.Unlock()
+		return nil
+	}
+	if hasHTTPBoundary(t.Unwrap()) {
+		ctx = withDispatch(ctx, guard)
+	} else if err := guard(ctx); err != nil {
+		return nil, err
+	}
+	events, err := t.attempt(ctx, e, req, true)
+	t.mu.Lock()
+	sent := t.sent
+	t.mu.Unlock()
+	if sent && err != nil && !errors.Is(err, errSelectionChanged) {
+		t.health.done(e.Provider, e.Served, classify(ctx, err))
+	}
+	return events, err
 }
 
 // attempt sends req to e. When peek is set, it holds the stream back
 // until its first event that is output, so that a failure before any
 // returns as an error the caller can fall through on.
 func (t *turnClient) attempt(ctx context.Context, e config.ChainEntry, req provider.Request, peek bool) (<-chan provider.Event, error) {
-	req.Model = e.Served
 	if e.MaxOutput > 0 && (req.MaxTokens == 0 || req.MaxTokens > e.MaxOutput) {
 		req.MaxTokens = e.MaxOutput
 	}
@@ -154,6 +109,9 @@ func (t *turnClient) attempt(ctx context.Context, e config.ChainEntry, req provi
 			}
 			held = append(held, ev)
 			if output(ev) {
+				t.mu.Lock()
+				t.streamed = true
+				t.mu.Unlock()
 				said = true
 				break
 			}
@@ -250,4 +208,30 @@ func output(ev provider.Event) bool {
 		return false
 	}
 	return true
+}
+
+// ErrRequestTooLarge means the selected candidate's conservative input
+// estimate plus reserved output exceeds its configured context cap.
+var ErrRequestTooLarge = errors.New("agent: request exceeds selected model context")
+
+func requestWithoutImages(messages []provider.Message) []provider.Message {
+	out := append([]provider.Message(nil), messages...)
+	var content func([]provider.Content) []provider.Content
+	content = func(in []provider.Content) []provider.Content {
+		out := append([]provider.Content(nil), in...)
+		for i, c := range out {
+			switch b := c.(type) {
+			case provider.ImageBlock:
+				out[i] = provider.TextBlock{Text: "[image omitted: this model does not accept images]"}
+			case provider.ToolResultBlock:
+				b.Content = content(b.Content)
+				out[i] = b
+			}
+		}
+		return out
+	}
+	for i := range out {
+		out[i].Content = content(out[i].Content)
+	}
+	return out
 }

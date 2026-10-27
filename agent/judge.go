@@ -49,6 +49,13 @@ const (
 
 // JudgeOptions configure NewJudge.
 type JudgeOptions struct {
+	// Guard runs for each actual candidate after its input is fitted and before
+	// final discovery. A false result skips that candidate. Keep a mode gate
+	// outside the judge to disable all inference independently of model choice.
+	Guard func(*airut.Ctx, JudgeModel, airut.Judgement) bool
+	// HTTPClients shares per-provider pools with discovery and agent inference.
+	// HTTP is the fallback, preserving single-provider callers.
+	HTTPClients map[string]*http.Client
 	// Models is the chain of models a judgement walks, in order. Each
 	// entry is described by its own JudgeModel, and its own input cap.
 	// When it is empty, the judge runs on the one model BaseURL, APIKey,
@@ -284,7 +291,7 @@ func NewJudge(o JudgeOptions) (*Judge, error) {
 		o.BytesPerToken = defaultBytesPerToken
 	}
 	if o.HTTP == nil {
-		o.HTTP = &http.Client{}
+		o.HTTP = providerHTTP()
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
@@ -292,6 +299,16 @@ func NewJudge(o JudgeOptions) (*Judge, error) {
 	if o.Health == nil {
 		o.Health = NewHealth(HealthOptions{Logger: o.Logger})
 	}
+	pools := map[string]*http.Client{}
+	for k, v := range o.HTTPClients {
+		pools[k] = v
+	}
+	for _, m := range models {
+		if pools[m.Provider] == nil {
+			pools[m.Provider] = o.HTTP
+		}
+	}
+	o.HTTPClients = pools
 	// The single model's fields read as the first model's, for the
 	// callers and tests that know the judge by them.
 	first := models[0]
@@ -338,8 +355,18 @@ func checkJudgeModel(m *JudgeModel) error {
 // the file.
 type JudgeOpenOption func(*JudgeOptions)
 
-// WithJudgeHealth sets JudgeOptions.Health, so that the judge shares h
-// with an agent.
+// WithJudgeGuard installs a per-candidate guard, replacing a guard that
+// assumes the role always uses its first configured model.
+func WithJudgeGuard(guard func(*airut.Ctx, JudgeModel, airut.Judgement) bool) JudgeOpenOption {
+	return func(o *JudgeOptions) { o.Guard = guard }
+}
+
+// WithJudgeHTTPClients shares pooled clients by provider.
+func WithJudgeHTTPClients(clients map[string]*http.Client) JudgeOpenOption {
+	return func(o *JudgeOptions) { o.HTTPClients = clients }
+}
+
+// WithJudgeHealth shares discovery and breakers with an agent.
 func WithJudgeHealth(h *Health) JudgeOpenOption {
 	return func(o *JudgeOptions) { o.Health = h }
 }
@@ -375,13 +402,17 @@ func OpenJudge(c *config.Config, personas map[string]string, log *slog.Logger, o
 		}
 		o.Models = append(o.Models, m)
 	}
+	originalHealth := o.Health
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.Health == originalHealth {
+		o.Health = NewHealth(HealthOptions{Providers: c.Providers, Logger: log, HTTPClients: o.HTTPClients, HTTP: o.HTTP})
 	}
 	return NewJudge(o)
 }
 
-// Judge walks the chain for j. It passes over a model that is
+// Judge prefers a ready candidate across its independent list for j. It passes over a model that is
 // unavailable, whose breaker is open, or whose cap j cannot be cut to
 // fit, and falls through to the next when a call fails by a connect
 // error, a 5xx, a 429, a timeout, or a missing model. Any other failure
@@ -421,51 +452,90 @@ func (g *Judge) Judge(c *airut.Ctx, j airut.Judgement) (airut.Verdict, error) {
 	}
 	defer release()
 
+	keys := make([]ModelKey, len(g.models))
+	excluded := make([]bool, len(g.models))
+	for i, m := range g.models {
+		keys[i] = ModelKey{m.Provider, m.Model}
+		excluded[i] = !fit[i]
+	}
 	fell, called := 0, false
 	var last error
-	for i, m := range g.models {
-		why := ""
-		switch {
-		case !fit[i]:
-			why = reasonTooLarge
-		default:
-			why = g.health.usable(parent, m.Provider, m.Model)
-		}
-		if why == "" {
-			// The first model that fits, called first, keeps the deadline
-			// it shares with the wait. Any other model called gets its own
-			// timeout from the start of its call, even when it is the first
-			// called because the models before it were passed over.
-			callCtx, callCancel := ctx, context.CancelFunc(func() {})
-			if called || i != first {
-				callCtx, callCancel = context.WithTimeout(parent, m.Timeout)
-			}
-			called = true
-			v, err := g.call(c, callCtx, m, persona, fits[i], fell)
-			callCancel()
-			if err == nil || errors.Is(err, errParse) {
-				return v, unwrapParse(err)
-			}
-			class := classify(parent, err)
-			g.health.done(m.Provider, m.Model, class)
-			if !fallsThrough(class) {
-				g.o.Logger.Info("judge call failed", "invocation", c.ID(), "error_kind", judgeErrKind(err))
-				return airut.Verdict{}, err
-			}
-			last, why = err, class
-		}
-		if i == len(g.models)-1 {
+	changes := 0
+	for {
+		i := g.health.selectModel(parent, keys, excluded)
+		if i < 0 {
 			break
 		}
-		skipped(c, g.o.Logger, "judge", m.Provider, m.Alias, m.Model, why)
+		m := g.models[i]
+		if !called {
+			for n := 0; n < i; n++ {
+				why := reasonUnavailable
+				if !fit[n] {
+					why = reasonTooLarge
+				} else if !g.health.breakerAllows(keys[n], false) {
+					why = reasonBreakerOpen
+				}
+				prev := g.models[n]
+				skipped(c, g.o.Logger, "judge", prev.Provider, prev.Alias, prev.Model, why)
+				fell++
+			}
+		}
+		if g.o.Guard != nil && !g.o.Guard(c, m, fits[i]) {
+			excluded[i] = true
+			continue
+		}
+		callCtx, callCancel := ctx, context.CancelFunc(func() {})
+		if called || i != first {
+			callCtx, callCancel = context.WithTimeout(parent, m.Timeout)
+		}
+		callCtx = context.WithValue(callCtx, judgeDispatchKey{}, &judgeDispatchState{guard: func(checkCtx context.Context) error { return g.health.dispatch(checkCtx, keys, excluded, i) }})
+		called = true
+		v, err := g.call(c, callCtx, m, persona, fits[i], fell)
+		callCancel()
+		if errors.Is(err, errSelectionChanged) {
+			changes++
+			if changes > 8 {
+				break
+			}
+			continue
+		}
+		if err == nil || errors.Is(err, errParse) {
+			return v, unwrapParse(err)
+		}
+		class := classify(parent, err)
+		g.health.done(m.Provider, m.Model, class)
+		if !fallsThrough(class) {
+			g.o.Logger.Info("judge call failed", "invocation", c.ID(), "error_kind", judgeErrKind(err))
+			return airut.Verdict{}, err
+		}
+		last = err
+		excluded[i] = true
+		skipped(c, g.o.Logger, "judge", m.Provider, m.Alias, m.Model, class)
 		fell++
 	}
+
 	if last != nil {
 		g.o.Logger.Info("judge call failed", "invocation", c.ID(), "error_kind", judgeErrKind(last))
 		return airut.Verdict{}, last
 	}
 	g.o.Logger.Info("judge call skipped", "invocation", c.ID(), "persona", j.Persona, "error_kind", "no_model")
 	return airut.Verdict{}, ErrNoModel
+}
+
+type judgeDispatchKey struct{}
+type judgeDispatchState struct {
+	guard func(context.Context) error
+	sent  bool
+}
+
+func judgeDispatch(ctx context.Context) error {
+	if state, ok := ctx.Value(judgeDispatchKey{}).(*judgeDispatchState); ok {
+		if err := state.guard(ctx); err != nil {
+			return err
+		}
+		state.sent = true
+	}
+	return nil
 }
 
 // errParse marks a reply that came back and was not a verdict: the call
@@ -502,6 +572,9 @@ func (g *Judge) call(c *airut.Ctx, ctx context.Context, m JudgeModel, persona st
 		reply, usage, err = g.chat(ctx, m, system, user, j)
 	} else {
 		reply, usage, err = g.stream(ctx, m, system, user)
+	}
+	if state, ok := ctx.Value(judgeDispatchKey{}).(*judgeDispatchState); ok && !state.sent {
+		return airut.Verdict{}, err
 	}
 	took, result := time.Since(called), "ok"
 	if err != nil {
@@ -653,7 +726,14 @@ func (g *Judge) chat(ctx context.Context, m JudgeModel, system, user string, j a
 	if m.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+m.APIKey)
 	}
-	resp, err := g.o.HTTP.Do(req)
+	client := g.o.HTTPClients[m.Provider]
+	if client == nil {
+		client = g.o.HTTP
+	}
+	if err := judgeDispatch(ctx); err != nil {
+		return "", provider.Usage{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", provider.Usage{}, err
 	}
@@ -693,6 +773,11 @@ func (g *Judge) stream(ctx context.Context, m JudgeModel, system, user string) (
 	temperature := float32(0)
 	if m.Temperature != nil {
 		temperature = float32(*m.Temperature)
+	}
+	if hasHTTPBoundary(m.Client) {
+		ctx = withDispatch(ctx, judgeDispatch)
+	} else if err := judgeDispatch(ctx); err != nil {
+		return "", provider.Usage{}, err
 	}
 	events, err := m.Client.Stream(ctx, provider.Request{
 		Model: m.Model, System: system, MaxTokens: m.MaxTokens, Temperature: &temperature, ForbidTools: true,

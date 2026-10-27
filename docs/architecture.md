@@ -771,69 +771,35 @@ that command.
 
 ### Model chains
 
-`Options.Models` is the chain `config.Load` resolves from `[agent]`, and
-`agent.Open` passes it with an `agent.Health` over the file's providers.
-The turn takes the first entry it can use, and the engine runs on that
-entry's served id, described as the entry describes it. An entry cannot
-be used when:
+`Options.Models` and the independent judge list are acceptable candidates.
+Every physical attempt scans the entire list for a ready model before
+considering a cold load on authoritative absence. Native llama-swap
+readiness and an application's `agent.Discovery` adapter feed the same
+selector. Unknown, loading, missing routes and failed discovery never
+permit loading. Backend no-load restrictions survive provider aliases.
 
-- its provider is of kind `llama-swap` and says it cannot serve the
-  model now (below);
-- its circuit breaker is open.
+A completed tool batch ends one engine run; the next resumes its transcript
+and cumulative usage with the newly selected candidate's metadata. A fresh
+dispatch check can refuse a changed selection before sending. The built-in
+OpenAI-compatible HTTP boundary also prevents silent provider retries from
+resending a captured request without reselection. An already-streaming
+response stays on its model. See [per-request model selection](model-selection.md)
+for the interface, pooling, guard integration and compatibility changes.
 
-The turn falls through to the next entry it can use only while its
-first model request has streamed nothing. The failures that fall
-through are a connect error, a 5xx, a 429, a timeout, and a missing
-model, a 404 or an error that says so. Any other 4xx says the request
-itself is bad, and fails the turn. The fall-through happens inside the
-one request the engine sees, so a session records the prompt once. Once
-the model has streamed anything, the turn is committed to its entry,
-and a failure fails the turn as it would on one model. A failure on the
-chain's last entry is retried by terva as usual. Each request carries
-the entry's served id, and its `max_output` and `temperature` when the
-entry sets them. An entry with no `max_output`, whose model the catalog
-gives no output limit either, sends none, and the server's own default
-applies: 1024 tokens on llama.cpp's server. `agent.New` warns once for
-each such entry, naming its provider and alias. The entry's `timeout`, when set, bounds each request.
-The engine measures context by the entry the turn started on. With no
-entry to use, the turn fails with `agent.ErrNoModel` and makes no
-request.
+Discovery-to-inference admission is best effort without an atomic provider
+precondition. Neither connection pooling nor a read-only sidecar closes the
+race with other clients. Logs explicitly mark selection as best effort and
+carry IDs and decisions, never content or raw response bodies.
 
-Availability and health key on the provider and the served model, never
-the alias, so every variant of a model shares them. One `Health` may
-serve an agent and a judge, with `agent.WithHealth` and
-`agent.WithJudgeHealth`, so that each skips a model the other saw fail.
-
-- **llama-swap.** Before it uses an entry on a `llama-swap` provider,
-  the chain asks `Provider.RunningURL`, giving up after 3 seconds. A
-  model `/running` lists is used. One it does not list is used under
-  `load = "always"`, under `when_idle` only when nothing is running, and
-  never under `never`. An unreachable server, or an answer that is not
-  a JSON object whose `running` is an array, such as `{}`, `null`, or
-  `{"running":null}`, makes the model unavailable, logged as
-  `unreachable`, so a malformed answer never reads as idle. An answer that makes a model
-  available is never kept, since llama-swap can swap the model out the
-  moment after. One that makes it unavailable is kept for 30 seconds per
-  provider, so a busy room does not ask at each judgement. Each decision
-  logs "model availability" at Debug with the provider, the served
-  model, and its kind: `loaded`, `loading_when_idle`, `loading_always`,
-  `not_loaded`, `busy_other_model`, or `unreachable`. A provider of any
-  other kind is always available.
-- **Breakers.** Three failures in a row of a kind that falls through
-  open a served model's breaker, which logs "model breaker opened". An
-  open breaker skips the model for 30 seconds. Then it is half-open: one
-  request tries the model, and its success closes the breaker while its
-  failure opens it for another 30 seconds. A success resets the count,
-  and so does a failure about the request, such as a 400 for a request
-  too large, since the server answered. These are
-  `agent.DefaultBreakerFailures` and `agent.DefaultBreakerCoolOff`,
-  which `HealthOptions` can change.
-- **Accounting.** Each entry passed over logs "model fell through" at
-  Info, with the use, the provider, the alias as `model`, the `served`
-  id, and the reason, and counts once in
-  `airut_model_fallthrough_total`. The reason is `unavailable`,
-  `breaker_open`, `too_large` (judgements only), or the failure's kind:
-  `connect`, `5xx`, `429`, `timeout`, or `not_found`.
+Availability and breakers key on provider and served ID, never alias.
+`WithHealth` and `WithJudgeHealth` share discovery and breakers. Three
+consecutive connection, 5xx, 429, timeout or missing-model failures open a
+breaker for 30 seconds, after which one half-open probe is admitted. A
+success closes it. `HealthOptions` tunes those defaults. Skipped entries
+retain the `airut_model_fallthrough_total` metric and fixed reason kinds.
+Native discovery has no state cache; only the breaker retains failure
+history. Every actual judge candidate has its own input fit and optional
+application guard, followed by fresh discovery at dispatch.
 
 ## Gating
 
